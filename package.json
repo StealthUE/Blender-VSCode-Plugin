@@ -1,0 +1,158 @@
+{
+  "name": "vsblender",
+  "publisher": "MassiveDynamicEngineering",
+  "displayName": "VSBlender",
+  "description": "Set up Blender for AI clients, ingest .blend files into readable notes, and drive Blender through a local MCP server and add-on.",
+  "version": "0.1.0",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/StealthUE/Blender-VSCode-Plugin"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "Blender",
+    "MCP",
+    "3D",
+    "blend"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/*.blend",
+    "onCommand:vsblender.setup"
+  ],
+  "main": "./out/extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "VSBlender starts Blender with the executable named in .blender-ai/config.json and ingests .blend files when a folder opens, so it only runs in trusted folders."
+    }
+  },
+  "contributes": {
+    "configuration": {
+      "title": "VSBlender",
+      "properties": {
+        "vsblender.showSetupOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open the setup wizard when a workspace with a .blend file has not been configured yet."
+        },
+        "vsblender.autoIngest": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ingest .blend files when the workspace opens and when a .blend file is saved."
+        },
+        "vsblender.ingestPreviews": {
+          "type": "boolean",
+          "default": true,
+          "description": "Render the overview previews during ingest. Turn this off for a faster structural ingest."
+        },
+        "vsblender.port": {
+          "type": "number",
+          "default": 47876,
+          "minimum": 1024,
+          "maximum": 65535,
+          "description": "Localhost port the Blender add-on listens on. Default shown in the setup wizard."
+        },
+        "vsblender.blenderPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to blender.exe. Leave empty to use the path saved by the setup wizard."
+        },
+        "vsblender.replaceLegacy": {
+          "type": "boolean",
+          "default": true,
+          "description": "When setup runs, remove MCP entries whose command is mcp-for-blender. Other servers are left alone."
+        },
+        "vsblender.clients.claude": {
+          "type": "boolean",
+          "default": true,
+          "description": "Default for the setup wizard: write .mcp.json, CLAUDE.md, and Claude deny rules for .blend files."
+        },
+        "vsblender.clients.vscode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Default for the setup wizard: write .vscode/mcp.json and .github/copilot-instructions.md."
+        },
+        "vsblender.clients.grok": {
+          "type": "boolean",
+          "default": true,
+          "description": "Default for the setup wizard: write .grok/config.toml. Grok reads CLAUDE.md, so a second copy of the guide is not written while Claude Code is enabled."
+        },
+        "vsblender.clients.cursor": {
+          "type": "boolean",
+          "default": false,
+          "description": "Default for the setup wizard: write .cursor/mcp.json and .cursorrules. Off unless you turn it on."
+        },
+        "vsblender.clients.cline": {
+          "type": "boolean",
+          "default": false,
+          "description": "Default for the setup wizard: write .cline/mcp.json and .clinerules. Off unless you turn it on."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "vsblender.setup",
+        "title": "VSBlender: Setup",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "vsblender.doctor",
+        "title": "VSBlender: Doctor",
+        "icon": "$(pulse)"
+      },
+      {
+        "command": "vsblender.launch",
+        "title": "VSBlender: Launch Blender",
+        "icon": "$(play)"
+      },
+      {
+        "command": "vsblender.ingest",
+        "title": "VSBlender: Ingest Blend File",
+        "icon": "$(book)"
+      },
+      {
+        "command": "vsblender.showLog",
+        "title": "VSBlender: Show Log",
+        "icon": "$(output)"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "vsblender.setup",
+          "when": "true"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "vsblender.ingest",
+          "when": "resourceExtname == .blend",
+          "group": "7_modification"
+        },
+        {
+          "command": "vsblender.launch",
+          "when": "resourceExtname == .blend",
+          "group": "7_modification"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node scripts/node-tests.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.5"
+  }
+}

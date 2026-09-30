@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "vsblender_bridge"
+version = "0.1.0"
+name = "VSBlender Bridge"
+tagline = "Local bridge for the VSBlender VS Code extension"
+maintainer = "Massive Dynamic Engineering"
+type = "add-on"
+tags = ["Development"]
+blender_version_min = "4.2.0"
+license = ["SPDX:MIT"]
