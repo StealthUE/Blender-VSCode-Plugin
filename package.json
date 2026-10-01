@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSBlender",
   "description": "Set up Blender for AI clients, ingest .blend files into readable notes, and drive Blender through a local MCP server and add-on.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
@@ -22,6 +22,7 @@
     "3D",
     "blend"
   ],
+  "icon": "resources/blender_logo.png",
   "activationEvents": [
     "workspaceContains:**/*.blend",
     "onCommand:vsblender.setup"
@@ -72,7 +73,7 @@
         "vsblender.clients.claude": {
           "type": "boolean",
           "default": true,
-          "description": "Default for the setup wizard: write .mcp.json, CLAUDE.md, and Claude deny rules for .blend files."
+          "description": "Default for the setup wizard: write .mcp.json, CLAUDE.md, and Claude permission rules (read-only VSBlender tools allowed, .blend files denied)."
         },
         "vsblender.clients.vscode": {
           "type": "boolean",
@@ -148,7 +149,9 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "test": "npm run compile && node scripts/node-tests.js"
+    "test": "npm run compile && node scripts/node-tests.js",
+    "test:blender": "blender -b --factory-startup --python scripts/blender-tests.py",
+    "test:e2e": "npm run compile && node scripts/e2e-tests.js"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
