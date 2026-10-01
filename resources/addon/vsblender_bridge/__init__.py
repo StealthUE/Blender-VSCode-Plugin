@@ -2,10 +2,12 @@
 
 Listens on 127.0.0.1 for one JSON object per connection. bpy is only touched on
 Blender's main thread: the GUI path queues work onto a timer, and the headless
-path accepts connections on the main thread.
+path accepts connections on the main thread. ping and cancel are answered on the
+socket thread, so they work while a script runs.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import math
@@ -20,46 +22,26 @@ from contextlib import redirect_stderr, redirect_stdout
 
 import bpy
 from bpy.app.handlers import persistent
-from mathutils import Vector
+
+from . import blender_ingest, helpers, history, inspect_tools, preview as preview_mod, sheet, snapshot
 
 # Legacy add-ons (scripts/addons) are skipped by Preferences without bl_info.
 # Extensions read blender_manifest.toml instead and ignore this.
 bl_info = {
     "name": "VSBlender Bridge",
     "author": "Massive Dynamic Engineering",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (3, 2, 0),
     "location": "View3D > Sidebar > VSBlender",
     "description": "Local bridge for the VSBlender VS Code extension",
     "category": "Development",
 }
 
-ADDON_VERSION = "0.1.0"
+ADDON_VERSION = "0.2.0"
 # Answered on the socket thread. Everything else runs on Blender's main thread.
-_NO_MAIN_THREAD = {"ping"}
+_NO_MAIN_THREAD = {"ping", "cancel"}
 # How long a connection waits for the main thread. The caller's own timeout is usually shorter.
-_MAIN_THREAD_WAIT = 600
-_PREFIX = {
-    "objects": "OB",
-    "meshes": "ME",
-    "materials": "MA",
-    "lights": "LI",
-    "cameras": "CA",
-    "collections": "CO",
-    "images": "IM",
-    "worlds": "WO",
-    "node_groups": "NT",
-    "texts": "TX",
-}
-_VIEWS = {
-    "front": Vector((0.0, -1.0, 0.0)),
-    "back": Vector((0.0, 1.0, 0.0)),
-    "left": Vector((-1.0, 0.0, 0.0)),
-    "right": Vector((1.0, 0.0, 0.0)),
-    "top": Vector((0.0, 0.0, 1.0)),
-    "bottom": Vector((0.0, 0.0, -1.0)),
-    "iso": Vector((1.0, -1.0, 1.0)),
-}
+_MAIN_THREAD_WAIT = 900
 _state = {
     "registered": False,
     "running": False,
@@ -136,42 +118,32 @@ def _jsonable(value, depth: int = 0):
             return str(value)
     if isinstance(value, dict):
         return {str(key): _jsonable(item, depth + 1) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, set)):
         return [_jsonable(item, depth + 1) for item in value]
     return str(value)
 
 
-def _fingerprint() -> dict:
-    found = {}
-    for attr, prefix in _PREFIX.items():
-        collection = getattr(bpy.data, attr, None)
-        if collection is None:
-            continue
-        for item in collection:
-            if item.name.startswith("_vsblender"):
-                continue
-            key = f"{prefix}:{item.name}"
-            if attr == "objects":
-                found[key] = (
-                    tuple(round(v, 5) for v in item.location),
-                    tuple(round(v, 5) for v in item.rotation_euler),
-                    tuple(round(v, 5) for v in item.scale),
-                    bool(item.hide_viewport),
-                    bool(item.hide_render),
-                    tuple((slot.material.name if slot.material else "") for slot in item.material_slots),
-                )
-            else:
-                found[key] = item.name
-    return found
-
-
-def _changed(before: dict, after: dict) -> list:
-    keys = set(before) | set(after)
-    return sorted(key for key in keys if before.get(key) != after.get(key))
+# ----------------------------------------------------------------------------- session
+def _devices(scene) -> dict:
+    """Which device each engine renders on. EEVEE and Workbench always use the GPU."""
+    out = {"engine": scene.render.engine, "eevee": "GPU (always)", "workbench": "GPU (always)"}
+    cycles = getattr(scene, "cycles", None)
+    if cycles is not None and hasattr(cycles, "device"):
+        device = cycles.device
+        try:
+            prefs = bpy.context.preferences.addons["cycles"].preferences
+            backend = prefs.compute_device_type
+            if device == "GPU":
+                device = f"GPU ({backend})" if backend and backend != "NONE" else "GPU requested, but no GPU backend is enabled in Preferences, so CPU"
+        except Exception:
+            pass
+        out["cycles"] = device
+    return out
 
 
 def session_info() -> dict:
     scene = _scene()
+    root = workspace_root()
     info = {
         "product": "vsblender",
         "addon_version": ADDON_VERSION,
@@ -179,8 +151,9 @@ def session_info() -> dict:
         "blender_version_tuple": list(bpy.app.version),
         "file": bpy.data.filepath,
         "dirty": bool(bpy.data.is_dirty),
+        "background": bool(bpy.app.background),
         "port": port(),
-        "workspace": workspace_root(),
+        "workspace": root,
         "objects": len(bpy.data.objects),
         "materials": len(bpy.data.materials),
     }
@@ -193,17 +166,26 @@ def session_info() -> dict:
             "frame_end": scene.frame_end,
             "fps": scene.render.fps,
             "engine": scene.render.engine,
+            "resolution": [scene.render.resolution_x, scene.render.resolution_y, scene.render.resolution_percentage],
+            "camera": scene.camera.name if scene.camera else None,
             "unit_system": unit.system,
             "unit_scale": unit.scale_length,
             "length_unit": unit.length_unit,
+            "render_devices": _devices(scene),
         })
-        cycles = getattr(scene, "cycles", None)
-        if cycles is not None and hasattr(cycles, "device"):
-            info["render_device"] = cycles.device
     try:
         info["mode"] = bpy.context.mode
     except Exception:
         info["mode"] = None
+    try:
+        info["sidecar"] = history.sidecar_status(root)
+    except Exception as exc:
+        info["sidecar"] = {"status": "unknown", "detail": str(exc)}
+    try:
+        recent = history.list_checkpoints(root)[-5:]
+        info["checkpoints"] = [{k: e.get(k) for k in ("id", "label", "time", "auto")} for e in recent]
+    except Exception:
+        info["checkpoints"] = []
     return info
 
 
@@ -223,12 +205,14 @@ def open_file(params: dict) -> dict:
     return {"opened": True, "file": bpy.data.filepath, "dirty": bool(bpy.data.is_dirty)}
 
 
+# ----------------------------------------------------------------------------- run_script
 class ScriptError(Exception):
     """The user's script failed. The message is already formatted for the caller."""
 
-    def __init__(self, message: str, changed: list):
+    def __init__(self, message: str, changed: list, changes: dict | None = None):
         super().__init__(message)
         self.changed = changed
+        self.changes = changes or {}
 
 
 def _script_traceback(exc: BaseException, script: str) -> str:
@@ -254,6 +238,26 @@ def _undo_push(message: str) -> None:
         pass
 
 
+def _prepare_imports(root: str, lib_paths: list) -> list:
+    """Put the workspace helper folders on sys.path and drop workspace modules imported by earlier
+    calls, so an edited helper is read again. The add-on's own modules are never dropped."""
+    own = os.path.dirname(os.path.abspath(__file__))
+    for name, module in list(sys.modules.items()):
+        path = getattr(module, "__file__", None)
+        if not path or name == "vsblender" or name.startswith(__name__):
+            continue
+        if _under(path, root) and not _under(path, own):
+            del sys.modules[name]
+    added = []
+    for entry in lib_paths:
+        folder = entry if os.path.isabs(entry) else os.path.join(root, entry)
+        if os.path.isdir(folder) and _under(folder, root) and folder not in sys.path:
+            sys.path.insert(0, folder)
+            added.append(folder)
+    sys.modules["vsblender"] = helpers
+    return added
+
+
 def run_script(params: dict):
     raw = params.get("path")
     if not isinstance(raw, str) or not raw:
@@ -272,56 +276,116 @@ def run_script(params: dict):
         raise ValueError("function must be a string")
     if not isinstance(args, dict):
         raise ValueError("args must be an object")
+    reason = str(params.get("reason") or "").strip()
+    cp_opts = params.get("checkpoint") if isinstance(params.get("checkpoint"), dict) else {}
+    lib_paths = params.get("lib_paths") or ["scripts/lib"]
     with open(script, encoding="utf-8") as handle:
         source = handle.read()
     try:
         code = compile(source, script, "exec")
     except SyntaxError as exc:
         raise RuntimeError(f"{exc.filename}:{exc.lineno}: {exc.msg}") from exc
+    rel_script = history.rel(root, script)
+    script_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
 
-    before = _fingerprint()
+    started = time.time()
+    before = snapshot.take()
+    checkpoint_entry = None
+    if cp_opts.get("auto", True):
+        try:
+            checkpoint_entry = history.checkpoint(root, auto=True, keep=int(cp_opts.get("keep", 10)),
+                                                  max_mb=float(cp_opts.get("max_mb", 300)), script=rel_script,
+                                                  reason=reason or None, snap=before)
+        except Exception as exc:
+            checkpoint_entry = {"skipped": f"checkpoint failed: {exc}"}
     stdout = io.StringIO()
     stderr = io.StringIO()
-    namespace = {"__name__": "__main__", "__file__": script, "bpy": bpy}
+    namespace = {"__name__": "__main__", "__file__": script, "bpy": bpy, "vsblender": helpers}
     try:
         import mathutils
         namespace["mathutils"] = mathutils
     except Exception:
         pass
     previous = os.getcwd()
+    added_paths = []
     warnings = []
     value = None
     failure = ""
+    helpers._begin(rel_script, root)
+    # No .pyc in the workspace: a helper edited twice within a second, at the same size, would
+    # otherwise be loaded from the stale cache.
+    wrote_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     try:
         os.chdir(root)
+        added_paths = _prepare_imports(root, lib_paths)
         import warnings as warnings_mod
-        with warnings_mod.catch_warnings(record=True) as caught:
-            warnings_mod.simplefilter("always")
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                try:
-                    exec(code, namespace)
-                    if function:
-                        fn = namespace.get(function)
-                        if not callable(fn):
-                            raise RuntimeError(f"{function} is not defined in {script}")
-                        value = fn(**args)
-                    else:
-                        value = namespace.get("result")
-                except (Exception, SystemExit) as exc:
-                    # SystemExit too: sys.exit() in a script must not reach Blender's timer loop.
-                    failure = _script_traceback(exc, script)
+        with snapshot.DepsgraphRecorder() as recorder:
+            with warnings_mod.catch_warnings(record=True) as caught:
+                warnings_mod.simplefilter("always")
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    try:
+                        exec(code, namespace)
+                        if function:
+                            fn = namespace.get(function)
+                            if not callable(fn):
+                                raise RuntimeError(f"{function} is not defined in {script}")
+                            value = fn(**args)
+                        else:
+                            value = namespace.get("result")
+                    except helpers.Cancelled as exc:
+                        failure = f"Cancelled at {rel_script}: {exc}. Changes made before the cancel are kept " \
+                                  "(one undo step in Blender)."
+                    except (Exception, SystemExit) as exc:
+                        # SystemExit too: sys.exit() in a script must not reach Blender's timer loop.
+                        failure = _script_traceback(exc, script)
+            recorder.flush()
         warnings = [f"{item.category.__name__}: {item.message}" for item in caught][:40]
     finally:
+        helpers._end()
+        sys.dont_write_bytecode = wrote_bytecode
         os.chdir(previous)
-    changed = _changed(before, _fingerprint())
+        for folder in added_paths:
+            try:
+                sys.path.remove(folder)
+            except ValueError:
+                pass
+    report = snapshot.diff(before, snapshot.take(), recorder.updates)
+    changed = snapshot.flat(report)
+    ms = int((time.time() - started) * 1000)
+    cp_id = checkpoint_entry.get("id") if isinstance(checkpoint_entry, dict) else None
+    if not changed and cp_id:
+        history.discard_checkpoint(root, cp_id)
+        cp_id = None
     if changed:
         _undo_push(f"VSBlender: {os.path.basename(script)}")
+        history.mark_edited()
+        entry = {
+            "time": history.now_iso(), "event": "script", "actor": str(params.get("actor") or "ai"),
+            "script": rel_script, "script_sha256": script_sha, "reason": reason or None, "ok": not failure,
+            "result": _jsonable(value) if not failure else None, "error": failure.splitlines()[-1] if failure else None,
+            "changes": report, "changed": changed, "ms": ms, "checkpoint": cp_id,
+            "blend": history.rel(root, bpy.data.filepath) if bpy.data.filepath else None,
+        }
+        result_text = json.dumps(entry["result"], ensure_ascii=False, default=str)
+        if len(result_text) > 4000:
+            entry["result"] = result_text[:4000] + "... (truncated)"
+        try:
+            history.journal(root, entry)
+            what = f"`{rel_script}`" + (" (failed partway)" if failure else "")
+            history.notes_log(root, history.log_line(entry["actor"], what, reason, report, cp_id))
+        except Exception as exc:
+            warnings.append(f"journal not written: {exc}")
     text_out = stdout.getvalue()
     text_err = stderr.getvalue()
     if len(text_out) > 200000:
-        text_out = text_out[:200000] + "\n… stdout truncated"
+        text_out = text_out[:200000] + "\n... stdout truncated"
     if len(text_err) > 200000:
-        text_err = text_err[:200000] + "\n… stderr truncated"
+        text_err = text_err[:200000] + "\n... stderr truncated"
+    if not reason and changed:
+        warnings.append("no reason was given, so the journal entry says only what changed, not why")
+    if isinstance(checkpoint_entry, dict) and checkpoint_entry.get("skipped"):
+        warnings.append(f"no checkpoint: {checkpoint_entry['skipped']}")
     if failure:
         parts = [failure.rstrip()]
         if text_out.strip():
@@ -329,310 +393,138 @@ def run_script(params: dict):
         if text_err.strip():
             parts.append("--- stderr ---\n" + text_err.rstrip())
         if changed:
-            parts.append("changed before the error: " + ", ".join(changed[:60]))
-        raise ScriptError("\n".join(parts), changed)
+            parts.append("changed before the error: " + snapshot.summary(report, 20))
+            if cp_id:
+                parts.append(f"checkpoint from before the script: {cp_id} (restore_checkpoint)")
+        raise ScriptError("\n".join(parts), changed, report)
     return {
         "file": script,
         "result": _jsonable(value),
         "stdout": text_out,
         "stderr": text_err,
+        "changes": report,
+        "checkpoint": cp_id,
+        "ms": ms,
     }, warnings, changed
 
 
-def _set_engine(scene, names: list) -> str:
-    last = None
-    for name in names:
-        try:
-            scene.render.engine = name
-            return scene.render.engine
-        except Exception as exc:
-            last = exc
-    raise RuntimeError(f"no usable render engine ({last})")
+# ----------------------------------------------------------------------------- checkpoints, ingest, history
+def checkpoint(params: dict) -> dict:
+    root = workspace_root()
+    entry = history.checkpoint(root, label=str(params.get("label") or "manual"), auto=False,
+                               reason=params.get("reason") or None)
+    history.journal(root, {"time": history.now_iso(), "event": "checkpoint", "actor": params.get("actor") or "ai",
+                           "checkpoint": entry["id"], "label": entry["label"]})
+    return entry
 
 
-_GEOMETRY = {"MESH", "CURVE", "SURFACE", "META", "FONT", "CURVES", "POINTCLOUD", "VOLUME", "GPENCIL", "GREASEPENCIL"}
+def restore_checkpoint(params: dict) -> dict:
+    root = workspace_root()
+    cid = str(params.get("id") or "")
+    if not cid:
+        raise ValueError("id is required (see session_info.checkpoints, or 'last')")
+    result = history.restore(root, cid)
+    _undo_push(f"VSBlender: restore {result['restored']}")
+    history.mark_edited()
+    history.journal(root, {"time": history.now_iso(), "event": "restore", "actor": params.get("actor") or "ai",
+                           "checkpoint": result["restored"], "safety_checkpoint": result["safety_checkpoint"],
+                           "reason": params.get("reason") or None})
+    history.notes_log(root, history.log_line(params.get("actor") or "ai", f"restored checkpoint `{result['restored']}`",
+                                             params.get("reason"), None, result["safety_checkpoint"]))
+    return result
 
 
-def _bounds(objects) -> tuple:
-    """World bounds of the geometry, read from evaluated objects.
-
-    An object made since the last depsgraph update (for example by the script that just ran)
-    still has an empty bound_box on the original, which put the camera inside it. Lights,
-    cameras and empties only count when there is no geometry at all.
-    """
-    try:
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-    except Exception:
-        depsgraph = None
-    usable = [obj for obj in objects if obj is not None and not obj.name.startswith("_vsblender")]
-    shaped = [obj for obj in usable if obj.type in _GEOMETRY]
-    low = Vector((1e18, 1e18, 1e18))
-    high = Vector((-1e18, -1e18, -1e18))
-    found = False
-    for original in shaped or usable:
-        obj = original
-        if depsgraph is not None:
-            try:
-                obj = original.evaluated_get(depsgraph)
-            except Exception:
-                obj = original
-        corners = []
-        try:
-            corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
-        except Exception:
-            corners = [obj.matrix_world.translation.copy()]
-        for point in corners:
-            low.x, low.y, low.z = min(low.x, point.x), min(low.y, point.y), min(low.z, point.z)
-            high.x, high.y, high.z = max(high.x, point.x), max(high.y, point.y), max(high.z, point.z)
-            found = True
-    if not found:
-        return Vector((0.0, 0.0, 0.0)), Vector((0.0, 0.0, 0.0))
-    return low, high
+def list_checkpoints(_params: dict) -> dict:
+    return {"checkpoints": history.list_checkpoints(workspace_root())}
 
 
-def _look_at(cam, location, target, view: str) -> None:
-    """Aim a camera: it looks down its local -Z with local Y up.
-
-    Straight down or up there is no single "up", so those two are set explicitly
-    (+Y world at the top of the image for the top view).
-    """
-    cam.location = location
-    if view == "top":
-        cam.rotation_euler = (0.0, 0.0, 0.0)
-        return
-    if view == "bottom":
-        cam.rotation_euler = (math.pi, 0.0, 0.0)
-        return
-    direction = Vector(target) - Vector(location)
-    if direction.length < 1e-8:
-        return
-    cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+def save_copy(params: dict) -> dict:
+    """A copy of the session for a background job (render, diff). Never changes the user's file."""
+    root = workspace_root()
+    out = params.get("path")
+    if not isinstance(out, str) or not _under(out, root):
+        raise ValueError("path must be inside the workspace")
+    history.save_copy(out, relative_remap=True)
+    scene = _scene()
+    return {"file": out, "source": bpy.data.filepath, "dirty": bool(bpy.data.is_dirty),
+            "scene": scene.name if scene else None, "frame": scene.frame_current if scene else None,
+            "autoexec": bool(bpy.context.preferences.filepaths.use_scripts_auto_execute)}
 
 
-def _collect_objects(src, target_name: str | None):
-    if target_name:
-        obj = src.objects.get(target_name) or bpy.data.objects.get(target_name)
-        if obj is None:
-            raise KeyError(f"no object named {target_name}")
-        children = list(getattr(obj, "children_recursive", []))
-        return [obj, *children]
-    return [obj for obj in src.objects if obj.type != "CAMERA" and not obj.hide_render and not obj.name.startswith("_vsblender")]
+def ingest_live(params: dict) -> dict:
+    root = workspace_root()
+    out = history.sidecar_dir(root)
+    result = blender_ingest.live_ingest(out, preview_mod.render_view, actor=str(params.get("actor") or "ai"),
+                                        reason=str(params.get("reason") or ""), force=bool(params.get("force")),
+                                        previews=params.get("previews", True) is not False,
+                                        preview_size=int(params.get("preview_size") or 512))
+    result["out"] = history.rel(root, result.get("out", out))
+    return result
 
 
-def _scene_contains(scene, obj) -> bool:
-    if obj.name in scene.collection.objects:
-        return True
-    try:
-        children = scene.collection.children_recursive
-    except Exception:
-        children = scene.collection.children
-    for child in children:
-        if obj.name in child.objects:
-            return True
-    return False
+def manifest(params: dict) -> dict:
+    """The manifest of the live session, written to a file in the workspace (for diff)."""
+    root = workspace_root()
+    out = params.get("path")
+    if not isinstance(out, str) or not _under(out, root):
+        raise ValueError("path must be inside the workspace")
+    man = blender_ingest.build_manifest(bpy.data.filepath, None)
+    blender_ingest.write_json(out, man)
+    return {"file": out, "objects": len(man["objects"])}
 
 
-def _new_preview_scene(src):
-    """New scene only. Never scene.copy(): a shared master collection must not be deleted with the preview."""
-    preview = bpy.data.scenes.new("_vsblender_preview")
-    for child in list(src.collection.children):
-        if child.name.startswith("_vsblender"):
-            continue
-        try:
-            preview.collection.children.link(child)
-        except RuntimeError:
-            pass
-    for obj in list(src.collection.objects):
-        if obj.name.startswith("_vsblender"):
-            continue
-        try:
-            preview.collection.objects.link(obj)
-        except RuntimeError:
-            pass
-    preview.world = src.world
-    preview.frame_start = src.frame_start
-    preview.frame_end = src.frame_end
-    preview.frame_set(src.frame_current)
-    return preview
+def diff_manifests(params: dict) -> dict:
+    a, b = (history.load_json(params.get(key) or "") for key in ("a", "b"))
+    if a is None or b is None:
+        raise FileNotFoundError("both manifest files are needed")
+    return {"changes": blender_ingest.diff_manifests(a, b)}
 
 
-def _cleanup_preview(scene, cam, cam_data, private, linked) -> None:
-    for obj in linked:
-        try:
-            private.objects.unlink(obj)
-        except Exception:
-            pass
-    try:
-        if private is not None and scene is not None:
-            scene.collection.children.unlink(private)
-    except Exception:
-        pass
-    if cam is not None:
-        try:
-            bpy.data.objects.remove(cam, do_unlink=True)
-        except Exception:
-            pass
-    if cam_data is not None:
-        try:
-            if cam_data.users == 0:
-                bpy.data.cameras.remove(cam_data)
-        except Exception:
-            pass
-    if private is not None:
-        try:
-            if private.users == 0:
-                bpy.data.collections.remove(private)
-        except Exception:
-            pass
-    if scene is not None:
-        try:
-            bpy.data.scenes.remove(scene)
-        except Exception:
-            pass
-
-
-def _render_still(scene) -> None:
-    """Render one scene without changing the user's scene.
-
-    context.temp_override exists in Blender 3.2 and later. Passing a context
-    dict on 2.92 reaches the render, then the dependency graph crashes while
-    two scenes share the same objects, so that path is not used.
-    """
-    override = getattr(bpy.context, "temp_override", None)
-    if override is None:
-        raise RuntimeError("offscreen preview needs Blender 3.2 or newer")
-    with bpy.context.temp_override(scene=scene):
-        bpy.ops.render.render(write_still=True)
-
-
-def preview(params: dict):
-    view = str(params.get("view") or "iso")
-    shading = str(params.get("shading") or "solid")
-    if view != "camera" and view not in _VIEWS:
-        raise ValueError("view must be camera, front, back, left, right, top, bottom, or iso")
-    if shading not in {"solid", "material", "rendered"}:
-        raise ValueError("shading must be solid, material, or rendered")
-    try:
-        size = int(params.get("size") or 512)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("size must be an integer") from exc
-    size = max(64, min(2048, size))
-    out = params.get("out")
-    if not isinstance(out, str) or not out:
-        raise ValueError("out path is required")
+def compose(params: dict) -> dict:
+    root = workspace_root()
     import tempfile
-    roots = [tempfile.gettempdir(), workspace_root()]
-    if bpy.data.filepath:
-        roots.append(os.path.dirname(bpy.data.filepath))
-    if not any(root and _under(out, root) for root in roots):
-        raise ValueError("refusing to write the preview outside the workspace or temp directory")
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    out = params.get("out")
+    paths = params.get("paths") or []
+    allowed = [root, tempfile.gettempdir()]
+    if not isinstance(out, str) or not any(_under(out, r) for r in allowed):
+        raise ValueError("out must be inside the workspace or the temp folder")
+    for path in paths:
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+    return sheet.compose_files(paths, out, labels=params.get("labels"), columns=params.get("columns"),
+                               cell=int(params.get("cell") or 512), diff=bool(params.get("diff")))
 
-    src = _scene()
-    if src is None:
-        raise RuntimeError("no scene")
-    saved_frame = src.frame_current
-    target_name = params.get("target")
-    if target_name is not None and not isinstance(target_name, str):
-        raise ValueError("target must be a string")
-    frame = params.get("frame")
-    warnings = []
-    scene = cam = cam_data = private = None
-    linked = []
-    try:
-        scene = _new_preview_scene(src)
-        if frame is not None:
-            scene.frame_set(int(frame))
-        try:
-            scene.view_layers[0].update()
-        except Exception:
-            pass
-        objects = _collect_objects(src, target_name)
-        cam_data = bpy.data.cameras.new("_vsblender_preview_cam")
-        cam = bpy.data.objects.new("_vsblender_preview_cam", cam_data)
-        private = bpy.data.collections.new("_vsblender_preview")
-        private.objects.link(cam)
-        scene.collection.children.link(private)
-        scene.camera = cam
-        if target_name and objects:
-            obj = objects[0]
-            if not _scene_contains(scene, obj):
-                try:
-                    private.objects.link(obj)
-                    linked.append(obj)
-                except RuntimeError:
-                    pass
-        if view == "camera":
-            src_cam = src.camera
-            if src_cam is None:
-                raise RuntimeError("this file has no camera; use view iso or front")
-            cam.matrix_world = src_cam.matrix_world.copy()
-            if src_cam.type == "CAMERA":
-                cam_data.lens = src_cam.data.lens
-                cam_data.clip_start = src_cam.data.clip_start
-                cam_data.clip_end = src_cam.data.clip_end
-        else:
-            low, high = _bounds(objects)
-            center = (low + high) * 0.5
-            extent = max((high - low).length, 0.5)
-            lens = 50.0
-            sensor = 36.0
-            fov = 2.0 * math.atan(sensor / (2.0 * lens))
-            distance = max(0.5, (extent * 0.5) / math.tan(fov * 0.5) * 1.35)
-            direction = _VIEWS[view].normalized()
-            _look_at(cam, center + direction * distance, center, view)
-            cam_data.lens = lens
-            cam_data.clip_start = max(0.01, distance / 100.0)
-            cam_data.clip_end = max(1000.0, distance * 20.0)
 
-        if shading == "solid":
-            wanted = ["BLENDER_WORKBENCH"]
-        elif shading == "material":
-            wanted = ["BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "BLENDER_WORKBENCH"]
-        else:
-            wanted = [src.render.engine, "BLENDER_EEVEE", "CYCLES", "BLENDER_WORKBENCH"]
-        engine = _set_engine(scene, wanted)
-        if shading != "solid" and engine == "BLENDER_WORKBENCH":
-            warnings.append(f"{shading} preview fell back to Workbench")
-        eevee = getattr(scene, "eevee", None)
-        if eevee is not None and hasattr(eevee, "taa_render_samples"):
-            eevee.taa_render_samples = min(int(getattr(eevee, "taa_render_samples", 16) or 16), 32)
-        cycles = getattr(scene, "cycles", None)
-        if cycles is not None and hasattr(cycles, "samples"):
-            cycles.samples = min(int(cycles.samples or 16), 32)
-        display = getattr(scene, "display", None)
-        shading_settings = getattr(display, "shading", None) if display else None
-        if shading_settings is not None:
-            try:
-                shading_settings.light = "STUDIO"
-                shading_settings.color_type = "MATERIAL"
-            except Exception:
-                pass
-        scene.render.resolution_x = size
-        scene.render.resolution_y = size
-        scene.render.resolution_percentage = 100
-        scene.render.image_settings.file_format = "PNG"
-        scene.render.filepath = os.path.abspath(out)
-        scene.render.film_transparent = False
-        _render_still(scene)
-        if not os.path.isfile(scene.render.filepath):
-            raise RuntimeError("render finished without writing the png")
-        return {
-            "file": scene.render.filepath,
-            "view": view,
-            "shading": shading,
-            "engine": engine,
-            "size": size,
-        }, warnings
-    finally:
-        _cleanup_preview(scene, cam, cam_data, private, linked)
-        # Objects are shared with the preview scene, so evaluating another frame there
-        # wrote animated values onto them. Re-evaluate the user's frame to put them back.
-        if frame is not None:
-            try:
-                src.frame_set(saved_frame)
-            except Exception:
-                pass
+def object_facts(params: dict) -> dict:
+    """Type, parent, size and materials, for roles.json entries of objects the sidecar does not know yet."""
+    out = {}
+    for name in params.get("names") or []:
+        ob = bpy.data.objects.get(name)
+        if ob is None:
+            continue
+        out[name] = {"type": ob.type, "parent": ob.parent.name if ob.parent else None,
+                     "dimensions": [round(v, 4) for v in ob.dimensions],
+                     "materials": [s.material.name for s in ob.material_slots if s.material]}
+    return out
+
+
+def write_role_property(params: dict):
+    """Stamp ai_role on an object, so a reviewed role travels with the .blend. One undo step."""
+    name = params.get("target")
+    ob = bpy.data.objects.get(name or "")
+    if ob is None:
+        raise KeyError(f"no object named {name!r}")
+    before = snapshot.take()
+    ob["ai_role"] = str(params.get("role") or "")
+    report = snapshot.diff(before, snapshot.take())
+    _undo_push(f"VSBlender: role of {ob.name}")
+    history.mark_edited()
+    return {"object": ob.name, "property": "ai_role"}, [], snapshot.flat(report)
+
+
+# ----------------------------------------------------------------------------- dispatch
+def _with_text(result) -> dict:
+    return result if isinstance(result, dict) else {"value": result}
 
 
 def dispatch(req: dict) -> dict:
@@ -644,10 +536,14 @@ def dispatch(req: dict) -> dict:
         return {"id": ident, "ok": False, "error": "params must be an object"}
     warnings = []
     changed = []
+    root = None
     try:
         if method == "ping":
             # No bpy here: ping runs on the socket thread so it answers while Blender is busy.
-            result = {"product": "vsblender", "version": ADDON_VERSION, "port": _state["port"], "busy": _state["busy"]}
+            result = {"product": "vsblender", "version": ADDON_VERSION, "port": _state["port"], "busy": _state["busy"],
+                      "progress": helpers.progress_state()}
+        elif method == "cancel":
+            result = {"cancelled": helpers.request_cancel(), "busy": _state["busy"]}
         elif method == "session_info":
             result = session_info()
         elif method == "open_file":
@@ -655,21 +551,55 @@ def dispatch(req: dict) -> dict:
         elif method == "run_script":
             result, warnings, changed = run_script(params)
         elif method == "preview":
-            result, warnings = preview(params)
+            root = workspace_root()
+            result, warnings = preview_mod.preview(params, [root])
+        elif method == "checkpoint":
+            result = checkpoint(params)
+        elif method == "restore_checkpoint":
+            result = restore_checkpoint(params)
+        elif method == "list_checkpoints":
+            result = list_checkpoints(params)
+        elif method == "save_copy":
+            result = save_copy(params)
+        elif method == "ingest_live":
+            result = ingest_live(params)
+        elif method == "manifest":
+            result = manifest(params)
+        elif method == "diff_manifests":
+            result = diff_manifests(params)
+        elif method == "compose":
+            result = compose(params)
+        elif method == "api":
+            result = inspect_tools.api(str(params.get("query") or ""), int(params.get("limit") or 60))
+        elif method == "node_schema":
+            result = inspect_tools.node_schema(str(params.get("bl_idname") or ""), params.get("props") or None)
+        elif method == "describe":
+            result = inspect_tools.describe(str(params.get("target") or ""), workspace_root(), blender_ingest)
+        elif method == "find":
+            result = inspect_tools.find(str(params.get("selector") or ""), workspace_root(), int(params.get("limit") or 100))
+        elif method == "spatial":
+            result = inspect_tools.spatial(params, workspace_root())
+        elif method == "object_facts":
+            result = object_facts(params)
+        elif method == "write_role_property":
+            result, warnings, changed = write_role_property(params)
         else:
             return {"id": ident, "ok": False, "error": f"unknown method {method}"}
         return {
             "id": ident,
             "ok": True,
-            "result": result,
+            "result": _jsonable(_with_text(result)),
             "warnings": warnings,
             "changed": changed,
             "ms": int((time.time() - started) * 1000),
         }
     except ScriptError as exc:
-        return {"id": ident, "ok": False, "error": str(exc), "changed": exc.changed, "ms": int((time.time() - started) * 1000)}
+        return {"id": ident, "ok": False, "error": str(exc), "changed": exc.changed, "changes": _jsonable(exc.changes),
+                "ms": int((time.time() - started) * 1000)}
     except Exception as exc:
         detail = str(exc).strip() or exc.__class__.__name__
+        if isinstance(exc, KeyError) and detail.startswith(("'", '"')):
+            detail = detail[1:-1]
         return {"id": ident, "ok": False, "error": detail, "ms": int((time.time() - started) * 1000)}
 
 
@@ -764,22 +694,11 @@ def _bind() -> socket.socket:
 
 
 def _purge_leftovers() -> None:
-    for scene in list(bpy.data.scenes):
-        if scene.name.startswith("_vsblender_preview"):
+    preview_mod.purge_leftovers()
+    for tree in list(bpy.data.node_groups):
+        if tree.name.startswith(("_vsblender_scratch", "_ingest_scratch")):
             try:
-                bpy.data.scenes.remove(scene)
-            except Exception:
-                pass
-    for collection in list(bpy.data.collections):
-        if collection.name.startswith("_vsblender_preview") and collection.users == 0:
-            try:
-                bpy.data.collections.remove(collection)
-            except Exception:
-                pass
-    for obj in list(bpy.data.objects):
-        if obj.name.startswith("_vsblender_preview"):
-            try:
-                bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.data.node_groups.remove(tree)
             except Exception:
                 pass
 
@@ -818,7 +737,11 @@ def ensure_server() -> None:
 
 
 def serve_blocking() -> None:
-    """Headless Blender has no timer loop, so accept on the main thread."""
+    """Headless Blender has no timer loop, so accept on the main thread.
+
+    ping and cancel still need an answer while a request runs, so connections are accepted on a
+    thread and those two are answered there; everything else is handed to the main thread.
+    """
     stop_server()
     _purge_leftovers()
     sock = _bind()
@@ -826,8 +749,9 @@ def serve_blocking() -> None:
     _state["running"] = True
     _state["blocking"] = True
     _state["error"] = ""
-    sock.settimeout(0.5)
-    try:
+
+    def loop():
+        sock.settimeout(0.5)
         while _state["running"]:
             try:
                 conn, _addr = sock.accept()
@@ -835,7 +759,21 @@ def serve_blocking() -> None:
                 continue
             except OSError:
                 break
-            _handle_conn(conn, True)
+            threading.Thread(target=_handle_conn, args=(conn, False), daemon=True).start()
+
+    thread = threading.Thread(target=loop, name="vsblender-bridge", daemon=True)
+    _state["thread"] = thread
+    thread.start()
+    try:
+        while _state["running"]:
+            try:
+                job = _state["queue"].get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                job()
+            except Exception:
+                traceback.print_exc()
     finally:
         _state["blocking"] = False
         _state["running"] = False
@@ -864,7 +802,15 @@ def server_running() -> bool:
 def _load_post(_dummy):
     # A preview interrupted by a crash can be saved into the file; clear it when the file loads.
     _purge_leftovers()
+    history.reset_edited()
     ensure_server()
+
+
+@persistent
+def _save_post(*_args):
+    # Saved: the edits made through the bridge are in the file now. A copy (checkpoint) does not count.
+    if not history.writing_copy():
+        history.reset_edited()
 
 
 def _purge_once():
@@ -909,6 +855,15 @@ class VSBLENDER_PT_panel(bpy.types.Panel):
         else:
             layout.label(text="Stopped")
         layout.operator("vsblender.toggle", text="Stop" if server_running() else "Start")
+        try:
+            recent = history.list_checkpoints(workspace_root())[-3:]
+        except Exception:
+            recent = []
+        if recent:
+            box = layout.box()
+            box.label(text="Recent checkpoints")
+            for entry in reversed(recent):
+                box.label(text=f"{entry.get('id', '')}  {entry.get('label', '')}"[:60])
 
 
 _CLASSES = (VSBlenderPreferences, VSBLENDER_OT_toggle, VSBLENDER_PT_panel)
@@ -920,11 +875,14 @@ def register():
             bpy.utils.register_class(cls)
         if _load_post not in bpy.app.handlers.load_post:
             bpy.app.handlers.load_post.append(_load_post)
+        if _save_post not in bpy.app.handlers.save_post:
+            bpy.app.handlers.save_post.append(_save_post)
         _state["registered"] = True
         # bpy.data is off limits while an add-on registers (at startup and when enabled from
         # Preferences), so the cleanup waits for the first timer tick.
         if not bpy.app.background and not bpy.app.timers.is_registered(_purge_once):
             bpy.app.timers.register(_purge_once, first_interval=0.1)
+    sys.modules["vsblender"] = helpers
     ensure_server()
 
 
@@ -932,9 +890,13 @@ def unregister():
     stop_server()
     if _load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_post)
+    if _save_post in bpy.app.handlers.save_post:
+        bpy.app.handlers.save_post.remove(_save_post)
     for cls in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(cls)
         except RuntimeError:
             pass
+    if sys.modules.get("vsblender") is helpers:
+        del sys.modules["vsblender"]
     _state["registered"] = False
