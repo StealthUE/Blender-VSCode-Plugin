@@ -93,7 +93,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     const probe = await probeBridge(config.port);
     if (probe.ok) {
-      status.text = `$(debug-start) Blender :${config.port}${probe.busy ? " (busy)" : ""}`;
+      const share = typeof probe.progress?.fraction === "number" ? ` ${Math.round(probe.progress.fraction * 100)}%` : "";
+      status.text = `$(debug-start) Blender :${config.port}${probe.busy ? ` (busy${share})` : ""}`;
       status.tooltip = probe.version && probe.version !== ADDON_VERSION
         ? `${probe.detail}. The add-on in Blender is ${probe.version}; this extension ships ${ADDON_VERSION}. Run Doctor.`
         : probe.detail;
@@ -151,7 +152,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (!folder) return;
     const outcome = await vscode.window.withProgress(
       { location: vscode.ProgressLocation.Window, title: "VSBlender doctor" },
-      () => doctor(toolContext(context, output, folder), {})
+      () => doctor(toolContext(context, output, folder), false)
     );
     output.appendLine(outcome.text);
     output.show(true);
@@ -192,26 +193,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   // Registered whether or not setup has run, and checked per event, so finishing setup
   // later in this window starts watching without a reload.
   const blendWatcher = vscode.workspace.createFileSystemWatcher("**/*.blend");
+  /** A workspace .blend, not a checkpoint or a render job's copy under .blender-ai/. */
+  const ownBlend = (folder: string, uri: vscode.Uri): boolean => {
+    if (!uri.fsPath.toLowerCase().endsWith(".blend")) return false;
+    const rel = path.relative(folder, uri.fsPath);
+    return !rel.startsWith("..") && !rel.split(/[\\/]/).includes(".blender-ai");
+  };
   const onBlend = (uri: vscode.Uri): void => {
     const folder = root();
-    if (!folder || !readConfig(folder) || !autoIngestOn()) return;
-    if (!uri.fsPath.toLowerCase().endsWith(".blend")) return;
-    if (path.relative(folder, uri.fsPath).startsWith("..")) return;
+    if (!folder || !readConfig(folder) || !autoIngestOn() || !ownBlend(folder, uri)) return;
     scheduleIngest(context, folder, output, uri.fsPath);
   };
-  blendWatcher.onDidCreate(onBlend);
-  blendWatcher.onDidChange(onBlend);
-  context.subscriptions.push(blendWatcher);
-
-  // An ingest run by the AI through MCP writes state.json. Refresh the status column in the guides.
-  const stateWatcher = vscode.workspace.createFileSystemWatcher("**/.blender-ai/*/state.json");
-  const onState = (): void => {
+  // The guides list the .blend files, so adding or removing one rewrites them.
+  const onBlendSet = (uri: vscode.Uri): void => {
     const folder = root();
-    if (folder && readConfig(folder)) scheduleRefresh(context, folder, output);
+    if (!folder || !readConfig(folder) || !ownBlend(folder, uri)) return;
+    cachedRoot = undefined;
+    scheduleRefresh(context, folder, output);
   };
-  stateWatcher.onDidCreate(onState);
-  stateWatcher.onDidChange(onState);
-  context.subscriptions.push(stateWatcher);
+  blendWatcher.onDidCreate((uri) => {
+    onBlend(uri);
+    onBlendSet(uri);
+  });
+  blendWatcher.onDidChange(onBlend);
+  blendWatcher.onDidDelete(onBlendSet);
+  context.subscriptions.push(blendWatcher);
 
   const folder = root();
   if (!folder) return;
@@ -229,7 +235,9 @@ async function startWorkspace(context: vscode.ExtensionContext, folder: string, 
   await refreshClientFiles(context, folder, output);
   if (!autoIngestOn()) return;
   for (const file of listBlendFiles(folder)) {
-    if (ingestStatus(file) !== "current") enqueueIngest(context, folder, output, file, "external", false);
+    // A "live" sidecar was written on purpose from an unsaved session; re-reading the file would lose it.
+    const state = ingestStatus(file);
+    if (state === "new" || state === "stale") enqueueIngest(context, folder, output, file, "external", false);
   }
 }
 
@@ -255,6 +263,10 @@ async function refreshClientFiles(context: vscode.ExtensionContext, folder: stri
       clients: config.clients,
       replaceLegacy: config.replaceLegacy,
       launch,
+      ...(config.allowScripts !== undefined ? { allowScripts: config.allowScripts } : {}),
+      ...(config.ignoreClientConfig !== undefined ? { ignoreClientConfig: config.ignoreClientConfig } : {}),
+      ...(config.checkpoints ? { checkpoints: config.checkpoints } : {}),
+      ...(config.libPaths ? { libPaths: config.libPaths } : {}),
     });
     // config.json is rewritten on every refresh even when nothing changed; only report real writes.
     const written = applied.written.filter((file) => !file.endsWith("config.json"));

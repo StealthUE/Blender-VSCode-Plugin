@@ -1,11 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
-import { blendTable, renderGuide, writeGuides } from "./aiFiles";
-import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
+import { blendList, renderGuide, writeGuides } from "./aiFiles";
+import { listBlendFiles, relativeTo } from "./blendFiles";
 import {
   claudeServerEntry,
+  clineServerEntry,
   fileIsEmptyJson,
-  mergeClaudeDeny,
+  mergeClaudeLocal,
+  mergeClaudeSettings,
   mergeGitignore,
   mergeGrokToml,
   mergeMcpJson,
@@ -17,7 +19,7 @@ import {
   writeIfChanged,
 } from "./configWrite";
 import { writeConfig } from "./projectConfig";
-import { ClientFlags, ProjectConfig, ServerLaunch } from "./types";
+import { CheckpointSettings, ClientFlags, ProjectConfig, ServerLaunch } from "./types";
 
 export interface ApplyInput {
   workspace: string;
@@ -27,6 +29,12 @@ export interface ApplyInput {
   clients: ClientFlags;
   replaceLegacy: boolean;
   launch: ServerLaunch;
+  /** undefined: leave the run_script rule in .claude/settings.local.json as it is. */
+  allowScripts?: boolean;
+  /** undefined means true: the client MCP files are git-ignored. */
+  ignoreClientConfig?: boolean;
+  checkpoints?: CheckpointSettings;
+  libPaths?: string[];
 }
 
 export interface ApplyResult {
@@ -51,12 +59,17 @@ function record(result: ApplyResult, file: string, state: "written" | "unchanged
 
 export function applyWorkspace(input: ApplyInput): ApplyResult {
   const result: ApplyResult = { written: [], unchanged: [], skipped: [], removed: [] };
+  const ignoreClientConfig = input.ignoreClientConfig ?? true;
   const config: ProjectConfig = {
     version: 1,
     port: input.port,
     ...(input.blender ? { blender: input.blender } : {}),
     clients: input.clients,
     replaceLegacy: input.replaceLegacy,
+    ...(input.allowScripts !== undefined ? { allowScripts: input.allowScripts } : {}),
+    ignoreClientConfig,
+    ...(input.checkpoints ? { checkpoints: input.checkpoints } : {}),
+    ...(input.libPaths ? { libPaths: input.libPaths } : {}),
   };
   const configFile = writeConfig(input.workspace, config);
   result.written.push(configFile);
@@ -65,7 +78,7 @@ export function applyWorkspace(input: ApplyInput): ApplyResult {
     { rel: ".mcp.json", style: "mcpServers", enabled: input.clients.claude, entry: claudeServerEntry(input.launch) },
     { rel: path.join(".vscode", "mcp.json"), style: "servers", enabled: input.clients.vscode, entry: vscodeServerEntry(input.launch) },
     { rel: path.join(".cursor", "mcp.json"), style: "mcpServers", enabled: input.clients.cursor, entry: claudeServerEntry(input.launch) },
-    { rel: path.join(".cline", "mcp.json"), style: "mcpServers", enabled: input.clients.cline, entry: claudeServerEntry(input.launch) },
+    { rel: path.join(".cline", "mcp.json"), style: "mcpServers", enabled: input.clients.cline, entry: clineServerEntry(input.launch, input.allowScripts === true) },
   ];
 
   for (const target of targets) {
@@ -108,23 +121,25 @@ export function applyWorkspace(input: ApplyInput): ApplyResult {
   const templatePath = path.join(input.extensionRoot, "resources", "blender-guide.md");
   const template = fs.existsSync(templatePath)
     ? fs.readFileSync(templatePath, "utf8")
-    : "# VSBlender\n\n{{BLEND_TABLE}}\n\nPort {{PORT}}\n";
-  const rows = listBlendFiles(input.workspace).map((file) => ({
-    rel: relativeTo(input.workspace, file),
-    status: ingestStatus(file),
-  }));
-  const guides = writeGuides(input.workspace, input.clients, renderGuide(template, blendTable(rows), input.port));
+    : "# VSBlender\n\n{{BLEND_LIST}}\n\nPort {{PORT}}\n";
+  const rows = listBlendFiles(input.workspace).map((file) => relativeTo(input.workspace, file));
+  const guides = writeGuides(input.workspace, input.clients, renderGuide(template, blendList(rows), input.port));
   result.written.push(...guides.written);
   result.skipped.push(...guides.skipped);
   result.removed.push(...guides.removed);
 
+  // Grok reads Claude Code's permission files when it has no permission rules of its own.
   if (input.clients.claude || input.clients.grok) {
-    const denyFile = path.join(input.workspace, ".claude", "settings.json");
-    const next = mergeClaudeDeny(readText(denyFile));
-    record(result, denyFile, writeIfChanged(denyFile, next));
+    const settingsFile = path.join(input.workspace, ".claude", "settings.json");
+    record(result, settingsFile, writeIfChanged(settingsFile, mergeClaudeSettings(readText(settingsFile))));
+    const localFile = path.join(input.workspace, ".claude", "settings.local.json");
+    const localExisting = readText(localFile);
+    const localNext = mergeClaudeLocal(localExisting, input.allowScripts);
+    if (localNext === undefined && localExisting !== undefined) result.skipped.push(localFile);
+    else if (localNext !== undefined && localNext !== localExisting) record(result, localFile, writeIfChanged(localFile, localNext));
   }
 
   const ignoreFile = path.join(input.workspace, ".gitignore");
-  record(result, ignoreFile, writeIfChanged(ignoreFile, mergeGitignore(readText(ignoreFile))));
+  record(result, ignoreFile, writeIfChanged(ignoreFile, mergeGitignore(readText(ignoreFile), ignoreClientConfig)));
   return result;
 }

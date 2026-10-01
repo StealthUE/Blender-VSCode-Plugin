@@ -1,6 +1,7 @@
 import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
-import { serverLaunch } from "./configWrite";
+import { hasScriptRule, readText, serverLaunch } from "./configWrite";
 import { installAddon, runDoctor } from "./doctor";
 import { findBlenders, findNode } from "./findBlender";
 import { readConfig } from "./projectConfig";
@@ -14,6 +15,8 @@ interface PanelState {
   port: number;
   clients: ClientFlags;
   replaceLegacy: boolean;
+  allowScripts: boolean;
+  ignoreClientConfig: boolean;
   node?: string;
 }
 
@@ -48,6 +51,8 @@ async function collectState(workspace: string): Promise<PanelState> {
     port: saved?.port ?? clampPort(settings.get<number>("port"), DEFAULT_PORT),
     clients: configuredClients(workspace),
     replaceLegacy: saved?.replaceLegacy ?? settings.get<boolean>("replaceLegacy") !== false,
+    allowScripts: saved?.allowScripts ?? hasScriptRule(readText(path.join(workspace, ".claude", "settings.local.json"))),
+    ignoreClientConfig: saved?.ignoreClientConfig ?? true,
     ...(node ? { node } : {}),
   };
 }
@@ -97,6 +102,12 @@ function html(state: PanelState): string {
     ${box("cline", "Cline — off by default")}
     <label><input type="checkbox" id="replace" ${state.replaceLegacy ? "checked" : ""}> Remove existing mcp-for-blender entries</label>
   </fieldset>
+  <fieldset>
+    <legend>Approvals and git</legend>
+    <p class="muted">Claude Code runs the read-only VSBlender tools (session_info, context_pack, preview, ingest, describe, find, api and the like) without asking. Tools that change Blender still ask.</p>
+    <label><input type="checkbox" id="allowScripts" ${state.allowScripts ? "checked" : ""}> Also let Claude Code run scripts in Blender without asking (run_script runs any Python). Saved in .claude/settings.local.json, which is personal and not committed.</label>
+    <label><input type="checkbox" id="ignoreClientConfig" ${state.ignoreClientConfig ? "checked" : ""}> Keep the MCP config files out of git. .mcp.json and the others hold paths for this machine; each person runs setup.</label>
+  </fieldset>
   <label>Bridge port <input type="number" id="port" min="1024" max="65535" value="${state.port}"></label>
   <p class="muted">Node: ${escapeText(state.node ?? "not on PATH — VS Code will be used to run the MCP server")}</p>
   <button id="go" type="button">Install and configure</button>
@@ -123,7 +134,9 @@ function html(state: PanelState): string {
         blender: typed || (picked ? picked.value : ""),
         port: Number(document.getElementById("port").value),
         clients: clients(),
-        replaceLegacy: document.getElementById("replace").checked
+        replaceLegacy: document.getElementById("replace").checked,
+        allowScripts: document.getElementById("allowScripts").checked,
+        ignoreClientConfig: document.getElementById("ignoreClientConfig").checked
       });
     });
     window.addEventListener("message", (event) => {
@@ -168,6 +181,7 @@ export async function showSetup(
     enableScripts: true,
     retainContextWhenHidden: true,
   });
+  panel.iconPath = vscode.Uri.joinPath(context.extensionUri, "resources", "blender_logo.png");
   const current = panel;
   current.onDidDispose(() => {
     panel = undefined;
@@ -178,7 +192,10 @@ export async function showSetup(
   current.webview.html = html(state);
   output.appendLine(`Setup opened for ${workspace}`);
 
-  current.webview.onDidReceiveMessage(async (message: { type?: string; blender?: string; port?: number; clients?: unknown; replaceLegacy?: boolean }) => {
+  current.webview.onDidReceiveMessage(async (message: {
+    type?: string; blender?: string; port?: number; clients?: unknown; replaceLegacy?: boolean;
+    allowScripts?: boolean; ignoreClientConfig?: boolean;
+  }) => {
     if (message.type === "launch") {
       await vscode.commands.executeCommand("vsblender.launch");
       return;
@@ -218,7 +235,14 @@ export async function showSetup(
     post(installed.ok ? installed.message : `Add-on install failed. Launch Blender from VS Code still loads the bridge from the extension.\n${installed.message}`);
     // The Blender path and port are saved in .blender-ai/config.json (git-ignored), not in
     // .vscode/settings.json, which is often committed and would carry this machine's paths.
-    const applied = applyWorkspace({ workspace, extensionRoot, port, blender, clients, replaceLegacy, launch });
+    const saved = readConfig(workspace);
+    const allowScripts = message.allowScripts === true;
+    const ignoreClientConfig = message.ignoreClientConfig !== false;
+    const applied = applyWorkspace({
+      workspace, extensionRoot, port, blender, clients, replaceLegacy, launch, allowScripts, ignoreClientConfig,
+      ...(saved?.checkpoints ? { checkpoints: saved.checkpoints } : {}),
+      ...(saved?.libPaths ? { libPaths: saved.libPaths } : {}),
+    });
     for (const file of applied.written) post(`wrote ${file}`);
     for (const file of applied.removed) post(`removed ${file}`);
     for (const file of applied.skipped) post(`left untouched (not ours, or not valid JSON): ${file}`);
@@ -235,7 +259,12 @@ export async function showSetup(
     const report = await runDoctor(ctx, { electronPath: process.execPath });
     post(report.ok ? "Doctor passed." : "Doctor found something still wrong. The report is below.");
     const next: string[] = [];
-    if (clients.claude) next.push("Claude Code asks you to approve the vsblender server in .mcp.json the first time it starts in this folder.");
+    if (clients.claude) {
+      next.push("Claude Code asks you to approve the vsblender server in .mcp.json the first time it starts in this folder.");
+      next.push(allowScripts
+        ? "Claude Code runs VSBlender's read-only tools and run_script without asking."
+        : "Claude Code runs VSBlender's read-only tools without asking; run_script still asks each time.");
+    }
     if (clients.vscode) next.push("VS Code: start the vsblender server from .vscode/mcp.json (or the MCP Servers view) if it does not start by itself.");
     next.push("Launch Blender below, or open Blender yourself: the add-on starts the bridge on its own once it is enabled.");
     void current.webview.postMessage({ type: "done", report: `${report.text}\n\nNext:\n- ${next.join("\n- ")}`, configured: true });

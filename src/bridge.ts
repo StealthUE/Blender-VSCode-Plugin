@@ -1,5 +1,14 @@
 import * as net from "net";
 
+/** What run_script changed, by category. modified[category][name] lists the aspects that changed. */
+export interface ChangeReport {
+  added: string[];
+  removed: string[];
+  recreated: string[];
+  renamed: { from: string; to: string }[];
+  modified: Record<string, Record<string, string[]>>;
+}
+
 export interface BridgeResponse {
   id?: number;
   ok: boolean;
@@ -7,6 +16,7 @@ export interface BridgeResponse {
   error?: string;
   warnings?: string[];
   changed?: string[];
+  changes?: ChangeReport;
   ms?: number;
 }
 
@@ -59,12 +69,20 @@ export function callBridge(
  */
 export type ProbeState = "listening" | "absent" | "unresponsive" | "foreign" | "error";
 
+export interface ScriptProgress {
+  label?: string;
+  fraction?: number | null;
+  message?: string;
+  seconds?: number;
+}
+
 export interface Probe {
   ok: boolean;
   state: ProbeState;
   detail: string;
   version?: string;
   busy?: string;
+  progress?: ScriptProgress;
 }
 
 export async function probeBridge(port: number): Promise<Probe> {
@@ -73,12 +91,16 @@ export async function probeBridge(port: number): Promise<Probe> {
     if (response.ok && response.result?.["product"] === "vsblender") {
       const version = String(response.result["version"] ?? "");
       const busy = String(response.result["busy"] ?? "");
+      const progress = response.result["progress"] as ScriptProgress | undefined;
+      const hasProgress = Boolean(progress && Object.keys(progress).length);
+      const share = hasProgress && typeof progress?.fraction === "number" ? ` ${Math.round(progress.fraction * 100)}%` : "";
       return {
         ok: true,
         state: "listening",
-        detail: `listening on ${port}${busy ? ` (busy: ${busy})` : ""}`,
+        detail: `listening on ${port}${busy ? ` (busy: ${busy}${share}${hasProgress && progress?.message ? `, ${progress.message}` : ""})` : ""}`,
         version,
         ...(busy ? { busy } : {}),
+        ...(hasProgress && progress ? { progress } : {}),
       };
     }
     if (response.ok) return { ok: false, state: "foreign", detail: `port ${port} answered, but it is not the VSBlender bridge` };
@@ -91,4 +113,39 @@ export async function probeBridge(port: number): Promise<Probe> {
     }
     return { ok: false, state: "error", detail: message };
   }
+}
+
+/** Ask a running script to stop at its next vsblender.progress() call. Answered while Blender is busy. */
+export async function cancelScript(port: number): Promise<boolean> {
+  try {
+    const response = await callBridge(port, "cancel", {}, 1500);
+    return response.ok && response.result?.["cancelled"] === true;
+  } catch {
+    return false;
+  }
+}
+
+/** One line per category, for tool replies and the journal. */
+export function formatChanges(report: ChangeReport | undefined, limit = 12): string[] {
+  if (!report) return [];
+  const lines: string[] = [];
+  const list = (items: string[]): string =>
+    items.slice(0, limit).join(", ") + (items.length > limit ? ` (+${items.length - limit} more)` : "");
+  if (report.added?.length) lines.push(`added: ${list(report.added)}`);
+  if (report.removed?.length) lines.push(`removed: ${list(report.removed)}`);
+  if (report.recreated?.length) lines.push(`recreated (deleted and built again under the same name): ${list(report.recreated)}`);
+  if (report.renamed?.length) lines.push(`renamed: ${list(report.renamed.map((r) => `${r.from} -> ${r.to}`))}`);
+  for (const [category, items] of Object.entries(report.modified ?? {})) {
+    const names = Object.keys(items);
+    if (category === "scenes") {
+      for (const name of names) {
+        const paths = items[name] ?? [];
+        lines.push(`scene ${name}: ${paths.slice(0, 20).join("; ")}${paths.length > 20 ? ` (+${paths.length - 20} more)` : ""}`);
+      }
+      continue;
+    }
+    const shown = names.slice(0, limit).map((name) => `${name} (${(items[name] ?? []).slice(0, 4).join(", ")})`);
+    lines.push(`modified ${category}: ${shown.join(", ")}${names.length > limit ? ` (+${names.length - limit} more)` : ""}`);
+  }
+  return lines;
 }

@@ -1,3 +1,4 @@
+import * as fs from "fs";
 import * as path from "path";
 import { execFileText } from "./exec";
 
@@ -27,9 +28,36 @@ export interface IngestResult {
 /**
  * Always the copy shipped with the extension. Auto-ingest runs when a folder opens, so a
  * blender_ingest.py taken from the workspace would let any cloned repo run its own Python.
+ * It lives inside the add-on package, so the add-on can also ingest the live session.
  */
 export function ingestScript(extensionRoot: string): string {
-  return path.join(extensionRoot, "resources", "blender_ingest.py");
+  return path.join(extensionRoot, "resources", "addon", "vsblender_bridge", "blender_ingest.py");
+}
+
+/** Write the manifest of a .blend (a checkpoint, say) without touching its sidecar. */
+export async function manifestHeadless(blender: string, script: string, blendFile: string, out: string): Promise<string> {
+  const result = await execFileText(blender, [
+    "-b", "--factory-startup", "--disable-autoexec", blendFile, "--python-exit-code", "1", "--python", script,
+    "--", "--manifest-to", out,
+  ], { timeout: 300000 });
+  const parsed = parseIngestResult(`${result.stdout}\n${result.stderr}`);
+  if (!parsed || parsed["status"] !== "manifest") {
+    throw new Error(`could not build the manifest of ${blendFile}: ${String(parsed?.["error"] ?? `${result.stdout}${result.stderr}`.slice(-800))}`);
+  }
+  return out;
+}
+
+/** Compare two manifest files with the ingester's diff, in a Blender that opens no file. */
+export async function diffHeadless(blender: string, script: string, a: string, b: string, out: string): Promise<unknown[]> {
+  const result = await execFileText(blender, [
+    "-b", "--factory-startup", "--python-exit-code", "1", "--python", script, "--", "--diff", a, b, "--diff-to", out,
+  ], { timeout: 120000 });
+  const parsed = parseIngestResult(`${result.stdout}\n${result.stderr}`);
+  if (!parsed || parsed["status"] !== "diff") {
+    throw new Error(`diff failed: ${String(parsed?.["error"] ?? `${result.stdout}${result.stderr}`.slice(-800))}`);
+  }
+  const data: unknown = JSON.parse(fs.readFileSync(out, "utf8"));
+  return Array.isArray(data) ? data : [];
 }
 
 export function parseIngestResult(output: string): Record<string, unknown> | undefined {

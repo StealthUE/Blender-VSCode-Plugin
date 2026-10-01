@@ -2,12 +2,13 @@ import * as fs from "fs";
 import * as path from "path";
 import { execFileText } from "./exec";
 import { compareVersions, findNode } from "./findBlender";
-import { probeBridge } from "./bridge";
+import { callBridge, probeBridge } from "./bridge";
 import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
 import { readConfig } from "./projectConfig";
 import { applyWorkspace } from "./workspaceSetup";
-import { serverLaunch } from "./configWrite";
-import { ADDON_VERSION, ClientFlags, DEFAULT_CLIENTS, WorkspaceContext } from "./types";
+import { hasScriptRule, readText, serverLaunch } from "./configWrite";
+import { AUTO_APPROVE, claudeRule } from "./toolDefs";
+import { ADDON_VERSION, ClientFlags, DEFAULT_CHECKPOINTS, DEFAULT_CLIENTS, DEFAULT_LIB_PATHS, WorkspaceContext } from "./types";
 
 export interface Check {
   id: string;
@@ -87,7 +88,8 @@ export async function runDoctor(
 
   if (options?.fix && launch && ctx.blender) {
     const installed = await installAddon(ctx.blender, ctx.extensionRoot, ctx.port);
-    checks.push(check("add-on install", installed.ok, installed.message));
+    checks.push(check("add-on install", installed.ok, installed.message + (installed.ok ? ". Restart Blender to load it." : "")));
+    const saved = readConfig(ctx.workspace);
     const applied = applyWorkspace({
       workspace: ctx.workspace,
       extensionRoot: ctx.extensionRoot,
@@ -96,6 +98,10 @@ export async function runDoctor(
       clients: ctx.clients,
       replaceLegacy: ctx.replaceLegacy,
       launch,
+      ...(saved?.allowScripts !== undefined ? { allowScripts: saved.allowScripts } : {}),
+      ...(saved?.ignoreClientConfig !== undefined ? { ignoreClientConfig: saved.ignoreClientConfig } : {}),
+      ...(saved?.checkpoints ? { checkpoints: saved.checkpoints } : {}),
+      ...(saved?.libPaths ? { libPaths: saved.libPaths } : {}),
     });
     checks.push(check("config", true, `rewrote ${applied.written.length} file(s); skipped ${applied.skipped.length}`));
   }
@@ -125,20 +131,54 @@ export async function runDoctor(
     checks.push(check(file.label, exists && mentions, exists && mentions ? file.path : `missing vsblender entry in ${file.path}`));
   }
 
+  if (ctx.clients.claude || ctx.clients.grok) {
+    const settings = readText(path.join(ctx.workspace, ".claude", "settings.json")) ?? "";
+    const missing = AUTO_APPROVE.map(claudeRule).filter((rule) => !settings.includes(`"${rule}"`));
+    const scripts = hasScriptRule(readText(path.join(ctx.workspace, ".claude", "settings.local.json")))
+      ? "run_script runs without asking (settings.local.json)"
+      : "run_script asks each time";
+    checks.push(check("claude permissions", !missing.length,
+      missing.length ? `${missing.length} read-only tool(s) still ask for approval (${missing.slice(0, 3).join(", ")}...). Run doctor_fix.`
+        : `read-only tools run without asking; ${scripts}`, true));
+  }
+
   const bridge = await probeBridge(ctx.port);
+  let live: { file?: string; dirty?: boolean; status?: string; detail?: string } = {};
   if (bridge.ok && bridge.version && bridge.version !== ADDON_VERSION) {
-    checks.push(check("bridge", false, `${bridge.detail}, but the add-on in Blender is ${bridge.version} and this extension ships ${ADDON_VERSION}. Run doctor with fix, then restart Blender.`, true));
+    checks.push(check("bridge", false, `${bridge.detail}, but the add-on in Blender is ${bridge.version} and this extension ships ${ADDON_VERSION}. Run doctor_fix, then restart Blender (or close Blender and use launch_blender, which loads the shipped add-on).`, true));
   } else if (bridge.state === "absent") {
     checks.push(check("bridge", false, `${bridge.detail}. Blender is not open with the add-on yet: use Launch Blender.`, true));
   } else {
     checks.push(check("bridge", bridge.ok, bridge.detail));
+    if (bridge.ok && !bridge.busy) {
+      try {
+        const info = await callBridge(ctx.port, "session_info", {}, 15000);
+        const sidecar = info.result?.["sidecar"] as { status?: string; detail?: string } | undefined;
+        live = {
+          file: String(info.result?.["file"] ?? ""),
+          dirty: info.result?.["dirty"] === true,
+          ...(sidecar?.status ? { status: sidecar.status } : {}),
+          ...(sidecar?.detail ? { detail: sidecar.detail } : {}),
+        };
+      } catch {
+        live = {};
+      }
+    }
   }
 
   const blends = listBlendFiles(ctx.workspace);
   if (!blends.length) {
     checks.push(check("blend files", true, "no .blend files in the workspace"));
   } else {
-    const summary = blends.map((file) => `${relativeTo(ctx.workspace, file)} (${ingestStatus(file)})`).join(", ");
+    const summary = blends.map((file) => {
+      const rel = relativeTo(ctx.workspace, file);
+      const fold = (p: string): string => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p));
+      const open = live.file && fold(live.file) === fold(file);
+      if (open && live.status) {
+        return `${rel} (${live.status}, open in Blender${live.dirty ? " with unsaved changes" : ""}${live.status === "current" ? "" : `: ${live.detail ?? ""}`})`;
+      }
+      return `${rel} (${ingestStatus(file)})`;
+    }).join(", ");
     checks.push(check("blend files", true, summary));
   }
 
@@ -171,5 +211,7 @@ export function contextFromConfig(
     ...(blender ? { blender } : {}),
     clients: overrides?.clients ?? config?.clients ?? DEFAULT_CLIENTS,
     replaceLegacy: config?.replaceLegacy ?? true,
+    checkpoints: config?.checkpoints ?? DEFAULT_CHECKPOINTS,
+    libPaths: config?.libPaths ?? DEFAULT_LIB_PATHS,
   };
 }

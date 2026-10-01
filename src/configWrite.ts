@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { AUTO_APPROVE, claudeRule, SCRIPT_TOOL, TOOL_NAMES } from "./toolDefs";
 import { ServerLaunch, SERVER_NAME } from "./types";
 
 export interface LaunchInput {
@@ -103,6 +104,11 @@ export function claudeServerEntry(launch: ServerLaunch): JsonRecord {
   return { command: launch.command, args: launch.args, env: launch.env };
 }
 
+/** Cline reads alwaysAllow from the server entry: the read-only tools, plus run_script when allowed. */
+export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean): JsonRecord {
+  return { ...claudeServerEntry(launch), alwaysAllow: [...AUTO_APPROVE, ...(allowScripts ? [SCRIPT_TOOL] : [])], disabled: false };
+}
+
 const TOOL_TIMEOUT_SEC = 600;
 
 function tomlString(value: string): string {
@@ -159,22 +165,33 @@ export function removeGrokServer(existing: string): string {
   return mergeGrokToml(existing, "").replace(/\n{3,}/g, "\n\n").replace(/^\n+/, "");
 }
 
-const GITIGNORE_BLOCK = [
-  "# vsblender-begin",
+const GITIGNORE_BASE = [
   ".blender-ai/config.json",
   ".blender-ai/launch.log",
   ".blender-ai/live/",
+  ".blender-ai/jobs/",
+  ".blender-ai/renders/",
+  ".blender-ai/references/",
   ".blender-ai/**/state.json",
   ".blender-ai/**/previews/",
   ".blender-ai/**/checkpoints/",
   ".blender-ai/**/texts/",
-  "# vsblender-end",
-].join("\n");
+  ".claude/settings.local.json",
+];
 
-export function mergeGitignore(existing: string | undefined): string {
+/** The MCP files setup writes hold this machine's paths (node, the extension's storage folder). */
+export const CLIENT_CONFIG_FILES = [".mcp.json", ".vscode/mcp.json", ".grok/config.toml", ".cursor/mcp.json", ".cline/mcp.json"];
+
+export function mergeGitignore(existing: string | undefined, ignoreClientConfig = false): string {
   const source = existing ?? "";
   const without = source.replace(/# vsblender-begin[\s\S]*?# vsblender-end\r?\n?/g, "").replace(/\s+$/, "");
-  return (without ? `${without}\n\n` : "") + GITIGNORE_BLOCK + "\n";
+  const lines = ["# vsblender-begin", ...GITIGNORE_BASE];
+  if (ignoreClientConfig) {
+    lines.push("# MCP client config written by VSBlender setup: paths for this machine. Each person runs setup.");
+    lines.push(...CLIENT_CONFIG_FILES);
+  }
+  lines.push("# vsblender-end");
+  return (without ? `${without}\n\n` : "") + lines.join("\n") + "\n";
 }
 
 const BLEND_DENY = [
@@ -184,24 +201,71 @@ const BLEND_DENY = [
   "Edit(**/*.blend1)",
 ];
 
-export function mergeClaudeDeny(existing: string | undefined): string | undefined {
-  let settings: JsonRecord = {};
-  if (existing !== undefined) {
-    try {
-      const parsed: unknown = JSON.parse(existing);
-      if (!isRecord(parsed)) return undefined;
-      settings = parsed;
-    } catch {
-      return undefined;
-    }
+function parseSettings(existing: string | undefined): JsonRecord | undefined {
+  if (existing === undefined) return {};
+  try {
+    const parsed: unknown = JSON.parse(existing);
+    return isRecord(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
   }
+}
+
+function ruleList(permissions: JsonRecord, key: string): string[] {
+  return Array.isArray(permissions[key]) ? (permissions[key] as unknown[]).map((item) => String(item)) : [];
+}
+
+/**
+ * .claude/settings.json: deny reading or editing .blend files, and allow the read-only VSBlender tools
+ * without asking. Rules for tools that no longer exist are dropped. Other rules are left alone.
+ */
+export function mergeClaudeSettings(existing: string | undefined): string | undefined {
+  const settings = parseSettings(existing);
+  if (!settings) return undefined;
   const permissions = isRecord(settings["permissions"]) ? { ...settings["permissions"] } : {};
-  const deny = Array.isArray(permissions["deny"]) ? permissions["deny"].map((item) => String(item)) : [];
-  const missing = BLEND_DENY.filter((rule) => !deny.includes(rule));
-  if (!missing.length && existing !== undefined) return existing;
-  permissions["deny"] = [...deny, ...missing];
+  const deny = ruleList(permissions, "deny");
+  const allow = ruleList(permissions, "allow");
+  const ours = new Set(TOOL_NAMES.map(claudeRule));
+  // Old builds allowed tool names that were renamed or split; keep only rules for tools that exist.
+  const keptAllow = allow.filter((rule) => !rule.startsWith("mcp__vsblender__") || ours.has(rule));
+  const wantAllow = AUTO_APPROVE.map(claudeRule);
+  const nextAllow = [...keptAllow, ...wantAllow.filter((rule) => !keptAllow.includes(rule))];
+  const nextDeny = [...deny, ...BLEND_DENY.filter((rule) => !deny.includes(rule))];
+  if (existing !== undefined && JSON.stringify(nextAllow) === JSON.stringify(allow) && JSON.stringify(nextDeny) === JSON.stringify(deny)) {
+    return existing;
+  }
+  permissions["allow"] = nextAllow;
+  permissions["deny"] = nextDeny;
   settings["permissions"] = permissions;
   return JSON.stringify(settings, null, 2) + "\n";
+}
+
+/** Kept for callers of the first version: deny rules plus the read-only allow rules. */
+export const mergeClaudeDeny = mergeClaudeSettings;
+
+/**
+ * .claude/settings.local.json is personal and not committed: the place for "run scripts without
+ * asking". allow undefined leaves the file as it is.
+ */
+export function mergeClaudeLocal(existing: string | undefined, allowScripts: boolean | undefined): string | undefined {
+  if (allowScripts === undefined) return existing;
+  const settings = parseSettings(existing);
+  if (!settings) return undefined;
+  const permissions = isRecord(settings["permissions"]) ? { ...settings["permissions"] } : {};
+  const allow = ruleList(permissions, "allow");
+  const rule = claudeRule(SCRIPT_TOOL);
+  const has = allow.includes(rule);
+  if (has === allowScripts) return existing;
+  if (existing === undefined && !allowScripts) return undefined;
+  permissions["allow"] = allowScripts ? [...allow, rule] : allow.filter((item) => item !== rule);
+  settings["permissions"] = permissions;
+  return JSON.stringify(settings, null, 2) + "\n";
+}
+
+export function hasScriptRule(existing: string | undefined): boolean {
+  const settings = parseSettings(existing);
+  const permissions = settings && isRecord(settings["permissions"]) ? settings["permissions"] : {};
+  return ruleList(permissions, "allow").includes(claudeRule(SCRIPT_TOOL));
 }
 
 export function writeIfChanged(file: string, body: string | undefined): "written" | "unchanged" | "skipped" {

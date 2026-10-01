@@ -11,7 +11,12 @@ const SKIP_DIRS = new Set([
   ".blender-ai",
 ]);
 
-export type IngestStatus = "new" | "current" | "stale";
+/**
+ * From the files alone: new (no sidecar), current (it matches the .blend), stale (the .blend changed
+ * since), live (it was built from a Blender session with unsaved changes, so it does not match the
+ * file on disk). diverged needs the running Blender and comes from session_info.
+ */
+export type IngestStatus = "new" | "current" | "stale" | "live" | "diverged";
 
 export function sidecarDir(blendFile: string): string {
   const dir = path.dirname(blendFile);
@@ -59,13 +64,43 @@ export function ingestStatus(blendFile: string): IngestStatus {
   const statePath = path.join(sidecarDir(blendFile), "state.json");
   if (!fs.existsSync(statePath)) return "new";
   try {
-    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as { sha256?: string };
+    const state = JSON.parse(fs.readFileSync(statePath, "utf8")) as { sha256?: string; source?: string; dirty?: boolean };
     const sha = fileSha256(blendFile);
-    if (sha && state.sha256 === sha) return "current";
-    return "stale";
+    if (!sha || state.sha256 !== sha) return "stale";
+    return state.source === "live" && state.dirty ? "live" : "current";
   } catch {
     return "stale";
   }
+}
+
+export interface CheckpointEntry {
+  id: string;
+  file: string;
+  label?: string;
+  auto?: boolean;
+  time?: string;
+  scene?: string;
+  script?: string;
+  reason?: string;
+}
+
+/** Checkpoints written by the add-on, oldest first. `file` is relative to the workspace. */
+export function readCheckpoints(blendFile: string): CheckpointEntry[] {
+  try {
+    const data: unknown = JSON.parse(fs.readFileSync(path.join(sidecarDir(blendFile), "checkpoints", "index.json"), "utf8"));
+    return Array.isArray(data) ? (data as CheckpointEntry[]).filter((e) => e && typeof e.id === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+export function findCheckpoint(blendFile: string, id: string): CheckpointEntry | undefined {
+  const entries = readCheckpoints(blendFile);
+  if ((id === "last" || id === "latest") && entries.length) return entries[entries.length - 1];
+  const exact = entries.find((entry) => entry.id === id);
+  if (exact) return exact;
+  const prefixed = entries.filter((entry) => entry.id.startsWith(id));
+  return prefixed.length === 1 ? prefixed[0] : undefined;
 }
 
 /** Resolve a user path and reject anything outside the workspace. */

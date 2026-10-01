@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import { callTool, loadWorkspaceContext } from "./tools";
+import { TOOLS } from "./toolDefs";
 import { ADDON_VERSION } from "./types";
 
 interface RpcMessage {
@@ -9,85 +10,8 @@ interface RpcMessage {
   params?: unknown;
 }
 
-const TOOLS = [
-  {
-    name: "doctor",
-    description: "Check Blender, the add-on, client MCP config, and whether the bridge is listening. fix=true rewrites config and reinstalls the add-on.",
-    inputSchema: {
-      type: "object",
-      properties: { fix: { type: "boolean", description: "Repair config and reinstall the add-on." } },
-    },
-  },
-  {
-    name: "session_info",
-    description: "Blender version, open file, dirty flag, scene, frame, units, engine, and version gotchas. The bridge must be running.",
-    inputSchema: { type: "object", properties: {} },
-  },
-  {
-    name: "launch_blender",
-    description: "Start Blender with the VSBlender bridge, or open a file in the Blender that is already listening. Does not discard unsaved changes.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        file: { type: "string", description: "Workspace .blend to open. Optional when only one .blend exists." },
-        background: { type: "boolean", description: "Keep a headless Blender running instead of opening the GUI." },
-      },
-    },
-  },
-  {
-    name: "ingest",
-    description: "Read a .blend headlessly and write .blender-ai/<name>/ notes, manifest, and roles. Does not save the .blend.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Workspace .blend. Optional when only one exists." },
-        force: { type: "boolean" },
-        previews: { type: "boolean", description: "Render overview previews. Default true." },
-        reason: { type: "string" },
-      },
-    },
-  },
-  {
-    name: "context_pack",
-    description: "A NOTES.md summary sized to a token budget. Includes Before you modify even when that exceeds the budget. Call ingest first if the file is new.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string" },
-        budget_tokens: { type: "number", description: "Approximate token budget. Default 2000." },
-        focus: { type: "string", description: "Object or material name to prefer." },
-      },
-    },
-  },
-  {
-    name: "run_script",
-    description: "Run a workspace .py inside the open Blender. Tracebacks use that file and line. The namespace is fresh each call. Set result, or pass function and args.",
-    inputSchema: {
-      type: "object",
-      required: ["path"],
-      properties: {
-        path: { type: "string" },
-        function: { type: "string" },
-        args: { type: "object" },
-        timeout_ms: { type: "number" },
-      },
-    },
-  },
-  {
-    name: "preview",
-    description: "Offscreen PNG. Does not move the user's viewport, camera, or render settings. view: camera, front, back, left, right, top, bottom, iso. shading: solid, material, rendered.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        view: { type: "string" },
-        shading: { type: "string" },
-        size: { type: "number", description: "Square pixels, 64 to 2048. Default 512." },
-        target: { type: "string", description: "Object to frame." },
-        frame: { type: "number" },
-      },
-    },
-  },
-];
+/** Calls that are still running, so notifications/cancelled can stop them. */
+const inFlight = new Map<string, AbortController>();
 
 /** MCP stdio is one JSON-RPC message per line. JSON.stringify never emits a raw newline. */
 function writeMessage(payload: unknown): void {
@@ -105,7 +29,12 @@ function errorMessage(id: number | string | null, code: number, message: string)
 async function handle(message: RpcMessage): Promise<void> {
   const { id, method } = message;
   if (!method) return;
-  if (method === "notifications/initialized" || method === "notifications/cancelled") return;
+  if (method === "notifications/cancelled") {
+    const params = message.params as { requestId?: number | string } | undefined;
+    if (params?.requestId !== undefined) inFlight.get(String(params.requestId))?.abort();
+    return;
+  }
+  if (method === "notifications/initialized") return;
   if (id === undefined || id === null) return;
   if (method === "initialize") {
     const params = message.params && typeof message.params === "object" ? (message.params as { protocolVersion?: string }) : {};
@@ -114,7 +43,7 @@ async function handle(message: RpcMessage): Promise<void> {
       capabilities: { tools: {} },
       serverInfo: { name: "vsblender", version: ADDON_VERSION },
       instructions:
-        "Drive Blender through these tools. Do not read or edit .blend binaries. Ingest or context_pack before changing an existing file, write scripts/*.py, and run_script. preview is offscreen and does not touch the user's viewport.",
+        "Drive Blender through these tools. Do not read or edit .blend binaries. Call doctor for each file's status, then ingest or context_pack before changing an existing file. Write scripts/*.py and run_script with a reason. preview and render never touch the user's viewport or render settings.",
     });
     return;
   }
@@ -128,16 +57,39 @@ async function handle(message: RpcMessage): Promise<void> {
   }
   if (method === "tools/call") {
     const params = message.params && typeof message.params === "object"
-      ? (message.params as { name?: string; arguments?: Record<string, unknown> })
+      ? (message.params as { name?: string; arguments?: Record<string, unknown>; _meta?: { progressToken?: string | number } })
       : {};
     const name = params.name ?? "";
     const args = params.arguments ?? {};
-    const outcome = await callTool(loadWorkspaceContext(), name, args);
-    const content: { type: string; text?: string; data?: string; mimeType?: string }[] = [{ type: "text", text: outcome.text }];
-    for (const image of outcome.images ?? []) {
-      content.push({ type: "image", data: image.data, mimeType: image.mimeType });
+    const token = params._meta?.progressToken;
+    const controller = new AbortController();
+    inFlight.set(String(id), controller);
+    let last = 0;
+    const progress = token === undefined ? undefined : (fraction: number | undefined, text: string): void => {
+      // MCP wants progress to increase with every notification, also when only the message changed.
+      const wanted = fraction === undefined ? last + 0.1 : Math.round(fraction * 1000) / 10;
+      last = Math.min(100, Math.max(wanted, last + 0.01));
+      writeMessage({
+        jsonrpc: "2.0",
+        method: "notifications/progress",
+        params: { progressToken: token, progress: Math.round(last * 100) / 100, total: 100, message: text },
+      });
+    };
+    try {
+      const outcome = await callTool(loadWorkspaceContext(), name, args, {
+        signal: controller.signal,
+        ...(progress ? { progress } : {}),
+      });
+      // A cancelled request gets no response.
+      if (controller.signal.aborted) return;
+      const content: { type: string; text?: string; data?: string; mimeType?: string }[] = [{ type: "text", text: outcome.text }];
+      for (const image of outcome.images ?? []) {
+        content.push({ type: "image", data: image.data, mimeType: image.mimeType });
+      }
+      resultMessage(id, { content, isError: !outcome.ok });
+    } finally {
+      inFlight.delete(String(id));
     }
-    resultMessage(id, { content, isError: !outcome.ok });
     return;
   }
   errorMessage(id, -32601, `method not found: ${method}`);

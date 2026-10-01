@@ -29,15 +29,24 @@ export const ALL_GUIDE_RELS = [
   ".clinerules",
 ];
 
-export function renderGuide(template: string, table: string, port: number): string {
-  return `${GUIDE_STAMP}-v1 -->\n${template.replace("{{BLEND_TABLE}}", table).replace("{{PORT}}", String(port))}`;
+export function renderGuide(template: string, list: string, port: number): string {
+  // {{BLEND_TABLE}} is the placeholder of the first guide template.
+  const body = template.replace("{{BLEND_LIST}}", list).replace("{{BLEND_TABLE}}", list).replace(/\{\{PORT\}\}/g, String(port));
+  return `${GUIDE_STAMP}-v2 -->\n${body}`;
 }
 
-export function blendTable(rows: { rel: string; status: string }[]): string {
-  const lines = ["| Blend file | Ingest |", "|---|---|"];
-  if (!rows.length) lines.push("| *(no .blend files in this workspace yet)* | |");
-  for (const row of rows) lines.push(`| \`${row.rel}\` | ${row.status} |`);
-  return lines.join("\n");
+/**
+ * The .blend files, without an ingest status. A status written into the guide is wrong as soon as
+ * a file is saved or edited in Blender, so the guide sends the reader to doctor for it.
+ */
+export function blendList(rels: string[]): string {
+  if (!rels.length) return "*(no .blend files in this workspace yet)*";
+  return rels.map((rel) => `- \`${rel}\``).join("\n");
+}
+
+/** First-version name, kept for callers that still pass rows with a status. */
+export function blendTable(rows: { rel: string; status?: string }[]): string {
+  return blendList(rows.map((row) => row.rel));
 }
 
 export interface GuideWriteResult {

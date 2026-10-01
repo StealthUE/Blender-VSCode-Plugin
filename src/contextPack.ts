@@ -5,7 +5,10 @@ import { relativeTo, sidecarDir } from "./blendFiles";
 export interface ContextPack {
   text: string;
   tokens: number;
+  /** True only when something was left out. */
   truncated: boolean;
+  /** What was cut, e.g. "Materials: 12 of 22 shown". */
+  dropped: string[];
   notesPath?: string;
 }
 
@@ -14,17 +17,19 @@ interface Section {
   body: string;
 }
 
+/** Previews come late: they are file links, and they used to crowd out the object tree under focus. */
 const PRIORITY = [
   "before you modify",
   "intent & constraints",
   "object tree",
   "materials",
   "animation",
-  "previews",
   "text blocks inside the .blend",
-  "files next to this one",
   "change log",
+  "previews",
+  "files next to this one",
 ];
+const REQUIRED = new Set(["before you modify", "intent & constraints"]);
 
 export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
@@ -56,58 +61,171 @@ function priorityOf(heading: string): number {
   return index === -1 ? PRIORITY.length : index;
 }
 
-function focusLines(body: string, focus: string | undefined): string {
-  if (!focus) return body;
+/** The object, material and preview names a focus covers. Built from manifest.json. */
+export interface FocusSet {
+  roots: string[];
+  objects: Set<string>;
+  materials: Set<string>;
+}
+
+interface ManifestShape {
+  objects?: Record<string, { children?: string[]; materials?: (string | null)[] }>;
+  materials?: Record<string, unknown>;
+}
+
+export function focusSet(manifest: ManifestShape, focus: string): FocusSet | undefined {
+  const objects = manifest.objects ?? {};
   const needle = focus.toLowerCase();
-  const lines = body.split(/\r?\n/);
-  const kept = lines.filter((line) => line.toLowerCase().includes(needle) || line.startsWith("#"));
-  if (!kept.length) return "";
+  const exact = Object.keys(objects).filter((name) => name.toLowerCase() === needle);
+  const roots = exact.length ? exact : Object.keys(objects).filter((name) => name.toLowerCase().includes(needle));
+  const materials = new Set(Object.keys(manifest.materials ?? {}).filter((name) => name.toLowerCase().includes(needle)));
+  if (!roots.length && !materials.size) return undefined;
+  const found = new Set<string>();
+  const visit = (name: string): void => {
+    if (found.has(name)) return;
+    found.add(name);
+    for (const child of objects[name]?.children ?? []) visit(child);
+  };
+  roots.forEach(visit);
+  for (const name of found) {
+    for (const material of objects[name]?.materials ?? []) if (material) materials.add(material);
+  }
+  return { roots, objects: found, materials };
+}
+
+/** Bold names on a NOTES line: "**SG Dais**", or a collapsed series "**SG Rock 00 ... SG Rock 15**". */
+function namesOn(line: string): string[] {
+  const match = /\*\*(.+?)\*\*/.exec(line);
+  if (!match?.[1]) return [];
+  const text = match[1];
+  return text.includes(" ... ") ? text.split(" ... ") : [text];
+}
+
+function keepForFocus(heading: string, line: string, set: FocusSet): boolean {
+  const names = namesOn(line);
+  switch (heading) {
+    case "object tree":
+      return names.some((name) => set.objects.has(name));
+    case "materials":
+      return names.some((name) => set.materials.has(name));
+    case "animation":
+      return names.some((name) => set.objects.has(name) || (name.startsWith("material:") && set.materials.has(name.slice(9))));
+    case "previews":
+      return set.roots.some((root) => line.includes(`'${root}'`) || line.includes(root.replace(/[^A-Za-z0-9._-]+/g, "_")));
+    default:
+      return true;
+  }
+}
+
+/** Items of a markdown list: a "- " line with the more-indented lines under it. Other lines stand alone. */
+function items(body: string): { lines: string[]; isItem: boolean }[] {
+  const out: { lines: string[]; isItem: boolean; indent: number }[] = [];
+  for (const line of body.split(/\r?\n/)) {
+    const bullet = /^(\s*)- /.exec(line);
+    const current = out[out.length - 1];
+    if (bullet) {
+      const indent = bullet[1]?.length ?? 0;
+      if (current?.isItem && indent > current.indent) {
+        current.lines.push(line);
+        continue;
+      }
+      out.push({ lines: [line], isItem: true, indent });
+      continue;
+    }
+    if (current?.isItem && /^\s+\S/.test(line)) {
+      current.lines.push(line);
+      continue;
+    }
+    out.push({ lines: [line], isItem: false, indent: 0 });
+  }
+  return out;
+}
+
+function focusFilter(heading: string, body: string, focus: string, set: FocusSet | undefined): string {
+  const key = heading.toLowerCase();
+  if (set) {
+    // Line by line: every object in the subtree is named on its own line, so nesting does not matter.
+    return body.split(/\r?\n/).filter((line) => !/^\s*- /.test(line) || keepForFocus(key, line, set)).join("\n");
+  }
+  const needle = focus.toLowerCase();
+  const kept = body.split(/\r?\n/).filter((line) => line.toLowerCase().includes(needle) || line.startsWith("#"));
   return kept.join("\n");
 }
 
 /**
  * Build a NOTES-style pack that fits a token budget.
  * "Before you modify" and "Intent & constraints" are kept even when that exceeds the budget,
- * because dropping those warnings is worse than being a bit over.
+ * because dropping those warnings is worse than being a bit over. A list section that does not fit
+ * is cut item by item (the change log keeps its newest lines), and every cut is reported.
  */
-export function packNotes(markdown: string, budgetTokens: number, focus?: string): { text: string; truncated: boolean } {
+export function packNotes(markdown: string, budgetTokens: number, focus?: string, set?: FocusSet):
+  { text: string; truncated: boolean; dropped: string[] } {
   const budget = Math.max(64, budgetTokens);
-  const required = new Set(["before you modify", "intent & constraints"]);
-  const lineFiltered = new Set(["object tree", "materials", "animation"]);
-  const blocks: { text: string; force: boolean; rank: number }[] = [];
+  const blocks: { heading: string; body: string; force: boolean; rank: number }[] = [];
+  const dropped: string[] = [];
 
   for (const section of splitSections(markdown)) {
     const key = section.heading.toLowerCase();
-    const force = key === "" || required.has(key);
+    const force = key === "" || REQUIRED.has(key);
     let body = section.body;
-    if (focus && lineFiltered.has(key)) {
-      const filtered = focusLines(section.body, focus);
-      if (!filtered.trim()) continue;
-      body = filtered;
-    } else if (focus && !force && !`${section.heading}\n${body}`.toLowerCase().includes(focus.toLowerCase())) {
-      continue;
+    if (focus && !force) {
+      if (["object tree", "materials", "animation", "previews"].includes(key)) {
+        body = focusFilter(section.heading, section.body, focus, set);
+        if (!body.split(/\r?\n/).some((line) => /^\s*- /.test(line))) continue;
+      } else if (!`${section.heading}\n${body}`.toLowerCase().includes(focus.toLowerCase())) {
+        continue;
+      }
     }
-    const text = `${section.heading ? `## ${section.heading}\n` : ""}${body}`.trim();
-    if (!text) continue;
-    blocks.push({ text, force, rank: key ? priorityOf(section.heading) : -1 });
+    if (!body.trim() && !section.heading) continue;
+    blocks.push({ heading: section.heading, body, force, rank: key ? priorityOf(section.heading) : -1 });
   }
   blocks.sort((a, b) => a.rank - b.rank);
 
   const parts: string[] = [];
   let used = 0;
-  let truncated = false;
   for (const block of blocks) {
-    const cost = estimateTokens(block.text);
-    if (!block.force && used + cost > budget) {
-      truncated = true;
+    const head = block.heading ? `## ${block.heading}\n` : "";
+    const full = `${head}${block.body}`.trim();
+    const cost = estimateTokens(full);
+    if (block.force || used + cost <= budget) {
+      parts.push(full);
+      used += cost;
       continue;
     }
-    parts.push(block.text);
-    used += cost;
-    if (used > budget) truncated = true;
+    // Cut the list item by item. The change log reads newest last, so it keeps its tail.
+    const all = items(block.body);
+    const listItems = all.filter((item) => item.isItem);
+    const newestFirst = block.heading.toLowerCase() === "change log";
+    const order = newestFirst ? [...all].reverse() : all;
+    const keptItems = new Set<typeof all[number]>();
+    let sectionCost = estimateTokens(head) + 12;
+    for (const item of order) {
+      const itemCost = estimateTokens(item.lines.join("\n")) + 1;
+      if (!item.isItem) {
+        if (used + sectionCost + itemCost <= budget) {
+          keptItems.add(item);
+          sectionCost += itemCost;
+        }
+        continue;
+      }
+      if (used + sectionCost + itemCost > budget) break;
+      keptItems.add(item);
+      sectionCost += itemCost;
+    }
+    const shownItems = listItems.filter((item) => keptItems.has(item)).length;
+    const name = block.heading || "header";
+    if (!shownItems) {
+      dropped.push(`${name}: left out (${listItems.length} items)`);
+      continue;
+    }
+    const lines = all.filter((item) => keptItems.has(item)).flatMap((item) => item.lines);
+    const note = `- ... ${shownItems} of ${listItems.length} shown${newestFirst ? " (newest)" : ""}; the rest is in NOTES.md`;
+    parts.push(`${head}${lines.join("\n")}\n${note}`.trim());
+    used += sectionCost;
+    dropped.push(`${name}: ${shownItems} of ${listItems.length} shown`);
   }
-  if (truncated) parts.push("… truncated to the token budget. Read NOTES.md and manifest.json for the rest.");
-  return { text: parts.join("\n\n").trim(), truncated };
+  if (dropped.length) parts.push("Cut to the token budget. Read NOTES.md and manifest.json for the rest.");
+  return { text: parts.join("\n\n").trim(), truncated: dropped.length > 0, dropped };
 }
 
 export function buildContextPack(
@@ -116,24 +234,45 @@ export function buildContextPack(
   budgetTokens: number,
   focus?: string
 ): ContextPack {
-  const notesPath = path.join(sidecarDir(blendFile), "NOTES.md");
+  const folder = sidecarDir(blendFile);
+  const notesPath = path.join(folder, "NOTES.md");
   const rel = relativeTo(workspace, blendFile);
   const header = [
     `blend: ${rel}`,
-    `sidecar: ${relativeTo(workspace, sidecarDir(blendFile))}/`,
+    `sidecar: ${relativeTo(workspace, folder)}/`,
     "Read NOTES.md before changing anything. Do not open the .blend binary.",
-  ].join("\n");
+  ];
   if (!fs.existsSync(notesPath)) {
-    const text = `${header}\n\nNo ingest yet. Call ingest for this file, then context_pack again.`;
-    return { text, tokens: estimateTokens(text), truncated: false };
+    const text = `${header.join("\n")}\n\nNo ingest yet. Call ingest for this file, then context_pack again.`;
+    return { text, tokens: estimateTokens(text), truncated: false, dropped: [] };
+  }
+  try {
+    const state = JSON.parse(fs.readFileSync(path.join(folder, "state.json"), "utf8")) as { source?: string; dirty?: boolean };
+    if (state.source === "live") {
+      header.push(`Source: the live Blender session${state.dirty ? ", with changes not saved to the .blend" : ""}.`);
+    }
+  } catch {
+    // No state: the notes are still worth reading.
+  }
+  let set: FocusSet | undefined;
+  if (focus) {
+    try {
+      set = focusSet(JSON.parse(fs.readFileSync(path.join(folder, "manifest.json"), "utf8")) as ManifestShape, focus);
+    } catch {
+      set = undefined;
+    }
+    if (set) {
+      header.push(`focus: ${set.roots.join(", ") || focus}, with ${set.objects.size} object(s) in its subtree and ${set.materials.size} material(s).`);
+    }
   }
   const notes = fs.readFileSync(notesPath, "utf8");
-  const packed = packNotes(notes, budgetTokens, focus);
-  const text = `${header}\n\n${packed.text}`;
+  const packed = packNotes(notes, budgetTokens, focus, set);
+  const text = `${header.join("\n")}\n\n${packed.text}`;
   return {
     text,
     tokens: estimateTokens(text),
     truncated: packed.truncated,
+    dropped: packed.dropped,
     notesPath,
   };
 }
