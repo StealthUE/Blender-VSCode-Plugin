@@ -108,11 +108,15 @@ def _window_override():
         return None
 
 
-def save_copy(path: str, relative_remap: bool = True) -> None:
-    """Write the session to path without changing the open file, its path or its dirty flag."""
+def save_copy(path: str, relative_remap: bool = True, compress: bool = False) -> None:
+    """Write the session to path without changing the open file, its path or its dirty flag.
+
+    compress: checkpoints are kept, so they are compressed (zstd, a fraction of the size). Copies for
+    background jobs are read once and thrown away, so they are written uncompressed, which is faster.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     kwargs = {"filepath": os.path.abspath(path), "copy": True, "check_existing": False,
-              "relative_remap": relative_remap}
+              "relative_remap": relative_remap, "compress": bool(compress)}
     prefs = bpy.context.preferences
     paths = getattr(prefs, "filepaths", None)
     # A thumbnail would draw the user's viewport; a copy does not need one.
@@ -176,7 +180,7 @@ def checkpoint(root: str, label: str = "", auto: bool = False, keep: int = 10, m
     os.makedirs(folder, exist_ok=True)
     cid = _new_id(folder)
     path = os.path.join(folder, cid + ".blend")
-    save_copy(path, relative_remap=True)
+    save_copy(path, relative_remap=True, compress=True)
     try:
         scene = bpy.context.scene.name
     except Exception:
@@ -191,6 +195,7 @@ def checkpoint(root: str, label: str = "", auto: bool = False, keep: int = 10, m
         "scene": scene,
         "bytes": os.path.getsize(path),
         "signature": snapshot.signature(snap),
+        "fake_users": fake_user_names(),
     }
     if script:
         entry["script"] = script
@@ -254,7 +259,7 @@ def restore(root: str, cid: str) -> dict:
         raise FileNotFoundError(path)
     safety = checkpoint(root, label=f"before restoring {entry['id']}")
     try:
-        _replace_data(path, entry.get("scene") or "")
+        _replace_data(path, entry.get("scene") or "", entry.get("fake_users"))
     except Exception as exc:
         raise RuntimeError(f"restore stopped partway ({exc}). The state from before the restore is checkpoint "
                            f"{safety.get('id')}: restore that id to get it back.") from exc
@@ -262,7 +267,31 @@ def restore(root: str, cid: str) -> dict:
             "scene": bpy.context.scene.name if bpy.context.scene else None}
 
 
-def _replace_data(path: str, active_scene: str) -> None:
+def rollback(root: str, cid: str) -> dict:
+    """Put the session back to a checkpoint after a failed script, without a safety checkpoint of the
+    failed state (the error report already says what the script changed before it failed)."""
+    entry = find_checkpoint(root, cid)
+    path = os.path.join(root, entry["file"])
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    _replace_data(path, entry.get("scene") or "", entry.get("fake_users"))
+    return entry
+
+
+def fake_user_names() -> dict:
+    """Datablocks kept by a fake user, by collection: appending a checkpoint does not keep the flag."""
+    out = {}
+    for attr in CONTENT:
+        collection = getattr(bpy.data, attr, None)
+        if collection is None:
+            continue
+        names = [idb.name for idb in collection if idb.library is None and idb.use_fake_user]
+        if names:
+            out[attr] = names
+    return out
+
+
+def _replace_data(path: str, active_scene: str, fake_users: dict | None = None) -> None:
     window_scenes = []
     if not bpy.app.background:
         for window in bpy.context.window_manager.windows:
@@ -284,6 +313,7 @@ def _replace_data(path: str, active_scene: str) -> None:
             doomed.append(idb)
     if doomed:
         bpy.data.batch_remove(doomed)
+    appended = {}
     with bpy.data.libraries.load(path, link=False) as (source, target):
         target.scenes = list(source.scenes)
         for attr in CONTENT:
@@ -292,6 +322,24 @@ def _replace_data(path: str, active_scene: str) -> None:
                 if attr == "images":
                     names = [n for n in names if n not in keep_images]
                 setattr(target, attr, names)
+                appended[attr] = names
+    # Appending drops fake users, so a text block (fake user, no other users) would be lost by the
+    # next save or checkpoint. Put back the ones the checkpoint recorded; for an older checkpoint
+    # without that record, text blocks (which always have one) are the only safe guess.
+    for attr, names in appended.items():
+        collection = getattr(bpy.data, attr, None)
+        if collection is None:
+            continue
+        wanted = set((fake_users or {}).get(attr, [])) if fake_users is not None else None
+        for item in names:
+            idb = item if isinstance(item, bpy.types.ID) else collection.get(item)
+            if idb is None or idb.library is not None:
+                continue
+            if (wanted is not None and idb.name in wanted) or (wanted is None and attr == "texts" and idb.users == 0):
+                try:
+                    idb.use_fake_user = True
+                except Exception:
+                    pass
     restored = [s for s in bpy.data.scenes if not s.name.startswith(_OLD_SCENE)]
     if not restored:
         raise RuntimeError("the checkpoint had no scene")

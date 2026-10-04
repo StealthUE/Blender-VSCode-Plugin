@@ -381,6 +381,8 @@ def describe(target: str, root: str, ingest_mod) -> dict:
                 if slot.material is not None and slot.material.name not in mats:
                     mats[slot.material.name] = ingest_mod.material_info(slot.material).get("summary", "")[:300]
             info["material_summaries"] = mats
+        from . import units as units_mod
+        info["units"] = units_mod.label()
         out.update(info)
     elif attr == "materials":
         info = ingest_mod.material_info(idb)
@@ -504,6 +506,10 @@ def _term(term: str, ob, ctx: _Ctx):
             return any(s.material is not None and fnmatch.fnmatchcase(s.material.name, value) for s in ob.material_slots)
         if key == "parent":
             return ob.parent is not None and fnmatch.fnmatchcase(ob.parent.name, value)
+        if key == "built_by":
+            script = str(ob.get("ai_built_by") or ob.get("ai_modified_by") or ob.get("ai_regenerate_with") or "")
+            return bool(script) and (fnmatch.fnmatchcase(script, value) or fnmatch.fnmatchcase(os.path.basename(script), value)
+                                     or value.lower() in script.lower())
         if key in ("children_of", "under"):
             p = ob.parent
             while p is not None:
@@ -563,6 +569,8 @@ def _term(term: str, ob, ctx: _Ctx):
         "selected": lambda: ob.select_get(),
         "active": lambda: bpy.context.view_layer.objects.active == ob,
         "derived": lambda: "ai_derived_from" in ob.keys(),
+        "built": lambda: "ai_built_by" in ob.keys(),
+        "reference": lambda: "vsblender_reference" in ob.keys(),
         "linked": lambda: ob.library is not None,
     }
     if low in flags:
@@ -659,6 +667,17 @@ def find(selector: str, root: str, limit: int = 100) -> dict:
 
 
 # ----------------------------------------------------------------------------- spatial
+def resolve_objects(spec, root: str, include_hidden: bool = True) -> list:
+    """Objects for a target spec: None (the scene), an exact name, a find selector, or a list of names.
+
+    include_hidden=False drops objects hidden in the viewport or for rendering (unless named exactly).
+    """
+    obs = _objects_for(spec, root)
+    if include_hidden or not isinstance(spec, str) or spec in bpy.data.objects:
+        return obs
+    return [o for o in obs if not o.hide_render and not o.hide_get()]
+
+
 def _objects_for(spec, root: str) -> list:
     if spec is None:
         return [o for o in bpy.context.scene.objects if not o.name.startswith("_vsblender")]
@@ -687,6 +706,14 @@ def _gap(a, b) -> tuple:
 
 
 def spatial(params: dict, root: str) -> dict:
+    from . import units as units_mod
+
+    out = _spatial(params, root)
+    out["units"] = units_mod.label()
+    return out
+
+
+def _spatial(params: dict, root: str) -> dict:
     op = params.get("op") or "bbox"
     deps = bpy.context.evaluated_depsgraph_get()
     scene = bpy.context.scene
@@ -740,6 +767,8 @@ def spatial(params: dict, root: str) -> dict:
                     "overlap": all(g < 0 for g in per)}
         target = _objects_for([params.get("target")], root)[0]
         tb = _world_box(target, deps)
+        # Default tolerance: 0.5% of the target's size, so it means the same in a mm or a metre scene.
+        touch_tol = float(params.get("tolerance") or max((tb[1] - tb[0]).length * 0.005, 1e-9))
         rows = []
         for ob in _objects_for(params.get("targets"), root):
             # Empties, lamps and cameras have no surface to be under, over or touching.
@@ -752,7 +781,7 @@ def spatial(params: dict, root: str) -> dict:
                 continue
             if op == "above" and not (xy_overlap and ob_box[0].z >= tb[1].z - 1e-4):
                 continue
-            if op == "touching" and dist > float(params.get("tolerance") or 0.01):
+            if op == "touching" and dist > touch_tol:
                 continue
             rows.append((dist, ob.name, _r(per)))
         rows.sort()
@@ -768,3 +797,126 @@ def spatial(params: dict, root: str) -> dict:
                 names.append(ob.name)
         return {"objects": names}
     raise ValueError("op must be bbox, raycast, drop, nearest, distance, below, above, touching, or within")
+
+
+# ----------------------------------------------------------------------------- timeline
+def _anim_sources(objects) -> list:
+    """(label, idb) pairs whose animation_data can hold keys: objects, their data, shape keys,
+    materials and node trees."""
+    seen = set()
+    out = []
+
+    def add(label, idb):
+        if idb is None or idb.as_pointer() in seen:
+            return
+        seen.add(idb.as_pointer())
+        out.append((label, idb))
+
+    for ob in objects:
+        add(f"OB:{ob.name}", ob)
+        data = getattr(ob, "data", None)
+        if data is not None:
+            add(f"{type(data).__name__}:{data.name}", data)
+            add(f"{data.name} shape keys", getattr(data, "shape_keys", None))
+            add(f"{data.name} nodes", getattr(data, "node_tree", None))
+        for slot in getattr(ob, "material_slots", []):
+            if slot.material is not None:
+                add(f"MA:{slot.material.name}", slot.material)
+                add(f"MA:{slot.material.name}", getattr(slot.material, "node_tree", None))
+    return out
+
+
+def _channel_fcurves(idb) -> list:
+    ad = getattr(idb, "animation_data", None)
+    if not ad or ad.action is None:
+        return []
+    act = ad.action
+    if getattr(ad, "action_slot", None) is not None:
+        try:
+            from bpy_extras import anim_utils
+            bag = anim_utils.action_get_channelbag_for_slot(act, ad.action_slot)
+            return list(bag.fcurves) if bag else []
+        except Exception:
+            pass
+    return list(getattr(act, "fcurves", []) or [])
+
+
+def _value_text(data_path: str, value: float) -> str:
+    if "rotation_euler" in data_path or data_path.endswith(("angle", "rotation")):
+        return f"{math.degrees(value):.3f}°"
+    return _fmt(value)
+
+
+def timeline(params: dict, root: str) -> dict:
+    """Keyframes in time order across objects (op keys), or channel values at given frames (op evaluate)."""
+    from . import blender_ingest, helpers
+
+    op = params.get("op") or "keys"
+    scene = bpy.context.scene
+    if op == "evaluate":
+        target = params.get("target")
+        path = params.get("path")
+        if not target or not path:
+            raise ValueError("evaluate needs target (a datablock or typed id) and path, e.g. rotation_euler "
+                             "or Principled BSDF/Emission Strength")
+        owner, data_path, index = helpers.resolve(target, str(path))
+        curves = [fc for fc in _channel_fcurves(owner) if fc.data_path == data_path and (index is None or fc.array_index == index)]
+        if not curves:
+            raise KeyError(f"{data_path} on {owner.name} has no keyframes")
+        frames = params.get("frames") or [scene.frame_start, scene.frame_current, scene.frame_end]
+        rows = {}
+        for fc in curves:
+            label = blender_ingest.channel_label(owner, fc.data_path, fc.array_index)
+            rows[label] = {str(f): _value_text(fc.data_path, fc.evaluate(float(f))) for f in frames}
+        lines = [f"{owner.name}: {label} " + ", ".join(f"f{k} = {v}" for k, v in values.items()) for label, values in rows.items()]
+        return {"text": "\n".join(lines), "values": rows}
+    if op != "keys":
+        raise ValueError("op must be keys or evaluate")
+    spec = params.get("targets")
+    objects = _objects_for(spec, root) if spec else [o for o in scene.objects if not o.name.startswith("_vsblender")]
+    sources = _anim_sources(objects)
+    if not spec and scene.world is not None:
+        sources += [(f"WO:{scene.world.name}", scene.world), (f"WO:{scene.world.name}", getattr(scene.world, "node_tree", None))]
+    frames = params.get("frames")
+    lo, hi = -math.inf, math.inf
+    wanted = None
+    if isinstance(frames, dict):
+        lo, hi = float(frames.get("start", -math.inf)), float(frames.get("end", math.inf))
+    elif isinstance(frames, list):
+        wanted = {round(float(f), 3) for f in frames}
+    events = {}
+    drivers = []
+    for label, idb in sources:
+        if idb is None:
+            continue
+        name = label.split(":", 1)[-1]
+        for fc in _channel_fcurves(idb):
+            channel = blender_ingest.channel_label(idb, fc.data_path, fc.array_index)
+            points = list(fc.keyframe_points)
+            for i, kp in enumerate(points):
+                f = round(float(kp.co[0]), 3)
+                if not (lo <= f <= hi) or (wanted is not None and f not in wanted):
+                    continue
+                prev = points[i - 1] if i > 0 else None
+                change = f" (from {_value_text(fc.data_path, prev.co[1])} at {prev.co[0]:g})" if prev is not None else ""
+                ease = kp.interpolation.lower()
+                if kp.interpolation not in ("CONSTANT", "LINEAR") and kp.easing != "AUTO":
+                    ease += " " + kp.easing.lower().replace("_", " ")
+                events.setdefault(f, []).append(f"{name} {channel} = {_value_text(fc.data_path, kp.co[1])}{change}, {ease}")
+        ad = getattr(idb, "animation_data", None)
+        if ad is not None:
+            for d in ad.drivers:
+                drivers.append(f"{label} {d.data_path}[{d.array_index}] = {d.driver.expression or d.driver.type}")
+    limit = int(params.get("limit") or 200)
+    lines = []
+    for f in sorted(events):
+        for entry in events[f]:
+            lines.append(f"frame {f:g}: {entry}")
+    total = len(lines)
+    text = [f"{total} keyframe(s) on {len(events)} frame(s); scene frames {scene.frame_start}-{scene.frame_end} at {scene.render.fps} fps"]
+    text += lines[:limit]
+    if total > limit:
+        text.append(f"... {total - limit} more (pass frames {{start, end}}, targets, or limit)")
+    if drivers:
+        text.append("drivers: " + "; ".join(drivers[:20]))
+    return {"text": "\n".join(text), "frames": sorted(events), "keys": total}

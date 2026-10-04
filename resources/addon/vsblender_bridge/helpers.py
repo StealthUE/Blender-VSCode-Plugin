@@ -8,6 +8,15 @@
     progress(0.4, "raycasting")          reported to the AI client; raises Cancelled when it cancels
     with view3d_override(): bpy.ops...   for operators that need a 3D view
     mark_derived(obj, sources)           record that obj is generated from sources by this script
+    spec(obj, n=39, pitch_deg=9.23)      record the parameters an object was built from
+
+Modelling (see vsblender.geo for solids and mesh builders):
+    material("Brass", color="brass", metallic=1, roughness=0.3)
+    modifier(obj, "BEVEL", width=0.002)  get-or-create by name, so re-runs do not stack modifiers
+    place_on_ground(objs), center_on_origin(objs), set_origin(obj, "base"), orient_flat(obj), stats(obj)
+    units() / mm(20) / m(1.5) / to_mm(x)  what a Blender unit is, and real sizes in Blender units
+    printer()                            the 3D-printer profile (millimetres)
+    read_stl / read_obj / read_3mf / read_mesh_file, svg_loops(path)
 """
 from __future__ import annotations
 
@@ -37,16 +46,64 @@ class Cancelled(BaseException):
 _progress = {"fraction": None, "message": "", "updated": 0.0, "cancel": False, "active": False, "started": 0.0,
              "label": ""}
 _root = {"path": ""}
+# What the current run_script call knows: the printer profile (purpose "print"), the script, and
+# warnings helpers raise along the way (reported with the run, not printed).
+_run = {"printer": None, "script": "", "warnings": []}
+
+# Submodules scripts import as vsblender.<name>. Loaded on first use, so a plain `import vsblender`
+# stays cheap.
+_SUBMODULES = ("geo", "meshdata", "geom2d")
 
 
-def _begin(label: str, root: str) -> None:
+def _begin(label: str, root: str, context: dict | None = None) -> None:
     _progress.update(fraction=None, message="", updated=time.time(), cancel=False, active=True,
                      started=time.time(), label=label)
     _root["path"] = root
+    context = context or {}
+    _run.update(printer=context.get("printer"), script=context.get("script") or label, warnings=[])
 
 
-def _end() -> None:
+def _end() -> list:
+    """Stop the run; returns the warnings helpers collected during it."""
     _progress.update(active=False, cancel=False)
+    collected, _run["warnings"] = list(_run["warnings"]), []
+    return collected[:40]
+
+
+def warn(message: str) -> None:
+    """A warning from a helper, shown in the run_script reply (not printed to stdout)."""
+    text = str(message)
+    if text not in _run["warnings"]:
+        _run["warnings"].append(text)
+
+
+def install_modules() -> None:
+    """Make `import vsblender` and `from vsblender import geo` / `import vsblender.geo` work."""
+    import importlib
+    this = sys.modules[__name__]
+    sys.modules["vsblender"] = this
+    package = __name__.rsplit(".", 1)[0]
+    for name in _SUBMODULES:
+        try:
+            module = importlib.import_module(f"{package}.{name}")
+        except ImportError:
+            continue
+        sys.modules[f"vsblender.{name}"] = module
+
+
+def uninstall_modules() -> None:
+    if sys.modules.get("vsblender") is sys.modules[__name__]:
+        del sys.modules["vsblender"]
+    for name in _SUBMODULES:
+        sys.modules.pop(f"vsblender.{name}", None)
+
+
+def __getattr__(name: str):
+    # PEP 562: vsblender.geo without an explicit import.
+    if name in _SUBMODULES:
+        import importlib
+        return importlib.import_module(f"{__name__.rsplit('.', 1)[0]}.{name}")
+    raise AttributeError(f"module 'vsblender' has no attribute {name!r}")
 
 
 def progress_state() -> dict:
@@ -492,3 +549,104 @@ def mark_derived(obj, sources, script: str | None = None) -> str:
         obj["ai_regenerate_with"] = script
     obj["ai_derived_signature"] = snapshot.derived_signature([bpy.data.objects[n] for n in names])
     return obj["ai_derived_signature"]
+
+
+# ----------------------------------------------------------------------------- modelling
+# The printer profile scripts see when the workspace configures none (purpose print, generic FDM).
+DEFAULT_PRINTER = {
+    "preset": "generic_220", "name": "Generic 220 mm FDM", "build_volume": [220, 220, 250], "nozzle": 0.4,
+    "layer_height": 0.2, "min_wall": 0.8, "max_overhang_deg": 45, "material": "PLA", "density": 1.24,
+    "filament_diameter": 1.75, "hole_compensation": 0.15, "configured": False,
+}
+
+
+def printer() -> dict:
+    """The 3D-printer profile (millimetres) from .blender-ai/config.json, or the generic default.
+    configured is False when the workspace set none."""
+    return dict(_run.get("printer") or DEFAULT_PRINTER)
+
+
+def modifier(obj, kind: str, name: str | None = None, **props):
+    """Get or create a modifier by name and set its properties, so a re-run updates it instead of
+    adding another. modifier(ob, "BEVEL", width=0.002, segments=3); modifier(ob, "SUBSURF", levels=2)."""
+    kind = kind.upper()
+    aliases = {"SUBDIVISION": "SUBSURF", "SUBDIV": "SUBSURF", "WEIGHTED_NORMALS": "WEIGHTED_NORMAL", "MIRROR_": "MIRROR"}
+    kind = aliases.get(kind, kind)
+    name = name or kind.replace("_", " ").title()
+    mod = obj.modifiers.get(name)
+    if mod is not None and mod.type != kind:
+        obj.modifiers.remove(mod)
+        mod = None
+    if mod is None:
+        mod = obj.modifiers.new(name, kind)
+    for key, value in props.items():
+        if isinstance(value, str) and key in ("object", "mirror_object", "offset_object", "target"):
+            value = bpy.data.objects.get(value)
+        try:
+            setattr(mod, key, value)
+        except (AttributeError, TypeError, ValueError) as exc:
+            known = sorted(p.identifier for p in mod.bl_rna.properties if not p.is_readonly)
+            raise AttributeError(f"{kind} modifier: cannot set {key} ({exc}). Settable: {', '.join(known[:40])}") from exc
+    return mod
+
+
+def apply_modifiers(obj, keep: tuple = ()) -> None:
+    """Bake the modifier stack into the mesh (evaluated geometry), then remove the modifiers, without
+    operators. Material slots stay. keep: modifier names to leave in place (not applied)."""
+    import bmesh
+    from . import geo
+
+    deps = bpy.context.evaluated_depsgraph_get()
+    kept = [m for m in obj.modifiers if m.name in keep]
+    for m in kept:
+        m.show_viewport = False
+    deps.update()
+    me = bpy.data.meshes.new_from_object(obj.evaluated_get(deps), depsgraph=deps)
+    try:
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        geo.replace_mesh(obj, bm, keep_slots=True)
+        bm.free()
+    finally:
+        bpy.data.meshes.remove(me)
+    for m in list(obj.modifiers):
+        if m.name not in keep:
+            obj.modifiers.remove(m)
+    for m in kept:
+        m.show_viewport = True
+
+
+def spec(obj, **params) -> dict:
+    """Record the parameters an object was built from (intent as data), e.g.
+    spec(ring, glyphs=39, pitch_deg=9.231, track_r=(2.542, 2.845)). Shown by describe and in NOTES.md.
+    Merges with what is there; a value of None removes the key."""
+    import json
+
+    try:
+        current = json.loads(obj.get("ai_spec") or "{}") if isinstance(obj.get("ai_spec"), str) else {}
+    except ValueError:
+        current = {}
+    for key, value in params.items():
+        if value is None:
+            current.pop(key, None)
+        else:
+            current[key] = list(value) if isinstance(value, tuple) else value
+    text = json.dumps(current, default=str)
+    if len(text) > 2000:
+        raise ValueError(f"spec is {len(text)} characters; keep it under 2000 (the key parameters, not the geometry)")
+    obj["ai_spec"] = text
+    return current
+
+
+# Re-exported so scripts reach everything through `import vsblender`.
+from .units import units, mm, m, to_mm, label as units_label  # noqa: E402
+from .looks import material, ref_image  # noqa: E402
+from .placement import place_on_ground, place_on_bed, center_on_origin, center_on_bed, set_origin, orient_flat, stats  # noqa: E402
+from .meshdata import read_stl, read_obj, read_3mf, read_mesh_file  # noqa: E402
+from .geom2d import svg_loops  # noqa: E402
+
+__all__ += [
+    "warn", "printer", "modifier", "apply_modifiers", "spec", "units", "mm", "m", "to_mm", "units_label",
+    "material", "ref_image", "place_on_ground", "place_on_bed", "center_on_origin", "center_on_bed", "set_origin",
+    "orient_flat", "stats", "read_stl", "read_obj", "read_3mf", "read_mesh_file", "svg_loops", "geo",
+]

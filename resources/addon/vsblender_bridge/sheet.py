@@ -57,17 +57,123 @@ def load(path: str) -> np.ndarray:
     return np.flipud(buf.reshape(h, w, 4)).copy()
 
 
-def save(path: str, pixels: np.ndarray) -> str:
+def save(path: str, pixels: np.ndarray, fmt: str | None = None, quality: int = 88) -> str:
+    """Save RGBA pixels (top row first). The format follows the extension: .jpg/.jpeg is JPEG, else PNG."""
     h, w = pixels.shape[:2]
-    img = bpy.data.images.new("_vsblender_sheet", w, h, alpha=True)
+    if fmt is None:
+        fmt = "JPEG" if path.lower().endswith((".jpg", ".jpeg")) else "PNG"
+    img = bpy.data.images.new("_vsblender_sheet", w, h, alpha=fmt == "PNG")
     try:
         img.pixels.foreach_set(np.flipud(np.clip(pixels, 0.0, 1.0)).astype(np.float32).ravel())
         img.filepath_raw = os.path.abspath(path)
-        img.file_format = "PNG"
-        img.save()
+        img.file_format = fmt
+        if fmt == "JPEG":
+            img.save(quality=int(max(10, min(100, quality))))
+        else:
+            img.save()
     finally:
         bpy.data.images.remove(img)
     return path
+
+
+def fit(path: str, max_bytes: int, min_side: int = 160) -> tuple:
+    """Make an image file small enough to return inline: JPEG first, then smaller, never omitted.
+
+    Returns (path, note). The original is replaced when a smaller file was written; note says how.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return path, ""
+    if not max_bytes or size <= max_bytes:
+        return path, ""
+    pixels = load(path)
+    # JPEG has no alpha: put transparent pixels on the preview background grey.
+    alpha = pixels[..., 3:4]
+    flat = pixels.copy()
+    flat[..., :3] = pixels[..., :3] * alpha + 0.12 * (1.0 - alpha)
+    flat[..., 3] = 1.0
+    h, w = flat.shape[:2]
+    out = os.path.splitext(path)[0] + ".jpg"
+    for scale, quality in ((1.0, 88), (1.0, 75), (0.75, 80), (0.5, 80), (0.35, 75), (0.25, 70)):
+        tw, th = max(1, round(w * scale)), max(1, round(h * scale))
+        if scale < 1.0 and max(tw, th) < min_side:
+            break
+        save(out, resize(flat, tw, th) if scale < 1.0 else flat, fmt="JPEG", quality=quality)
+        if os.path.getsize(out) <= max_bytes:
+            if os.path.abspath(out) != os.path.abspath(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            return out, f"re-encoded as JPEG {tw}x{th} (quality {quality}) from a {size // 1000} kB PNG to stay under {max_bytes // 1000} kB"
+    return out, f"still {os.path.getsize(out) // 1000} kB after re-encoding; use a smaller size or crop"
+
+
+def crop_pixels(pixels: np.ndarray, box) -> np.ndarray:
+    """box = [x0, y0, x1, y1] as fractions of the image, (0, 0) top left."""
+    h, w = pixels.shape[:2]
+    x0, y0, x1, y1 = (float(v) for v in box)
+    c0, c1 = int(round(max(0.0, min(x0, x1)) * w)), int(round(min(1.0, max(x0, x1)) * w))
+    r0, r1 = int(round(max(0.0, min(y0, y1)) * h)), int(round(min(1.0, max(y0, y1)) * h))
+    if c1 - c0 < 2 or r1 - r0 < 2:
+        raise ValueError("crop box is empty")
+    return pixels[r0:r1, c0:c1].copy()
+
+
+def _dilate(mask: np.ndarray, steps: int = 1) -> np.ndarray:
+    out = mask.copy()
+    for _ in range(max(1, steps)):
+        grown = out.copy()
+        grown[1:, :] |= out[:-1, :]
+        grown[:-1, :] |= out[1:, :]
+        grown[:, 1:] |= out[:, :-1]
+        grown[:, :-1] |= out[:, 1:]
+        out = grown
+    return out
+
+
+def overlay(base: np.ndarray, layer: np.ndarray, color, style: str = "xray", opacity: float = 0.5,
+            width: int = 2) -> np.ndarray:
+    """Composite an overlay pass (rendered alone on a transparent background) over a preview.
+
+    xray: the overlay's coverage tinted with color at opacity. wire: the same, at full strength by
+    default (the pass already holds only the wireframe). silhouette: only the outline of the coverage.
+    """
+    if layer.shape[:2] != base.shape[:2]:
+        layer = resize(layer, base.shape[1], base.shape[0])
+    alpha = np.clip(layer[..., 3], 0.0, 1.0)
+    if style == "silhouette":
+        mask = alpha > 0.5
+        edge = _dilate(mask, width) & ~mask
+        edge |= mask & ~(~_dilate(~mask, 1))
+        alpha = edge.astype(np.float32)
+        opacity = 1.0 if opacity is None else opacity
+    out = base.copy()
+    a = (alpha * float(opacity))[..., None]
+    out[..., :3] = base[..., :3] * (1.0 - a) + np.asarray(color[:3], dtype=np.float32) * a
+    out[..., 3] = np.maximum(base[..., 3], alpha)
+    return out
+
+
+def parse_color(value, default=(1.0, 0.19, 0.06)) -> tuple:
+    """'#ff3010', 'ff3010', [1, 0.2, 0.1] or [255, 48, 16] to an RGB float tuple."""
+    if isinstance(value, str):
+        text = value.strip().lstrip("#")
+        if len(text) == 3:
+            text = "".join(c * 2 for c in text)
+        if len(text) >= 6:
+            try:
+                return tuple(int(text[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+            except ValueError:
+                return default
+        return default
+    if isinstance(value, (list, tuple)) and len(value) >= 3:
+        vals = [float(v) for v in value[:3]]
+        if max(vals) > 1.0:
+            vals = [v / 255.0 for v in vals]
+        return tuple(vals)
+    return default
 
 
 def resize(pixels: np.ndarray, width: int, height: int) -> np.ndarray:
@@ -171,8 +277,10 @@ def heatmap(a: np.ndarray, b: np.ndarray, threshold: float = 0.04):
     return out, stats
 
 
-def compose_files(paths, out: str, labels=None, columns=None, cell: int = 512, diff: bool = False) -> dict:
-    """Compose image files into one PNG. With diff=True and two images, adds a heatmap panel."""
+def compose_files(paths, out: str, labels=None, columns=None, cell: int = 512, diff: bool = False,
+                  max_bytes: int | None = None) -> dict:
+    """Compose image files into one PNG. With diff=True and two images, adds a heatmap panel.
+    max_bytes: re-encode or shrink the sheet until it fits (see fit)."""
     arrays = [load(p) for p in paths]
     labels = list(labels or [os.path.basename(p) for p in paths])
     stats = None
@@ -185,6 +293,10 @@ def compose_files(paths, out: str, labels=None, columns=None, cell: int = 512, d
     sheet = compose(arrays, labels, columns=columns, cell=cell)
     save(out, sheet)
     result = {"file": out, "width": int(sheet.shape[1]), "height": int(sheet.shape[0]), "panels": len(arrays)}
+    if max_bytes:
+        result["file"], note = fit(out, int(max_bytes))
+        if note:
+            result["note"] = note
     if stats:
         result["difference"] = stats
     return result

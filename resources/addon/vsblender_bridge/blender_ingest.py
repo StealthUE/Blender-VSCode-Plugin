@@ -173,6 +173,9 @@ def custom_props(idb):
     for k in sorted(idb.keys()):
         if k.startswith("_") or k in ("cycles", "cycles_visibility"):
             continue
+        # Provenance stamps and specs are reported on their own (built_by, spec).
+        if k.startswith(("ai_built_", "ai_modified_")) or k == "ai_spec":
+            continue
         v = jsonable(idb[k])
         if isinstance(v, str) and len(v) > 2000:
             v = v[:2000] + "..."
@@ -515,6 +518,15 @@ def object_info(ob, deps, scene, vl):
     derived = derived_info(ob)
     if derived:
         o["derived"] = derived
+    built = {k[9:] if k.startswith("ai_built_") else k[3:]: str(ob[k]) for k in ob.keys()
+             if k in ("ai_built_by", "ai_built_sha", "ai_built_at", "ai_built_reason", "ai_modified_by", "ai_modified_at")}
+    if built:
+        o["built_by"] = built
+    if isinstance(ob.get("ai_spec"), str):
+        try:
+            o["spec"] = json.loads(ob["ai_spec"])
+        except ValueError:
+            o["spec"] = {"text": str(ob["ai_spec"])[:500]}
     return o
 
 
@@ -1272,16 +1284,36 @@ def notes_generated(man, roles, state, previews):
     mats = [(n, m) for n, m in man["materials"].items() if m["users"]]
     if mats:
         L += ["", "## Materials", ""]
+        groups = defaultdict(list)
+        order = []
         for n, m in mats:
-            flags = [k for k in ("emissive", "transmissive") if m.get(k)]
+            # Flags follow keyed values (emission keyed to 0 is not emissive at this frame), so they are not part of the key.
+            key = (series_base(n), _structure(m.get("summary", "")))
+            if key not in groups:
+                order.append(key)
+            groups[key].append((n, m))
+        for key in order:
+            members = groups[key]
+            n, m = members[0]
+            flags = [k for k in ("emissive", "transmissive") if any(mm.get(k) for _nn, mm in members)]
             summ = m.get("summary", "")
             summ = summ if len(summ) <= 260 else summ[:257] + "..."
-            L.append(f"- **{n}** ({m['users']} users{', ' + ', '.join(flags) if flags else ''}): `{summ}`")
+            if len(members) >= 3:
+                users = sum(mm["users"] for _nn, mm in members)
+                same = "identical" if len({mm.get("summary") for _nn, mm in members}) == 1 else "identical apart from values (keyed or tuned)"
+                L.append(f"- **{members[0][0]} ... {members[-1][0]}** ({len(members)} materials, {users} users"
+                         f"{', ' + ', '.join(flags) if flags else ''}; {same}): `{summ}`")
+            else:
+                for n, m in members:
+                    summ = m.get("summary", "")
+                    summ = summ if len(summ) <= 260 else summ[:257] + "..."
+                    L.append(f"- **{n}** ({m['users']} users{', ' + ', '.join(flags) if flags else ''}): `{summ}`")
 
     anim = [(n, o["animation"]) for n, o in objs.items() if o.get("animation")] + list(man["animation"].items())
     if anim:
         L += ["", "## Animation", ""]
-        for n, a in anim:
+
+        def anim_parts(a):
             parts = []
             for part, ch in a.items():
                 for c in ch.get("channels", [])[:4]:
@@ -1289,7 +1321,46 @@ def notes_generated(man, roles, state, previews):
                 if len(ch.get("channels", [])) > 4:
                     parts.append(f"+{len(ch['channels']) - 4} more")
                 parts += ch.get("drivers", [])
-            L.append(f"- **{n}**: {'; '.join(parts)}")
+            return parts
+
+        groups = defaultdict(list)
+        order = []
+        for n, a in anim:
+            channels = tuple(sorted(c.get("label") or c["path"] for ch in a.values() for c in ch.get("channels", [])))
+            key = (n.split(":", 1)[0] + ":" + series_base(n.split(":", 1)[-1]) if ":" in n else series_base(n), channels)
+            if key not in groups:
+                order.append(key)
+            groups[key].append((n, a))
+        for key in order:
+            members = groups[key]
+            if len(members) >= 3:
+                frames = [c["frames"] for _n, a in members for ch in a.values() for c in ch.get("channels", [])]
+                f0 = min(fr[0] for fr in frames) if frames else 0
+                f1 = max(fr[1] for fr in frames) if frames else 0
+                labels = ", ".join(list(key[1])[:4]) + (f", +{len(key[1]) - 4} more" if len(key[1]) > 4 else "")
+                L.append(f"- **{members[0][0]} ... {members[-1][0]}** ({len(members)}, the same channels, keys between "
+                         f"f{f0:g} and f{f1:g}): {labels}")
+            else:
+                for n, a in members:
+                    L.append(f"- **{n}**: {'; '.join(anim_parts(a))}")
+
+    built = defaultdict(list)
+    for n, o in objs.items():
+        script = (o.get("built_by") or {}).get("by") or (o.get("derived") or {}).get("script")
+        if script:
+            built[script].append(n)
+    if built:
+        L += ["", "## Built by scripts", "",
+              "Objects a script created or rebuilt (run_script stamps them). Change them by editing and re-running the script.", ""]
+        for script, names in sorted(built.items()):
+            L.append(f"- `{script}`: {collapse_names(names)}")
+
+    specs = [(n, o["spec"]) for n, o in objs.items() if o.get("spec")]
+    if specs:
+        L += ["", "## Parameters", "", "What objects were built from (vsblender.spec, geo to_object). Intent as data.", ""]
+        for n, spec in sorted(specs):
+            text = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v}" for k, v in spec.items())
+            L.append(f"- **{n}**: {text[:300]}{'...' if len(text) > 300 else ''}")
 
     if man["issues"]:
         L += ["", "## Before you modify", ""]
@@ -1318,13 +1389,50 @@ def notes_generated(man, roles, state, previews):
     return "\n".join(L)
 
 
+_NUMBERS = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+_VALUE_PAIR = re.compile(r"\s*[A-Za-z][A-Za-z ]*=(?:\([^)]*\)|[^,\])]+)\s*,?")
+
+
+def _structure(summary):
+    """A material summary without its parameter values: two materials that differ only in values
+    (a keyed strength, a tuned colour) have the same structure."""
+    return _VALUE_PAIR.sub("", summary).replace("[]", "")
+
+
+def collapse_names(names):
+    """'SG Chevron 0 ... SG Chevron 8 (9)' for numbered series, plain names otherwise."""
+    groups = defaultdict(list)
+    for n in sorted(names):
+        groups[series_base(n)].append(n)
+    parts = []
+    for _base, members in sorted(groups.items(), key=lambda kv: kv[1][0]):
+        if len(members) >= 3:
+            parts.append(f"{members[0]} ... {members[-1]} ({len(members)})")
+        else:
+            parts.extend(members)
+    return ", ".join(parts)
+
+
 def series_role(roles):
-    """What a collapsed series has in common: the shared role, or the shared start of the roles."""
+    """What a collapsed series has in common: the shared role, with the numbers that vary shown as
+    ranges ('lock order 1-6'), or the shared start of the roles."""
     distinct = list(dict.fromkeys(r for r in roles if r))
     if not distinct:
         return ""
     if len(distinct) == 1:
         return distinct[0]
+    templates = {_NUMBERS.sub("#", r) for r in distinct}
+    if len(templates) == 1:
+        template = templates.pop()
+        columns = list(zip(*[[float(x) for x in _NUMBERS.findall(r)] for r in distinct]))
+        out = template
+        for col in columns:
+            lo, hi = min(col), max(col)
+            text = f"{lo:g}" if lo == hi else f"{lo:g}-{hi:g}"
+            out = out.replace("#", text, 1)
+        return out
     prefix = os.path.commonprefix(distinct)
     cut = max(prefix.rfind(" "), prefix.rfind(";"), prefix.rfind(","))
     prefix = prefix[:cut].rstrip(" ;,.-") if cut > 0 else ""
