@@ -9,6 +9,8 @@ export interface ContextPack {
   truncated: boolean;
   /** What was cut, e.g. "Materials: 12 of 22 shown". */
   dropped: string[];
+  /** Tokens of the sections that are always kept (preamble, Before you modify, Intent & constraints). */
+  required?: number;
   notesPath?: string;
 }
 
@@ -24,6 +26,8 @@ const PRIORITY = [
   "object tree",
   "materials",
   "animation",
+  "parameters",
+  "built by scripts",
   "text blocks inside the .blend",
   "change log",
   "previews",
@@ -94,22 +98,47 @@ export function focusSet(manifest: ManifestShape, focus: string): FocusSet | und
 }
 
 /** Bold names on a NOTES line: "**SG Dais**", or a collapsed series "**SG Rock 00 ... SG Rock 15**". */
-function namesOn(line: string): string[] {
+export function namesOn(line: string): string[] {
   const match = /\*\*(.+?)\*\*/.exec(line);
   if (!match?.[1]) return [];
   const text = match[1];
   return text.includes(" ... ") ? text.split(" ... ") : [text];
 }
 
+/** The series a name belongs to and its number: "SG Rock 07" -> ["SG Rock", 7] (the ingester's series_base). */
+function seriesOf(name: string): [string, number] | undefined {
+  const match = /^(.*?)[\s._-]*(\d+)$/.exec(name);
+  return match ? [match[1] ?? "", Number(match[2])] : undefined;
+}
+
+/** True when name is on the line, also as a member of a collapsed "A ... B" series. */
+export function lineCovers(line: string, has: (name: string) => boolean, pool: Iterable<string>): boolean {
+  const names = namesOn(line).map((name) => name.replace(/^(material|OB|MA|WO):/, ""));
+  if (names.some(has)) return true;
+  if (names.length !== 2) return false;
+  const lo = seriesOf(names[0] ?? "");
+  const hi = seriesOf(names[1] ?? "");
+  if (!lo || !hi || lo[0] !== hi[0]) return false;
+  for (const name of pool) {
+    const member = seriesOf(name);
+    if (member && member[0] === lo[0] && member[1] >= lo[1] && member[1] <= hi[1] && has(name)) return true;
+  }
+  return false;
+}
+
 function keepForFocus(heading: string, line: string, set: FocusSet): boolean {
-  const names = namesOn(line);
+  const object = (name: string): boolean => set.objects.has(name) || set.objects.has(name.replace(/^OB:/, ""));
+  const material = (name: string): boolean => set.materials.has(name) || set.materials.has(name.replace(/^(MA|material):/, ""));
   switch (heading) {
     case "object tree":
-      return names.some((name) => set.objects.has(name));
+    case "parameters":
+      return lineCovers(line, object, set.objects);
     case "materials":
-      return names.some((name) => set.materials.has(name));
+      return lineCovers(line, material, set.materials);
     case "animation":
-      return names.some((name) => set.objects.has(name) || (name.startsWith("material:") && set.materials.has(name.slice(9))));
+      return lineCovers(line, object, set.objects) || lineCovers(line, material, set.materials);
+    case "built by scripts":
+      return [...set.objects].some((name) => line.includes(name)) || lineCovers(line.replace(/^-\s*`[^`]*`:\s*/, "- **") + "**", object, set.objects);
     case "previews":
       return set.roots.some((root) => line.includes(`'${root}'`) || line.includes(root.replace(/[^A-Za-z0-9._-]+/g, "_")));
     default:
@@ -159,8 +188,9 @@ function focusFilter(heading: string, body: string, focus: string, set: FocusSet
  * is cut item by item (the change log keeps its newest lines), and every cut is reported.
  */
 export function packNotes(markdown: string, budgetTokens: number, focus?: string, set?: FocusSet):
-  { text: string; truncated: boolean; dropped: string[] } {
+  { text: string; truncated: boolean; dropped: string[]; required: number } {
   const budget = Math.max(64, budgetTokens);
+  const trailer = "Cut to the token budget. Read NOTES.md and manifest.json for the rest.";
   const blocks: { heading: string; body: string; force: boolean; rank: number }[] = [];
   const dropped: string[] = [];
 
@@ -169,7 +199,7 @@ export function packNotes(markdown: string, budgetTokens: number, focus?: string
     const force = key === "" || REQUIRED.has(key);
     let body = section.body;
     if (focus && !force) {
-      if (["object tree", "materials", "animation", "previews"].includes(key)) {
+      if (["object tree", "materials", "animation", "previews", "parameters", "built by scripts"].includes(key)) {
         body = focusFilter(section.heading, section.body, focus, set);
         if (!body.split(/\r?\n/).some((line) => /^\s*- /.test(line))) continue;
       } else if (!`${section.heading}\n${body}`.toLowerCase().includes(focus.toLowerCase())) {
@@ -183,14 +213,22 @@ export function packNotes(markdown: string, budgetTokens: number, focus?: string
 
   const parts: string[] = [];
   let used = 0;
+  let required = 0;
+  let reservedTrailer = false;
   for (const block of blocks) {
     const head = block.heading ? `## ${block.heading}\n` : "";
     const full = `${head}${block.body}`.trim();
-    const cost = estimateTokens(full);
+    // Sections are joined by a blank line: one more token each.
+    const cost = estimateTokens(full) + 1;
+    if (block.force) required += cost;
     if (block.force || used + cost <= budget) {
       parts.push(full);
       used += cost;
       continue;
+    }
+    if (!reservedTrailer) {
+      used += estimateTokens(trailer) + 1;
+      reservedTrailer = true;
     }
     // Cut the list item by item. The change log reads newest last, so it keeps its tail.
     const all = items(block.body);
@@ -198,7 +236,8 @@ export function packNotes(markdown: string, budgetTokens: number, focus?: string
     const newestFirst = block.heading.toLowerCase() === "change log";
     const order = newestFirst ? [...all].reverse() : all;
     const keptItems = new Set<typeof all[number]>();
-    let sectionCost = estimateTokens(head) + 12;
+    // The "- ... N of M shown" line that replaces the cut items.
+    let sectionCost = estimateTokens(head) + estimateTokens("- ... 999 of 999 shown (newest); the rest is in NOTES.md") + 1;
     for (const item of order) {
       const itemCost = estimateTokens(item.lines.join("\n")) + 1;
       if (!item.isItem) {
@@ -224,8 +263,8 @@ export function packNotes(markdown: string, budgetTokens: number, focus?: string
     used += sectionCost;
     dropped.push(`${name}: ${shownItems} of ${listItems.length} shown`);
   }
-  if (dropped.length) parts.push("Cut to the token budget. Read NOTES.md and manifest.json for the rest.");
-  return { text: parts.join("\n\n").trim(), truncated: dropped.length > 0, dropped };
+  if (dropped.length) parts.push(trailer);
+  return { text: parts.join("\n\n").trim(), truncated: dropped.length > 0, dropped, required };
 }
 
 export function buildContextPack(
@@ -266,13 +305,16 @@ export function buildContextPack(
     }
   }
   const notes = fs.readFileSync(notesPath, "utf8");
-  const packed = packNotes(notes, budgetTokens, focus, set);
+  // The header is part of the pack: the notes get what is left of the budget.
+  const headerCost = estimateTokens(header.join("\n")) + 1;
+  const packed = packNotes(notes, Math.max(64, budgetTokens - headerCost), focus, set);
   const text = `${header.join("\n")}\n\n${packed.text}`;
   return {
     text,
     tokens: estimateTokens(text),
     truncated: packed.truncated,
     dropped: packed.dropped,
+    required: packed.required + headerCost,
     notesPath,
   };
 }

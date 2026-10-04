@@ -7,6 +7,8 @@ export interface ChangeReport {
   recreated: string[];
   renamed: { from: string; to: string }[];
   modified: Record<string, Record<string, string[]>>;
+  /** Removed or rebuilt datablocks that had animation (keys, drivers, NLA), and removed actions. */
+  lost_animation?: string[];
 }
 
 export interface BridgeResponse {
@@ -135,6 +137,7 @@ export function formatChanges(report: ChangeReport | undefined, limit = 12): str
   if (report.removed?.length) lines.push(`removed: ${list(report.removed)}`);
   if (report.recreated?.length) lines.push(`recreated (deleted and built again under the same name): ${list(report.recreated)}`);
   if (report.renamed?.length) lines.push(`renamed: ${list(report.renamed.map((r) => `${r.from} -> ${r.to}`))}`);
+  if (report.lost_animation?.length) lines.push(`WARNING lost animation (removed or rebuilt without its keys): ${list(report.lost_animation)}`);
   for (const [category, items] of Object.entries(report.modified ?? {})) {
     const names = Object.keys(items);
     if (category === "scenes") {

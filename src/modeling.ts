@@ -1,0 +1,363 @@
+import * as fs from "fs";
+import * as path from "path";
+import { listBlendFiles, relativeTo, resolveInside, sidecarDir } from "./blendFiles";
+import { callBridge, probeBridge } from "./bridge";
+import * as jobs from "./jobs";
+import { describePrinter, printerParams, resolvePrinter } from "./printers";
+import {
+  bridgeError,
+  bridgeFailure,
+  callWithProgress,
+  errorText,
+  fail,
+  imageReply,
+  launchBlender,
+  liveBlend,
+  ok,
+  PREVIEW_BYTES,
+  printerContext,
+  routeCall,
+  runScript,
+  sourceNote,
+  tempPng,
+} from "./tools";
+import { CallExtras, ToolOutcome, WorkspaceContext } from "./types";
+
+const PURPOSES = ["general", "render", "game", "print"];
+const TEMPLATES = ["empty", "render", "game", "print_mm"];
+const EXPORT_FORMATS = ["3mf", "stl", "obj", "glb", "gltf", "fbx", "usd", "usda", "usdc", "usdz", "ply"];
+
+function str(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function copyKeys(args: Record<string, unknown>, keys: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of keys) {
+    const value = args[key];
+    if (value !== undefined && value !== null && value !== "") out[key] = value;
+  }
+  return out;
+}
+
+function failed(ctx: WorkspaceContext, error: unknown, timeout: number): ToolOutcome {
+  const text = errorText(error);
+  if (/did not finish|failed:|not running|refusing|outside|must be/i.test(text)) return fail(text);
+  return fail(bridgeFailure(ctx.port, error, timeout));
+}
+
+// ----------------------------------------------------------------------------- check_model
+export async function checkModel(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  const purpose = str(args["purpose"]);
+  if (purpose && !PURPOSES.includes(purpose)) return fail(`purpose must be one of ${PURPOSES.join(", ")}`);
+  const printer = printerContext(ctx, args["printer"]);
+  const params: Record<string, unknown> = {
+    ...copyKeys(args, ["targets", "purpose", "deep", "max_tris", "mm_per_unit", "suggest_orientation", "place_on_bed", "views", "size"]),
+    printer,
+    image: args["image"] !== false,
+    out: tempPng("check"),
+    max_bytes: PREVIEW_BYTES,
+  };
+  const timeout = 300000;
+  try {
+    const routed = await routeCall(ctx, "check_model", params, timeout, args["path"], extras);
+    const response = routed.response;
+    if (!response.ok) return fail(bridgeError(response, "check_model"));
+    const result = response.result ?? {};
+    const notes = (printer["warnings"] as string[] | undefined) ?? [];
+    const lines = [
+      sourceNote(ctx, routed).trim(),
+      String(result["text"] ?? ""),
+      notes.length ? `printer: ${notes.join("; ")}` : "",
+      typeof result["legend"] === "string" && result["legend"] ? `image: ${String(result["legend"])}` : "",
+      response.warnings?.length ? `warnings: ${response.warnings.join("; ")}` : "",
+    ].filter(Boolean);
+    const file = typeof result["file"] === "string" ? result["file"] : "";
+    if (file && fs.existsSync(file)) {
+      return { ...imageReply(file, ctx.workspace, lines, args["save"] === true), details: result };
+    }
+    return ok(lines.join("\n"), { details: result });
+  } catch (error) {
+    return failed(ctx, error, timeout);
+  }
+}
+
+// ----------------------------------------------------------------------------- export_model
+function appendJournal(blend: string | undefined, workspace: string, entry: Record<string, unknown>): void {
+  const dir = blend ? sidecarDir(blend) : path.join(workspace, ".blender-ai", "untitled");
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.appendFileSync(path.join(dir, "journal.jsonl"), JSON.stringify(entry) + "\n", "utf8");
+  } catch {
+    // The export itself succeeded; the journal is a convenience.
+  }
+}
+
+export async function exportModel(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  const format = str(args["format"])?.toLowerCase().replace(/^\./, "");
+  if (format && !EXPORT_FORMATS.includes(format)) return fail(`format must be one of ${EXPORT_FORMATS.join(", ")}`);
+  const purpose = str(args["purpose"]);
+  if (purpose && !PURPOSES.includes(purpose)) return fail(`purpose must be one of ${PURPOSES.join(", ")}`);
+  const output = str(args["output"]) ?? str(args["path_out"]);
+  if (output) {
+    try {
+      resolveInside(ctx.workspace, output);
+    } catch (error) {
+      return fail(errorText(error));
+    }
+  }
+  const printer = printerContext(ctx, args["printer"]);
+  const params: Record<string, unknown> = {
+    ...copyKeys(args, ["targets", "purpose", "split", "overwrite", "place_on_bed", "center", "assembly", "ascii",
+      "apply_modifiers", "mm_per_unit", "reason"]),
+    ...(format ? { format } : {}),
+    ...(output ? { path: output } : {}),
+    printer,
+    actor: "ai",
+  };
+  const timeout = 300000;
+  let routed;
+  try {
+    routed = await routeCall(ctx, "export_model", params, timeout, args["path"], extras);
+  } catch (error) {
+    return failed(ctx, error, timeout);
+  }
+  const response = routed.response;
+  if (!response.ok) return fail(bridgeError(response, "export_model"));
+  const result = response.result ?? {};
+  const job = result["job"] as Record<string, unknown> | undefined;
+  if (!job) {
+    const lines = [sourceNote(ctx, routed).trim(), String(result["text"] ?? ""),
+      response.warnings?.length ? `warnings:\n${response.warnings.join("\n")}` : ""].filter(Boolean);
+    return ok(lines.join("\n"), { details: result });
+  }
+  // glTF, FBX, USD, OBJ, PLY: Blender's exporter needs selection, so it runs on a copy in a background Blender.
+  const id = jobs.newJobId("export");
+  const dir = path.join(jobs.jobsDir(ctx.workspace), id);
+  fs.mkdirSync(dir, { recursive: true });
+  const copy = path.join(dir, "scene.blend");
+  try {
+    const saved = await callBridge(ctx.port, "save_copy", { path: copy }, 300000);
+    if (!saved.ok) return fail(bridgeError(saved, "save_copy"));
+  } catch (error) {
+    return failed(ctx, error, 300000);
+  }
+  let done: Record<string, unknown>;
+  try {
+    done = await jobs.runToEnd(ctx, {
+      blend: copy,
+      spec: { kind: "export", export: job },
+      kind: "export",
+      label: `${String(job["format"])} export`,
+      scratch: copy,
+    }, 600000, extras.signal);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  const files = (done["files"] as Record<string, unknown>[] | undefined) ?? [];
+  const blend = await liveBlend(ctx);
+  const rows: Record<string, unknown>[] = files.map((file) => ({ ...file, file: relativeTo(ctx.workspace, String(file["file"])) }));
+  appendJournal(blend, ctx.workspace, {
+    time: new Date().toISOString(), event: "export", actor: "ai", format: job["format"], purpose: job["purpose"],
+    files: rows, reason: args["reason"] ?? null,
+  });
+  const lines = [`exported ${rows.length} file(s) as ${String(job["format"])} with Blender's exporter (from a copy of the session; your selection is unchanged)`];
+  for (const row of rows) {
+    lines.push(`- ${String(row["file"])}: ${Math.round(Number(row["bytes"]) / 1024)} KB (${(row["objects"] as string[] | undefined ?? []).join(", ")})`);
+  }
+  if (Number(job["bu_to_m"]) !== 1 && ["glb", "gltf", "usd", "usda", "usdc", "usdz", "fbx"].includes(String(job["format"]))) {
+    lines.push(`scaled from ${String(job["units"])} to metres, as ${String(job["format"]).toUpperCase()} expects`);
+  }
+  return ok(lines.join("\n"), { details: { files: rows, format: job["format"] } });
+}
+
+// ----------------------------------------------------------------------------- new_blend
+export async function newBlend(ctx: WorkspaceContext, args: Record<string, unknown>, _extras: CallExtras = {}): Promise<ToolOutcome> {
+  if (!ctx.blender || !fs.existsSync(ctx.blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
+  const requested = str(args["path"]);
+  if (!requested) return fail("path is required: the new .blend, e.g. Models/lamp.blend");
+  let abs: string;
+  try {
+    abs = resolveInside(ctx.workspace, requested);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  if (!abs.toLowerCase().endsWith(".blend")) return fail("path must end in .blend");
+  if (fs.existsSync(abs)) return fail(`${relativeTo(ctx.workspace, abs)} exists. new_blend never overwrites a file; pick another path.`);
+  const template = str(args["template"]) ?? "empty";
+  if (!TEMPLATES.includes(template)) return fail(`template must be one of ${TEMPLATES.join(", ")}`);
+  const { profile, warnings } = resolvePrinter(ctx.printer, args["printer"]);
+  let result: Record<string, unknown>;
+  try {
+    result = await jobs.runToEnd(ctx, {
+      spec: { kind: "new_blend", path: abs, template, printer: printerParams(profile) },
+      kind: "new_blend",
+      label: `new ${template} file`,
+      factoryStartup: true,
+    }, 180000);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  const rel = relativeTo(ctx.workspace, abs);
+  const lines = [`created ${rel} from the ${template} template (${String(result["units"])})`];
+  for (const item of (result["applied"] as string[] | undefined) ?? []) lines.push(`- ${item}`);
+  if (template === "print_mm") lines.push(`printer: ${describePrinter(profile)}${warnings.length ? `; ${warnings.join("; ")}` : ""}`);
+  if (args["open"] === true) {
+    const probe = await probeBridge(ctx.port);
+    if (probe.ok) {
+      try {
+        const opened = await callBridge(ctx.port, "open_file", { path: abs }, 90000);
+        if (opened.ok && opened.result?.["opened"] === true) lines.push(`opened it in the running Blender`);
+        else lines.push(`not opened: ${String(opened.result?.["reason"] ?? opened.error ?? "the open file could not be replaced")}. `
+          + "Blender keeps the file it has open; save that first, then launch_blender with this file.");
+      } catch (error) {
+        lines.push(`not opened: ${errorText(error)}`);
+      }
+    } else {
+      const launched = await launchBlender(ctx, { file: rel }, false);
+      lines.push(launched.ok ? launched.text : `not opened: ${launched.text}`);
+    }
+  } else {
+    lines.push(`open it with launch_blender {"file": "${rel}"} (or new_blend with open: true)`);
+  }
+  lines.push("Put its scripts in " + path.posix.join(path.dirname(rel).split(path.sep).join("/") || ".", "scripts") + "/ and shared code in scripts/lib/.");
+  return ok(lines.join("\n"), { details: result });
+}
+
+// ----------------------------------------------------------------------------- measure
+export async function measure(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  const op = str(args["op"]) ?? "section";
+  const params: Record<string, unknown> = { ...args, op };
+  delete params["path"];
+  if (op === "depthmap" && args["image"] !== false) params["out"] = tempPng("depthmap");
+  const timeout = 180000;
+  try {
+    const routed = await routeCall(ctx, "measure", params, timeout, args["path"], extras);
+    const response = routed.response;
+    if (!response.ok) return fail(bridgeError(response, "measure"));
+    const result = response.result ?? {};
+    const text = sourceNote(ctx, routed) + String(result["text"] ?? JSON.stringify(result, null, 1))
+      + (response.warnings?.length ? `\nwarnings: ${response.warnings.join("; ")}` : "");
+    const file = typeof result["file"] === "string" ? result["file"] : "";
+    if (file && fs.existsSync(file)) return { ...imageReply(file, ctx.workspace, [text], args["save"] === true), details: result };
+    return ok(text, { details: result });
+  } catch (error) {
+    return failed(ctx, error, timeout);
+  }
+}
+
+// ----------------------------------------------------------------------------- pipelines
+function findPipelines(workspace: string): string[] {
+  const found: string[] = [];
+  const skip = new Set(["node_modules", ".git", "out", ".blender-ai", "dist"]);
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 5) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory() && !skip.has(entry.name) && !entry.name.startsWith(".")) walk(full, depth + 1);
+      else if (entry.isFile() && entry.name === "pipeline.json") found.push(full);
+    }
+  };
+  walk(workspace, 0);
+  return found;
+}
+
+function pipelineFor(ctx: WorkspaceContext, args: Record<string, unknown>): string {
+  const requested = str(args["pipeline"]);
+  if (requested) {
+    const abs = resolveInside(ctx.workspace, requested);
+    if (fs.existsSync(abs) && fs.statSync(abs).isDirectory()) {
+      const inside = path.join(abs, "pipeline.json");
+      if (!fs.existsSync(inside)) throw new Error(`no pipeline.json in ${requested}`);
+      return inside;
+    }
+    if (!fs.existsSync(abs)) throw new Error(`file not found: ${requested}`);
+    return abs;
+  }
+  const step = str(args["from"]);
+  const all = findPipelines(ctx.workspace).filter((file) => {
+    if (!step) return true;
+    try {
+      const steps = (JSON.parse(fs.readFileSync(file, "utf8")) as { steps?: string[] }).steps ?? [];
+      return steps.some((s) => path.basename(s, ".py") === path.basename(step, ".py"));
+    } catch {
+      return false;
+    }
+  });
+  if (all.length === 1) return all[0]!;
+  if (!all.length) throw new Error("no pipeline.json found. Write <scripts folder>/pipeline.json: {\"steps\": [\"01_base\", \"02_detail\"], \"after\": {\"01_base\": [\"02_detail\"]}}");
+  throw new Error(`more than one pipeline.json; pass pipeline:\n${all.map((f) => relativeTo(ctx.workspace, f)).join("\n")}`);
+}
+
+export async function runPipeline(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  let file: string;
+  try {
+    file = pipelineFor(ctx, args);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  const params: Record<string, unknown> = {
+    pipeline: file,
+    ...copyKeys(args, ["from", "to", "mode", "reason"]),
+    actor: "ai",
+    atomic: args["atomic"] !== false,
+    checkpoint: { auto: ctx.checkpoints.auto && args["checkpoint"] !== false, keep: ctx.checkpoints.keep, max_mb: ctx.checkpoints.maxMb },
+    lib_paths: ctx.libPaths,
+    printer: printerContext(ctx),
+  };
+  const timeout = Math.min(600000, Math.max(1000, Number(args["timeout_ms"]) || 300000));
+  const rel = relativeTo(ctx.workspace, file);
+  try {
+    const response = await callWithProgress(ctx, "run_pipeline", params, timeout, extras, `running ${rel}`);
+    if (!response.ok) return fail(`pipeline: ${rel}\n${bridgeError(response, "run_pipeline")}`, { changed: response.changed ?? [] });
+    const result = response.result ?? {};
+    const steps = (result["steps"] as Record<string, unknown>[] | undefined) ?? [];
+    const lines = [`pipeline: ${rel}`, `ran ${steps.length} step(s) as one undo step${result["checkpoint"] ? `; checkpoint ${String(result["checkpoint"])} undoes all of them` : ""}`];
+    for (const step of steps) lines.push(`- ${String(step["step"])}: ${String(step["changes"] ?? "")}`);
+    if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
+    return ok(lines.join("\n"), { details: result });
+  } catch (error) {
+    return failed(ctx, error, timeout);
+  }
+}
+
+/** run_script for files in the workspace's trusted folders only, so it can be allowed without asking. */
+export async function runProjectScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  const trusted = ctx.trustedScripts ?? [];
+  if (!trusted.length) {
+    return fail("no trusted script folders. Add \"trustedScripts\": [\"Models/scripts\"] to .blender-ai/config.json "
+      + "(and tick \"Run trusted project scripts without asking\" in setup), or use run_script.");
+  }
+  const requested = str(args["path"]);
+  if (!requested) return fail("path is required");
+  let real: string;
+  try {
+    real = fs.realpathSync(resolveInside(ctx.workspace, requested));
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  const rel = relativeTo(ctx.workspace, real);
+  if (rel.split("/").includes(".blender-ai")) return fail("scripts under .blender-ai/ are never trusted");
+  const inside = trusted.some((folder) => {
+    let root: string;
+    try {
+      root = fs.realpathSync(resolveInside(ctx.workspace, folder));
+    } catch {
+      return false;
+    }
+    const relative = path.relative(root, real);
+    return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
+  });
+  if (!inside) return fail(`${rel} is not inside a trusted folder (${trusted.join(", ")}). Use run_script for other scripts.`);
+  return runScript(ctx, { ...args, path: real }, extras);
+}
+
+export function blendCount(ctx: WorkspaceContext): number {
+  return listBlendFiles(ctx.workspace).length;
+}

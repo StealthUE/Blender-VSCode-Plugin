@@ -129,7 +129,7 @@ export function startJob(ctx: WorkspaceContext, id: string, options: StartOption
   const child = spawn(ctx.blender, args, {
     windowsHide: true,
     stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env, VSBLENDER_ADDON_SRC: addonSource(ctx.extensionRoot) },
+    env: { ...process.env, VSBLENDER_ADDON_SRC: addonSource(ctx.extensionRoot), VSBLENDER_WORKSPACE: ctx.workspace },
   });
   job.child = child;
   jobs.set(id, job);

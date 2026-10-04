@@ -31,6 +31,12 @@ export interface ApplyInput {
   launch: ServerLaunch;
   /** undefined: leave the run_script rule in .claude/settings.local.json as it is. */
   allowScripts?: boolean;
+  /** Let Claude Code run run_project_script (trusted folders only) without asking. */
+  allowTrustedScripts?: boolean;
+  /** Folders whose scripts run_project_script accepts. */
+  trustedScripts?: string[];
+  /** Printer preset chosen in setup; undefined leaves config.json's printer as it is. */
+  printer?: string | null;
   /** undefined means true: the client MCP files are git-ignored. */
   ignoreClientConfig?: boolean;
   checkpoints?: CheckpointSettings;
@@ -67,6 +73,9 @@ export function applyWorkspace(input: ApplyInput): ApplyResult {
     clients: input.clients,
     replaceLegacy: input.replaceLegacy,
     ...(input.allowScripts !== undefined ? { allowScripts: input.allowScripts } : {}),
+    ...(input.allowTrustedScripts !== undefined ? { allowTrustedScripts: input.allowTrustedScripts } : {}),
+    ...(input.trustedScripts !== undefined ? { trustedScripts: input.trustedScripts } : {}),
+    ...(input.printer ? { printer: input.printer } : {}),
     ignoreClientConfig,
     ...(input.checkpoints ? { checkpoints: input.checkpoints } : {}),
     ...(input.libPaths ? { libPaths: input.libPaths } : {}),
@@ -78,7 +87,7 @@ export function applyWorkspace(input: ApplyInput): ApplyResult {
     { rel: ".mcp.json", style: "mcpServers", enabled: input.clients.claude, entry: claudeServerEntry(input.launch) },
     { rel: path.join(".vscode", "mcp.json"), style: "servers", enabled: input.clients.vscode, entry: vscodeServerEntry(input.launch) },
     { rel: path.join(".cursor", "mcp.json"), style: "mcpServers", enabled: input.clients.cursor, entry: claudeServerEntry(input.launch) },
-    { rel: path.join(".cline", "mcp.json"), style: "mcpServers", enabled: input.clients.cline, entry: clineServerEntry(input.launch, input.allowScripts === true) },
+    { rel: path.join(".cline", "mcp.json"), style: "mcpServers", enabled: input.clients.cline, entry: clineServerEntry(input.launch, input.allowScripts === true, input.allowTrustedScripts === true) },
   ];
 
   for (const target of targets) {
@@ -134,7 +143,7 @@ export function applyWorkspace(input: ApplyInput): ApplyResult {
     record(result, settingsFile, writeIfChanged(settingsFile, mergeClaudeSettings(readText(settingsFile))));
     const localFile = path.join(input.workspace, ".claude", "settings.local.json");
     const localExisting = readText(localFile);
-    const localNext = mergeClaudeLocal(localExisting, input.allowScripts);
+    const localNext = mergeClaudeLocal(localExisting, input.allowScripts, input.allowTrustedScripts);
     if (localNext === undefined && localExisting !== undefined) result.skipped.push(localFile);
     else if (localNext !== undefined && localNext !== localExisting) record(result, localFile, writeIfChanged(localFile, localNext));
   }

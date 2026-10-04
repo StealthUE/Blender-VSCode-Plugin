@@ -10,6 +10,8 @@ import { runDoctor } from "./doctor";
 import { gotchasFor } from "./gotchas";
 import { ingestScript, runIngest } from "./ingest";
 import * as jobs from "./jobs";
+import * as modeling from "./modeling";
+import { describePrinter, printerParams, resolvePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
 import { compare, diff, reference, setRole } from "./review";
 import {
@@ -61,6 +63,8 @@ export function loadWorkspaceContext(env: NodeJS.ProcessEnv = process.env, cwd =
     replaceLegacy: config?.replaceLegacy ?? true,
     checkpoints: config?.checkpoints ?? DEFAULT_CHECKPOINTS,
     libPaths: config?.libPaths ?? DEFAULT_LIB_PATHS,
+    ...(config?.printer !== undefined ? { printer: config.printer } : {}),
+    ...(config?.trustedScripts ? { trustedScripts: config.trustedScripts } : {}),
   };
 }
 
@@ -115,7 +119,7 @@ export function bridgeFailure(port: number, error: unknown, timeoutMs: number): 
 }
 
 /** An add-on older than this server answers new methods with "unknown method". */
-function bridgeError(response: BridgeResponse, method: string): string {
+export function bridgeError(response: BridgeResponse, method: string): string {
   const error = response.error || `${method} failed`;
   if (/^unknown method/i.test(error)) {
     return `The add-on running in Blender is older than this server and has no ${method}. Run doctor_fix and restart Blender, or close Blender and call launch_blender (it loads the add-on shipped with the extension).`;
@@ -123,17 +127,66 @@ function bridgeError(response: BridgeResponse, method: string): string {
   return error;
 }
 
+/** Read-only bridge methods that also work on the saved file, in a background Blender, when Blender is not running. */
+export const HEADLESS_OK = new Set(["describe", "find", "spatial", "timeline", "measure", "check_model", "export_model", "preview"]);
+
+export interface Routed {
+  response: BridgeResponse;
+  /** live: the open session. disk: the saved file, read by a background Blender. */
+  source: "live" | "disk";
+  blend?: string;
+}
+
+/**
+ * Call a bridge method on the open session; when nothing is listening and the method only reads,
+ * run it on the saved .blend in a one-shot background Blender instead (a few seconds; about 20 s
+ * for the first start on Windows). A persistent background Blender would hold the port.
+ */
+export async function routeCall(ctx: WorkspaceContext, method: string, params: Record<string, unknown>, timeoutMs: number,
+  blendArg: unknown, extras: CallExtras = {}): Promise<Routed> {
+  const probe = await probeBridge(ctx.port);
+  if (probe.ok || probe.state !== "absent" || !HEADLESS_OK.has(method)) {
+    return { response: await callBridge(ctx.port, method, params, timeoutMs), source: "live" };
+  }
+  if (!ctx.blender || !fs.existsSync(ctx.blender)) {
+    throw new Error(`Blender is not running, and no Blender executable is configured to read the saved file. Run VSBlender: Setup, or launch_blender.`);
+  }
+  let blend: string;
+  try {
+    blend = pickBlend(ctx, blendArg);
+  } catch (error) {
+    throw new Error(`Blender is not running, so this reads a saved file, and ${errorText(error)}`);
+  }
+  const result = await jobs.runToEnd(ctx, {
+    blend,
+    spec: { kind: "call", method, params },
+    kind: "call",
+    label: `${method} on ${relativeTo(ctx.workspace, blend)}`,
+    factoryStartup: true,
+  }, Math.max(timeoutMs, 120000), extras.signal);
+  const warnings = Array.isArray(result["warnings"]) ? (result["warnings"] as string[]) : [];
+  return { response: { ok: true, result: (result["result"] as Record<string, unknown>) ?? {}, warnings }, source: "disk", blend };
+}
+
+export function sourceNote(ctx: WorkspaceContext, routed: Routed): string {
+  return routed.source === "disk" && routed.blend
+    ? `source: saved file ${relativeTo(ctx.workspace, routed.blend)} (Blender is not running; unsaved work is not included)\n`
+    : "";
+}
+
 /** Call a bridge method and turn its reply into text. Most read-only tools are just this. */
 export async function bridgeTool(ctx: WorkspaceContext, method: string, params: Record<string, unknown>, timeoutMs: number,
-  format?: (result: Record<string, unknown>) => string): Promise<ToolOutcome> {
+  format?: (result: Record<string, unknown>) => string, blendArg?: unknown, extras: CallExtras = {}): Promise<ToolOutcome> {
   try {
-    const response = await callBridge(ctx.port, method, params, timeoutMs);
+    const routed = await routeCall(ctx, method, params, timeoutMs, blendArg, extras);
+    const response = routed.response;
     if (!response.ok) return fail(bridgeError(response, method));
     const result = response.result ?? {};
     const text = format ? format(result) : typeof result["text"] === "string" ? result["text"] : JSON.stringify(result, null, 1);
     const warnings = response.warnings?.length ? `\nwarnings: ${response.warnings.join("; ")}` : "";
-    return ok(text + warnings, { details: result });
+    return ok(sourceNote(ctx, routed) + text + warnings, { details: { ...result, source: routed.source } });
   } catch (error) {
+    if (/did not finish|failed:|not running/i.test(errorText(error))) return fail(errorText(error));
     return fail(bridgeFailure(ctx.port, error, timeoutMs));
   }
 }
@@ -168,10 +221,14 @@ export async function sessionInfo(ctx: WorkspaceContext): Promise<ToolOutcome> {
     const response = await callBridge(ctx.port, "session_info", {}, 15000);
     if (!response.ok) return fail(response.error || "session_info failed");
     const version = String(response.result?.["blender_version"] ?? "");
+    const { profile, warnings } = resolvePrinter(ctx.printer);
     const info = {
       ...response.result,
       workspace: ctx.workspace,
       port: ctx.port,
+      printer: ctx.printer !== undefined
+        ? `${describePrinter(profile)}${warnings.length ? ` (${warnings.join("; ")})` : ""}`
+        : `none set (purpose print uses ${describePrinter(profile)}); set "printer" in .blender-ai/config.json`,
       gotchas: gotchasFor(version),
     };
     return ok(JSON.stringify(info, null, 2), { details: info });
@@ -247,6 +304,12 @@ export async function launchBlender(ctx: WorkspaceContext, args: Record<string, 
 }
 
 // ----------------------------------------------------------------------------- run_script
+/** The printer profile scripts see through vsblender.printer(). configured: false when the workspace set none. */
+export function printerContext(ctx: WorkspaceContext, override?: unknown): Record<string, unknown> {
+  const { profile, warnings } = resolvePrinter(ctx.printer, override);
+  return { ...printerParams(profile), configured: ctx.printer !== undefined || override !== undefined, warnings };
+}
+
 function changesText(report: ChangeReport | undefined): string {
   const lines = formatChanges(report);
   return lines.length ? `changes:\n  ${lines.join("\n  ")}` : "changes: none";
@@ -269,29 +332,15 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
     actor: "ai",
     checkpoint: { auto: ctx.checkpoints.auto && args["checkpoint"] !== false, keep: ctx.checkpoints.keep, max_mb: ctx.checkpoints.maxMb },
     lib_paths: ctx.libPaths,
+    printer: printerContext(ctx),
   };
+  if (typeof args["atomic"] === "boolean") params["atomic"] = args["atomic"];
   if (typeof args["function"] === "string" && args["function"]) params["function"] = args["function"];
   if (args["args"] && typeof args["args"] === "object") params["args"] = args["args"];
   const timeout = Math.min(600000, Math.max(1000, Number(args["timeout_ms"]) || 60000));
   const rel = relativeTo(ctx.workspace, script);
-  // The bridge answers ping on its socket thread while the script holds Blender's main thread.
-  let last = "";
-  const poll = setInterval(() => {
-    void probeBridge(ctx.port).then((probe) => {
-      const progress = probe.progress;
-      if (!progress || !extras.progress) return;
-      const key = `${progress.fraction ?? ""}|${progress.message ?? ""}`;
-      if (key === last) return;
-      last = key;
-      extras.progress(typeof progress.fraction === "number" ? progress.fraction : undefined, progress.message || `running ${rel}`);
-    });
-  }, 1000);
-  const onAbort = (): void => {
-    void cancelScript(ctx.port);
-  };
-  extras.signal?.addEventListener("abort", onAbort);
   try {
-    const response = await callBridge(ctx.port, "run_script", params, timeout);
+    const response = await callWithProgress(ctx, "run_script", params, timeout, extras, `running ${rel}`);
     if (!response.ok) {
       // The add-on already puts the traceback from the user's file:line, stdout and partial changes in error.
       const error = bridgeError(response, "run_script");
@@ -306,6 +355,14 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
       checkpoint ? `checkpoint: ${checkpoint} (restore_checkpoint ${checkpoint} undoes this script)` : "checkpoint: none (nothing changed, or checkpoints are off)",
       changesText(report),
     ];
+    if (typeof result["provenance"] === "string") lines.push(`provenance: ${result["provenance"]}`);
+    if (Array.isArray(result["rerun_after"]) && result["rerun_after"].length) {
+      lines.push(`pipeline: this script repairs what ${(result["rerun_after"] as string[]).join(", ")} reset; run it again after those`);
+    }
+    if (Array.isArray(result["out_of_date"]) && result["out_of_date"].length) {
+      lines.push(`now out of date: ${(result["out_of_date"] as string[]).join(", ")} (pipeline.json or their rerun-after header). `
+        + "Run them again, or run_pipeline from this step.");
+    }
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
     const stdout = typeof result["stdout"] === "string" ? result["stdout"] : "";
     const stderr = typeof result["stderr"] === "string" ? result["stderr"] : "";
@@ -318,6 +375,33 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
       return fail(`${bridgeFailure(ctx.port, error, timeout)}${asked ? " The script was asked to stop at its next vsblender.progress() call; a script that never calls it runs to the end." : ""}`);
     }
     return fail(bridgeFailure(ctx.port, error, timeout));
+  }
+}
+
+/**
+ * A long bridge call that runs a script: progress comes from ping (answered on the bridge's socket
+ * thread while the script holds Blender's main thread), and an abort asks the script to stop.
+ */
+export async function callWithProgress(ctx: WorkspaceContext, method: string, params: Record<string, unknown>, timeout: number,
+  extras: CallExtras, label: string): Promise<BridgeResponse> {
+  let last = "";
+  const poll = setInterval(() => {
+    void probeBridge(ctx.port).then((probe) => {
+      const progress = probe.progress;
+      if (!progress || !extras.progress) return;
+      const key = `${progress.fraction ?? ""}|${progress.message ?? ""}|${progress.label ?? ""}`;
+      if (key === last) return;
+      last = key;
+      extras.progress(typeof progress.fraction === "number" ? progress.fraction : undefined,
+        progress.message || (progress.label ? `running ${progress.label}` : label));
+    });
+  }, 1000);
+  const onAbort = (): void => {
+    void cancelScript(ctx.port);
+  };
+  extras.signal?.addEventListener("abort", onAbort);
+  try {
+    return await callBridge(ctx.port, method, params, timeout);
   } finally {
     clearInterval(poll);
     extras.signal?.removeEventListener("abort", onAbort);
@@ -388,11 +472,19 @@ export async function contextPack(ctx: WorkspaceContext, args: Record<string, un
   const packed = buildContextPack(ctx.workspace, blend, budget, focus);
   const header = [`tokens: ${packed.tokens} of ${budget}`];
   if (packed.dropped.length) header.push(`cut to fit: ${packed.dropped.join("; ")}`);
-  else if (packed.tokens > budget) header.push("over budget: the warnings sections are always kept in full");
+  if (packed.tokens > budget) {
+    header.push(packed.required !== undefined && packed.required > budget
+      ? `over budget: the sections that are always kept (header, Before you modify, Intent & constraints) are ${packed.required} tokens on their own`
+      : "over budget: the warnings sections are always kept in full");
+  }
   return ok(`${header.join("\n")}\n\n${packed.text}`, { details: { tokens: packed.tokens, truncated: packed.truncated, dropped: packed.dropped } });
 }
 
 // ----------------------------------------------------------------------------- seeing
+export function mimeFor(file: string): string {
+  return /\.jpe?g$/i.test(file) ? "image/jpeg" : "image/png";
+}
+
 export function imageReply(file: string, workspace: string, lines: string[], keep: boolean): ToolOutcome {
   const size = fs.statSync(file).size;
   const data = size <= PREVIEW_BYTES ? fs.readFileSync(file).toString("base64") : undefined;
@@ -408,9 +500,9 @@ export function imageReply(file: string, workspace: string, lines: string[], kee
   const text = [
     ...lines,
     keep || !data ? `file: ${relativeTo(workspace, shown)}` : "not saved (pass save: true to keep a copy in .blender-ai/live/)",
-    data ? "" : `image omitted from the tool result (${size} bytes). Open the file path.`,
+    data ? "" : `image omitted from the tool result (${size} bytes). Open the file path, or pass a smaller size or a crop.`,
   ].filter(Boolean).join("\n");
-  return ok(text, data ? { images: [{ mimeType: "image/png", data }] } : {});
+  return ok(text, data ? { images: [{ mimeType: mimeFor(shown), data }] } : {});
 }
 
 export function tempPng(prefix: string): string {
@@ -420,7 +512,8 @@ export function tempPng(prefix: string): string {
 }
 
 const PREVIEW_KEYS = ["view", "shading", "size", "width", "height", "aspect", "target", "isolate", "projection", "samples",
-  "compositor", "dof", "motion_blur", "views", "framing"];
+  "compositor", "dof", "motion_blur", "views", "framing", "crop", "region", "overlay", "cavity", "outline", "shadow", "matcap",
+  "xray", "color_type", "material"];
 
 export function previewParams(args: Record<string, unknown>): Record<string, unknown> {
   const params: Record<string, unknown> = {};
@@ -429,32 +522,40 @@ export function previewParams(args: Record<string, unknown>): Record<string, unk
     if (value !== undefined && value !== null && value !== "") params[key] = value;
   }
   if (args["frame"] !== undefined && args["frame"] !== null && args["frame"] !== "") params["frame"] = Number(args["frame"]);
+  // The add-on re-encodes or shrinks an image that would not fit in a tool reply, instead of omitting it.
+  params["max_bytes"] = PREVIEW_BYTES;
   return params;
 }
 
-export async function preview(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+export async function preview(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   const out = tempPng(`preview-${String(args["view"] ?? "iso")}`);
   const params = { ...previewParams(args), out };
   const timeout = 240000;
   try {
-    const response = await callBridge(ctx.port, "preview", params, timeout);
+    const routed = await routeCall(ctx, "preview", params, timeout, args["path"], extras);
+    const response = routed.response;
     if (!response.ok) return fail(bridgeError(response, "preview"));
     const result = response.result ?? {};
     const file = String(result["file"] ?? out);
     if (!fs.existsSync(file)) return fail(`Blender reported ${file}, but the file is not there`);
     const applied = Array.isArray(result["applied"]) && result["applied"].length ? (result["applied"] as string[]).join(", ") : "none";
     const lines = [
+      sourceNote(ctx, routed).trim(),
+      result["material"] ? `material ball: ${String(result["material"])}` : "",
       result["views"] ? `views: ${(result["views"] as string[]).join(", ")}` : `view: ${String(result["view"] ?? "")}`,
       `shading: ${String(result["shading"] ?? "")} (${String(result["engine"] ?? "")})`,
       `size: ${String(result["width"])}x${String(result["height"])}`,
       `projection: ${typeof result["projection"] === "object" ? JSON.stringify(result["projection"]) : String(result["projection"] ?? "")}`,
       result["isolate"] ? "isolated: only the target and lights" : "",
       typeof result["framing"] === "string" && result["framing"] ? String(result["framing"]) : "",
-      `compositor, depth of field, motion blur applied: ${applied}`,
+      `applied: ${applied}`,
+      Array.isArray(result["overlays"]) && result["overlays"].length ? `overlays: ${(result["overlays"] as string[]).join("; ")}` : "",
+      typeof result["note"] === "string" ? String(result["note"]) : "",
       response.warnings?.length ? `warnings: ${response.warnings.join("; ")}` : "",
     ];
     return { ...imageReply(file, ctx.workspace, lines, args["save"] === true), details: result };
   } catch (error) {
+    if (/did not finish|failed:|not running/i.test(errorText(error))) return fail(errorText(error));
     return fail(bridgeFailure(ctx.port, error, timeout));
   }
 }
@@ -463,7 +564,7 @@ function pruneLive(dir: string, keep: number): void {
   let files: { full: string; mtime: number }[];
   try {
     files = fs.readdirSync(dir)
-      .filter((name) => name.toLowerCase().endsWith(".png"))
+      .filter((name) => /\.(png|jpe?g)$/i.test(name))
       .map((name) => {
         const full = path.join(dir, name);
         return { full, mtime: fs.statSync(full).mtimeMs };
@@ -497,10 +598,14 @@ function renderOutput(ctx: WorkspaceContext, id: string, mode: string, requested
 
 export async function render(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   if (!ctx.blender || !fs.existsSync(ctx.blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
-  const frames = args["frames"] && typeof args["frames"] === "object" ? args["frames"] as Record<string, unknown> : undefined;
+  const frames = args["frames"] && typeof args["frames"] === "object" ? args["frames"] as Record<string, unknown> | number[] : undefined;
   const mode = typeof args["as"] === "string" && args["as"] ? args["as"] : frames ? "sheet" : "still";
   if (!["still", "frames", "sheet", "mp4"].includes(mode)) return fail("as must be still, frames, sheet or mp4");
   if (mode === "still" && frames) return fail("as=still renders one frame; pass frame, or as=frames/sheet/mp4 with frames");
+  if (frames) {
+    const problem = await checkFrames(ctx, frames, mode, args["max_tiles"]);
+    if (problem) return fail(problem);
+  }
   const id = jobs.newJobId("render");
   let output: string;
   let frameDir: string;
@@ -546,6 +651,7 @@ export async function render(ctx: WorkspaceContext, args: Record<string, unknown
     frame_dir: frameDir,
     preview: path.join(dir, "preview.png"),
     preview_max: 1024,
+    max_bytes: PREVIEW_BYTES,
     overrides: args["overrides"] && typeof args["overrides"] === "object" ? args["overrides"] : {},
   };
   if (frames) spec["frames"] = frames;
@@ -565,13 +671,45 @@ export async function render(ctx: WorkspaceContext, args: Record<string, unknown
   return jobReply(ctx, job);
 }
 
+/** Frame lists and ranges: not empty, end after start, mp4 needs a range, and a sheet has at most max_tiles tiles. */
+async function checkFrames(ctx: WorkspaceContext, frames: Record<string, unknown> | number[], mode: string, maxTiles: unknown): Promise<string | undefined> {
+  let count: number;
+  if (Array.isArray(frames)) {
+    if (!frames.length) return "frames is an empty list";
+    if (!frames.every((f) => Number.isFinite(Number(f)))) return "frames must be numbers, e.g. [1, 36, 216, 260]";
+    if (mode === "mp4") return "as=mp4 needs a frame range {start, end, step}, not a list of frames";
+    count = frames.length;
+  } else {
+    let start = Number(frames["start"]);
+    let end = Number(frames["end"]);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+      try {
+        const info = await callBridge(ctx.port, "session_info", {}, 8000);
+        if (!Number.isFinite(start)) start = Number(info.result?.["frame_start"] ?? 1);
+        if (!Number.isFinite(end)) end = Number(info.result?.["frame_end"] ?? start);
+      } catch {
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return "frames needs start and end when Blender is not running";
+      }
+    }
+    if (end < start) return `frames end ${end} is before start ${start}`;
+    const step = Math.max(1, Number(frames["step"]) || 1);
+    count = Math.floor((end - start) / step) + 1;
+  }
+  const cap = Math.max(1, Math.min(36, Number(maxTiles) || 16));
+  if (mode === "sheet" && count > cap) {
+    return `a sheet of ${count} frames is too many to read (limit ${cap}). Pass a step, a list such as [1, 36, 216, 260], `
+      + `as=frames for every frame, or max_tiles (up to 36).`;
+  }
+  return undefined;
+}
+
 function jobReply(ctx: WorkspaceContext, job: jobs.Job): ToolOutcome {
   const text = jobs.describeJob(job, ctx.workspace);
   if (job.state === "running") return ok(`${text}\nStill rendering. Call job_status with id ${job.id}, or cancel_job.`);
   if (job.state !== "done") return fail(text);
   const preview = job.result?.["preview"];
   if (typeof preview === "string" && fs.existsSync(preview) && fs.statSync(preview).size <= PREVIEW_BYTES) {
-    return ok(text, { images: [{ mimeType: "image/png", data: fs.readFileSync(preview).toString("base64") }], details: job.result });
+    return ok(text, { images: [{ mimeType: mimeFor(preview), data: fs.readFileSync(preview).toString("base64") }], details: job.result });
   }
   return ok(text, { details: job.result });
 }
@@ -633,7 +771,7 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
     case "context_pack":
       return contextPack(ctx, args);
     case "preview":
-      return preview(ctx, args);
+      return preview(ctx, args, extras);
     case "render":
       return render(ctx, args, extras);
     case "job_status":
@@ -649,11 +787,25 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
     case "node_schema":
       return bridgeTool(ctx, "node_schema", { bl_idname: args["bl_idname"], props: args["props"] ?? null }, 30000);
     case "describe":
-      return bridgeTool(ctx, "describe", { target: args["target"] }, 60000);
+      return bridgeTool(ctx, "describe", { target: args["target"] }, 60000, undefined, args["path"], extras);
     case "find":
-      return bridgeTool(ctx, "find", { selector: args["selector"], limit: args["limit"] ?? 100 }, 60000);
+      return bridgeTool(ctx, "find", { selector: args["selector"], limit: args["limit"] ?? 100 }, 60000, undefined, args["path"], extras);
     case "spatial":
-      return bridgeTool(ctx, "spatial", args, 120000, (result) => JSON.stringify(result, null, 1));
+      return bridgeTool(ctx, "spatial", args, 120000, (result) => JSON.stringify(result, null, 1), args["path"], extras);
+    case "timeline":
+      return bridgeTool(ctx, "timeline", args, 120000, undefined, args["path"], extras);
+    case "measure":
+      return modeling.measure(ctx, args, extras);
+    case "check_model":
+      return modeling.checkModel(ctx, args, extras);
+    case "export_model":
+      return modeling.exportModel(ctx, args, extras);
+    case "new_blend":
+      return modeling.newBlend(ctx, args, extras);
+    case "run_pipeline":
+      return modeling.runPipeline(ctx, args, extras);
+    case "run_project_script":
+      return modeling.runProjectScript(ctx, args, extras);
     case "set_role":
       return setRole(ctx, args);
     case "diff":

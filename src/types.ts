@@ -1,3 +1,5 @@
+import type { PrinterSetting } from "./printers";
+
 export interface ClientFlags {
   claude: boolean;
   vscode: boolean;
@@ -42,6 +44,12 @@ export interface ProjectConfig {
   checkpoints?: CheckpointSettings;
   /** Workspace folders on sys.path during run_script. */
   libPaths?: string[];
+  /** 3D printer for purpose "print": a preset name or an object of overrides (src/printers.ts). */
+  printer?: PrinterSetting;
+  /** Workspace folders whose scripts run_project_script accepts. */
+  trustedScripts?: string[];
+  /** Let Claude Code run run_project_script without asking (settings.local.json). */
+  allowTrustedScripts?: boolean;
 }
 
 export interface WorkspaceContext {
@@ -53,6 +61,8 @@ export interface WorkspaceContext {
   replaceLegacy: boolean;
   checkpoints: CheckpointSettings;
   libPaths: string[];
+  printer?: PrinterSetting;
+  trustedScripts?: string[];
 }
 
 export interface ServerLaunch {
@@ -77,7 +87,7 @@ export interface CallExtras {
 
 export const DEFAULT_PORT = 47876;
 export const SERVER_NAME = "vsblender";
-export const ADDON_VERSION = "0.2.0";
+export const ADDON_VERSION = "0.3.0";
 export const GUIDE_STAMP = "<!-- vsblender-guide";
 export const DEFAULT_LIB_PATHS = ["scripts/lib"];
 

@@ -6,7 +6,7 @@ import { findCheckpoint, readCheckpoints, relativeTo, resolveInside, sidecarDir 
 import { callBridge, probeBridge } from "./bridge";
 import { diffHeadless, ingestScript, manifestHeadless } from "./ingest";
 import * as jobs from "./jobs";
-import { bridgeFailure, currentBlend, errorText, fail, imageReply, ok, previewParams, tempPng } from "./tools";
+import { bridgeFailure, currentBlend, errorText, fail, imageReply, ok, PREVIEW_BYTES, previewParams, tempPng } from "./tools";
 import { CallExtras, ToolOutcome, WorkspaceContext } from "./types";
 
 const IMAGE_FILE = /\.(png|jpe?g|webp|bmp|tiff?)$/i;
@@ -178,7 +178,8 @@ async function sourceImage(ctx: WorkspaceContext, source: string, params: Record
 
 async function composeImages(ctx: WorkspaceContext, paths: string[], labels: string[], diffPanel: boolean, cell: number, signal?: AbortSignal): Promise<{ file: string; stats?: Record<string, unknown> }> {
   const out = tempPng("compare");
-  const spec = { paths, out, labels, diff: diffPanel, cell };
+  // The sheet, not the panels, is what has to fit in the tool reply.
+  const spec = { paths, out, labels, diff: diffPanel, cell, max_bytes: PREVIEW_BYTES };
   const probe = await probeBridge(ctx.port);
   let result: Record<string, unknown>;
   if (probe.ok) {
@@ -197,6 +198,7 @@ export async function compare(ctx: WorkspaceContext, args: Record<string, unknow
   const b = typeof args["b"] === "string" && args["b"].trim() ? args["b"].trim() : "live";
   if (!a) return fail("a is required: a checkpoint id, live, or a workspace image");
   const params = previewParams({ size: 512, ...args });
+  delete params["max_bytes"];
   delete params["views"];
   const sources: Source[] = [];
   try {
@@ -289,6 +291,7 @@ export async function reference(ctx: WorkspaceContext, args: Record<string, unkn
       }
     }
     const params = previewParams({ size: 512, ...args });
+    delete params["max_bytes"];
     delete params["views"];
     live = await livePreview(ctx, params);
     files.push(live);

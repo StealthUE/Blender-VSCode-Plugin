@@ -43,7 +43,7 @@ async function handle(message: RpcMessage): Promise<void> {
       capabilities: { tools: {} },
       serverInfo: { name: "vsblender", version: ADDON_VERSION },
       instructions:
-        "Drive Blender through these tools. Do not read or edit .blend binaries. Call doctor for each file's status, then ingest or context_pack before changing an existing file. Write scripts/*.py and run_script with a reason. preview and render never touch the user's viewport or render settings.",
+        "Drive Blender through these tools. Do not read or edit .blend binaries. Call doctor for each file's status, then ingest or context_pack before changing an existing file. Write <blend folder>/scripts/*.py and run_script with a reason; build geometry with vsblender.geo (solids, booleans, threads, holes) and vsblender.material. new_blend starts a project from a template (render, game, print_mm). check_model checks a model for its purpose (general, render, game, print) and export_model writes 3MF/STL for slicers or GLB/FBX/USD/OBJ. preview and render never touch the user's viewport or render settings; lengths are scene units (session_info.units).",
     });
     return;
   }

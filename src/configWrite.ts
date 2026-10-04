@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { AUTO_APPROVE, claudeRule, SCRIPT_TOOL, TOOL_NAMES } from "./toolDefs";
+import { AUTO_APPROVE, claudeRule, PIPELINE_TOOL, SCRIPT_TOOL, TOOL_NAMES, TRUSTED_SCRIPT_TOOL } from "./toolDefs";
 import { ServerLaunch, SERVER_NAME } from "./types";
 
 export interface LaunchInput {
@@ -104,9 +104,10 @@ export function claudeServerEntry(launch: ServerLaunch): JsonRecord {
   return { command: launch.command, args: launch.args, env: launch.env };
 }
 
-/** Cline reads alwaysAllow from the server entry: the read-only tools, plus run_script when allowed. */
-export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean): JsonRecord {
-  return { ...claudeServerEntry(launch), alwaysAllow: [...AUTO_APPROVE, ...(allowScripts ? [SCRIPT_TOOL] : [])], disabled: false };
+/** Cline reads alwaysAllow from the server entry: the read-only tools, plus the script tools when allowed. */
+export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean, allowTrusted = false): JsonRecord {
+  const extra = [...(allowScripts ? [SCRIPT_TOOL, PIPELINE_TOOL] : []), ...(allowScripts || allowTrusted ? [TRUSTED_SCRIPT_TOOL] : [])];
+  return { ...claudeServerEntry(launch), alwaysAllow: [...AUTO_APPROVE, ...extra], disabled: false };
 }
 
 const TOOL_TIMEOUT_SEC = 600;
@@ -247,17 +248,31 @@ export const mergeClaudeDeny = mergeClaudeSettings;
  * .claude/settings.local.json is personal and not committed: the place for "run scripts without
  * asking". allow undefined leaves the file as it is.
  */
-export function mergeClaudeLocal(existing: string | undefined, allowScripts: boolean | undefined): string | undefined {
-  if (allowScripts === undefined) return existing;
+export function mergeClaudeLocal(existing: string | undefined, allowScripts: boolean | undefined,
+  allowTrusted?: boolean): string | undefined {
+  if (allowScripts === undefined && allowTrusted === undefined) return existing;
   const settings = parseSettings(existing);
   if (!settings) return undefined;
   const permissions = isRecord(settings["permissions"]) ? { ...settings["permissions"] } : {};
-  const allow = ruleList(permissions, "allow");
-  const rule = claudeRule(SCRIPT_TOOL);
-  const has = allow.includes(rule);
-  if (has === allowScripts) return existing;
-  if (existing === undefined && !allowScripts) return undefined;
-  permissions["allow"] = allowScripts ? [...allow, rule] : allow.filter((item) => item !== rule);
+  let allow = ruleList(permissions, "allow");
+  const want = new Map<string, boolean>();
+  // run_script and run_pipeline run any workspace script; run_project_script only trusted folders.
+  if (allowScripts !== undefined) {
+    want.set(claudeRule(SCRIPT_TOOL), allowScripts);
+    want.set(claudeRule(PIPELINE_TOOL), allowScripts);
+  }
+  const trusted = allowTrusted ?? (allowScripts === true ? true : undefined);
+  if (trusted !== undefined) want.set(claudeRule(TRUSTED_SCRIPT_TOOL), trusted || allowScripts === true);
+  let changed = false;
+  for (const [rule, on] of want) {
+    const has = allow.includes(rule);
+    if (has === on) continue;
+    allow = on ? [...allow, rule] : allow.filter((item) => item !== rule);
+    changed = true;
+  }
+  if (!changed) return existing;
+  if (existing === undefined && !allow.length) return undefined;
+  permissions["allow"] = allow;
   settings["permissions"] = permissions;
   return JSON.stringify(settings, null, 2) + "\n";
 }

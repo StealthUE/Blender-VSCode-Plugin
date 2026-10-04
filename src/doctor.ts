@@ -4,11 +4,12 @@ import { execFileText } from "./exec";
 import { compareVersions, findNode } from "./findBlender";
 import { callBridge, probeBridge } from "./bridge";
 import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
+import { describePrinter, resolvePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
 import { applyWorkspace } from "./workspaceSetup";
 import { hasScriptRule, readText, serverLaunch } from "./configWrite";
 import { AUTO_APPROVE, claudeRule } from "./toolDefs";
-import { ADDON_VERSION, ClientFlags, DEFAULT_CHECKPOINTS, DEFAULT_CLIENTS, DEFAULT_LIB_PATHS, WorkspaceContext } from "./types";
+import { ADDON_VERSION, ClientFlags, WorkspaceContext } from "./types";
 
 export interface Check {
   id: string;
@@ -99,6 +100,7 @@ export async function runDoctor(
       replaceLegacy: ctx.replaceLegacy,
       launch,
       ...(saved?.allowScripts !== undefined ? { allowScripts: saved.allowScripts } : {}),
+      ...(saved?.allowTrustedScripts !== undefined ? { allowTrustedScripts: saved.allowTrustedScripts } : {}),
       ...(saved?.ignoreClientConfig !== undefined ? { ignoreClientConfig: saved.ignoreClientConfig } : {}),
       ...(saved?.checkpoints ? { checkpoints: saved.checkpoints } : {}),
       ...(saved?.libPaths ? { libPaths: saved.libPaths } : {}),
@@ -123,6 +125,14 @@ export async function runDoctor(
 
   const config = readConfig(ctx.workspace);
   checks.push(check("workspace config", Boolean(config), config ? `port ${config.port}` : "missing .blender-ai/config.json"));
+  if (isExtensionSource(ctx.workspace)) {
+    checks.push(check("workspace", false, "this folder is the VSBlender extension source, and its scripts/ folder holds the extension's tests. "
+      + "Keep model scripts next to their .blend, in <blend folder>/scripts/ (shared code in <blend folder>/scripts/lib/).", true));
+  }
+  if (config?.printer !== undefined) {
+    const { profile, warnings } = resolvePrinter(config.printer);
+    checks.push(check("printer", !warnings.length, warnings.length ? warnings.join("; ") : describePrinter(profile), true));
+  }
 
   for (const file of clientFiles(ctx.clients, ctx.workspace)) {
     const exists = fs.existsSync(file.path);
@@ -186,6 +196,17 @@ export async function runDoctor(
   return { ok, checks, text: formatReport(checks) };
 }
 
+/** The workspace is this extension's own repository (its package.json names vsblender, or it holds the add-on source). */
+export function isExtensionSource(workspace: string): boolean {
+  if (fs.existsSync(path.join(workspace, "resources", "addon", "vsblender_bridge", "__init__.py"))) return true;
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(workspace, "package.json"), "utf8")) as { name?: unknown };
+    return pkg.name === "vsblender";
+  } catch {
+    return false;
+  }
+}
+
 function clientFiles(clients: ClientFlags, workspace: string): { label: string; path: string }[] {
   const files: { label: string; path: string; on: boolean }[] = [
     { label: "claude mcp", path: path.join(workspace, ".mcp.json"), on: clients.claude },
@@ -195,23 +216,4 @@ function clientFiles(clients: ClientFlags, workspace: string): { label: string; 
     { label: "cline mcp", path: path.join(workspace, ".cline", "mcp.json"), on: clients.cline },
   ];
   return files.filter((file) => file.on).map(({ label, path: file }) => ({ label, path: file }));
-}
-
-export function contextFromConfig(
-  workspace: string,
-  extensionRoot: string,
-  overrides?: { blender?: string; port?: number; clients?: ClientFlags }
-): WorkspaceContext {
-  const config = readConfig(workspace);
-  const blender = overrides?.blender || config?.blender;
-  return {
-    workspace,
-    extensionRoot,
-    port: overrides?.port || config?.port || 47876,
-    ...(blender ? { blender } : {}),
-    clients: overrides?.clients ?? config?.clients ?? DEFAULT_CLIENTS,
-    replaceLegacy: config?.replaceLegacy ?? true,
-    checkpoints: config?.checkpoints ?? DEFAULT_CHECKPOINTS,
-    libPaths: config?.libPaths ?? DEFAULT_LIB_PATHS,
-  };
 }
