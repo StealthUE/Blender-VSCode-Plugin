@@ -3,7 +3,7 @@
   "publisher": "MassiveDynamicEngineering",
   "displayName": "VSBlender",
   "description": "Set up Blender for AI clients, ingest .blend files into readable notes, and drive Blender through a local MCP server and add-on: model with a geometry kit, check models for render, games or 3D printing, and export 3MF, STL, GLB and more.",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
