@@ -5,7 +5,7 @@ even-odd rule (a loop inside another is a hole), which is what SVG fills and gly
 
     svg_loops(path, size=40)      SVG fills and strokes -> outline loops, y up, optionally scaled
     triangulate(loops)            -> (points, triangles) counter-clockwise, holes left open
-    circle(d), rect(w, h, r), regular(n, d), polygon(points), offset(loops, delta)
+    circle(d), rect(w, h, r), regular(n, d), arch(w, length), polygon(points), offset(loops, delta)
 
 triangulate uses mathutils.geometry.delaunay_2d_cdt and keeps the triangles inside by even-odd:
 tessellate_polygon mis-fills concave outlines (a "Λ" comes out as a solid triangle).
@@ -13,6 +13,7 @@ tessellate_polygon mis-fills concave outlines (a "Λ" comes out as a solid trian
 from __future__ import annotations
 
 import math
+import os
 import re
 import xml.etree.ElementTree as ET
 
@@ -20,6 +21,7 @@ import numpy as np
 
 _NUM = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 _TOK = re.compile(r"[MmLlHhVvCcSsQqTtAaZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
+_CLASS_RULE = re.compile(r"\.([A-Za-z_][\w-]*)\s*\{([^}]*)\}")
 _INHERITED = ("fill", "stroke", "stroke-width", "stroke-linecap", "fill-rule", "fill-opacity", "stroke-opacity",
               "display", "visibility")
 
@@ -55,6 +57,32 @@ def rect(w: float, h: float, r: float = 0.0, center: bool = True, segments: int 
 
 def polygon(points) -> np.ndarray:
     return np.asarray(points, float).reshape(-1, 2)
+
+
+def arch(width: float, length: float, segments: int = 16) -> np.ndarray:
+    """A window outline: straight sides, a round outer end, a square inner end. Counter-clockwise.
+
+    The inner end lies on y = 0 and is centred on x = 0. The outer end is a semicircle whose
+    diameter is `width`. `length` is the full height and must be at least half the width.
+    """
+    w = float(width)
+    length = float(length)
+    if w <= 0 or length <= 0:
+        raise ValueError("arch width and length must be positive")
+    radius = w / 2.0
+    if length + 1e-9 < radius:
+        raise ValueError("arch length must be at least half the width (the outer semicircle)")
+    straight = length - radius
+    n = max(2, int(segments))
+    pts = [(-radius, 0.0), (radius, 0.0)]
+    if straight > 1e-9:
+        pts.append((radius, straight))
+    for i in range(1, n):
+        t = math.pi * i / n
+        pts.append((radius * math.cos(t), straight + radius * math.sin(t)))
+    if straight > 1e-9:
+        pts.append((-radius, straight))
+    return np.array(pts, float)
 
 
 def signed_area(loop) -> float:
@@ -211,15 +239,48 @@ def _region_field(loops, px, py) -> np.ndarray:
 
 
 # ----------------------------------------------------------------------------- SVG parsing
-def _style(el, inherited: dict) -> dict:
+def _declarations(text: str) -> dict:
+    props = {}
+    for part in (text or "").split(";"):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            props[k.strip()] = v.strip()
+    return props
+
+
+def _class_rules(text: str) -> dict:
+    """`.name { prop: value }` rules from a style block. Later rules for the same class win."""
+    rules = {}
+    for name, body in _CLASS_RULE.findall(text or ""):
+        props = {k: v for k, v in _declarations(body).items() if k in _INHERITED}
+        if not props:
+            continue
+        rules.setdefault(name, {}).update(props)
+    return rules
+
+
+def _collect_classes(root) -> dict:
+    rules = {}
+    for el in root.iter():
+        if el.tag.rsplit("}", 1)[-1] != "style" or not el.text:
+            continue
+        for name, props in _class_rules(el.text).items():
+            rules.setdefault(name, {}).update(props)
+    return rules
+
+
+def _style(el, inherited: dict, classes: dict | None = None) -> dict:
+    """Class rules, then presentation attributes, then the style attribute. The style attribute wins."""
     out = {k: v for k, v in inherited.items() if k in _INHERITED}
+    if classes:
+        for name in (el.get("class") or "").split():
+            for k, v in (classes.get(name) or {}).items():
+                out[k] = v
     for k in _INHERITED:
         if el.get(k) is not None:
             out[k] = el.get(k)
-    for part in (el.get("style") or "").split(";"):
-        if ":" in part:
-            k, v = part.split(":", 1)
-            out[k.strip()] = v.strip()
+    for k, v in _declarations(el.get("style") or "").items():
+        out[k] = v
     return out
 
 
@@ -315,6 +376,16 @@ def parse_path(d: str) -> list:
         i += 1
         return v
 
+    def push(p):
+        """Drop a point that repeats the previous one. The first point of a subpath stays."""
+        if pts and abs(pts[-1][0] - p[0]) <= 1e-9 and abs(pts[-1][1] - p[1]) <= 1e-9:
+            return
+        pts.append(p)
+
+    def extend(seq):
+        for p in seq:
+            push(p)
+
     while i < len(toks):
         if re.match(r"[A-Za-z]", toks[i]):
             cmd = toks[i]
@@ -341,27 +412,27 @@ def parse_path(d: str) -> list:
             last_c = last_q = None
         elif c == "L":
             cur = (ox + num(), oy + num())
-            pts.append(cur)
+            push(cur)
             last_c = last_q = None
         elif c == "H":
             cur = ((ox if rel else 0.0) + num(), cur[1])
-            pts.append(cur)
+            push(cur)
             last_c = last_q = None
         elif c == "V":
             cur = (cur[0], (oy if rel else 0.0) + num())
-            pts.append(cur)
+            push(cur)
             last_c = last_q = None
         elif c == "C":
             p1 = (ox + num(), oy + num())
             p2 = (ox + num(), oy + num())
             p3 = (ox + num(), oy + num())
-            pts.extend(_bezier(cur, p1, p2, p3))
+            extend(_bezier(cur, p1, p2, p3))
             last_c, last_q, cur = p2, None, p3
         elif c == "S":
             p1 = (2 * cur[0] - last_c[0], 2 * cur[1] - last_c[1]) if last_c else cur
             p2 = (ox + num(), oy + num())
             p3 = (ox + num(), oy + num())
-            pts.extend(_bezier(cur, p1, p2, p3))
+            extend(_bezier(cur, p1, p2, p3))
             last_c, last_q, cur = p2, None, p3
         elif c in "QT":
             if c == "Q":
@@ -371,12 +442,12 @@ def parse_path(d: str) -> list:
             p3 = (ox + num(), oy + num())
             p1 = (cur[0] + 2 / 3 * (q[0] - cur[0]), cur[1] + 2 / 3 * (q[1] - cur[1]))
             p2 = (p3[0] + 2 / 3 * (q[0] - p3[0]), p3[1] + 2 / 3 * (q[1] - p3[1]))
-            pts.extend(_bezier(cur, p1, p2, p3))
+            extend(_bezier(cur, p1, p2, p3))
             last_q, last_c, cur = q, None, p3
         elif c == "A":
             rx, ry, phi, large, sweep = num(), num(), num(), num(), num()
             p1 = (ox + num(), oy + num())
-            pts.extend(_arc(cur, rx, ry, phi, int(large), int(sweep), p1))
+            extend(_arc(cur, rx, ry, phi, int(large), int(sweep), p1))
             cur = p1
             last_c = last_q = None
         else:
@@ -434,10 +505,11 @@ def load_shapes(path: str) -> list:
     """
     tree = ET.parse(path)
     root = tree.getroot()
+    classes = _collect_classes(root)
     shapes = []
 
     def walk(el, matrix, inherited):
-        style = _style(el, inherited)
+        style = _style(el, inherited, classes)
         if style.get("display") == "none" or style.get("visibility") == "hidden":
             return
         m = matrix @ _transform(el.get("transform"))
@@ -640,6 +712,10 @@ def svg_loops(path: str, size: float | None = None, res: float | None = None, to
     if not shapes:
         raise ValueError(f"no visible shapes in {path}")
     strokes = any(sh["kind"] == "stroke" for sh in shapes)
+    if mode == "fill" and strokes:
+        from . import helpers
+
+        helpers.warn(f"svg_loops mode=fill drops strokes in {os.path.basename(path)}; use mode='auto' to include them")
     if mode == "fill" or (mode == "auto" and not strokes):
         loops = [np.asarray(p, float) for sh in shapes if sh["kind"] == "fill" for p, _c in sh["subpaths"] if len(p) >= 3]
         loops = [l[:-1] if len(l) > 3 and np.allclose(l[0], l[-1]) else l for l in loops]

@@ -15,6 +15,8 @@ Spec kinds:
     call       one bridge method on this file (Blender is not running): method, params
     export     Blender's exporters (glTF, FBX, USD, OBJ, PLY) on this copy: export (a plan from export.plan)
     new_blend  a new .blend from a template, no input file: path, template, printer
+    script     exec a workspace .py in this copy and return result, stdout and stderr.
+               The copy is thrown away by the caller. Nothing is journaled or checkpointed.
 """
 import importlib.util
 import json
@@ -449,11 +451,12 @@ def new_blend(spec):
         floor["vsblender_stage"] = "floor"
         stage.objects.link(floor)
         target = Vector((0.0, 0.0, 0.5))
+        aim = load_addon().helpers.aim
         cam_data = bpy.data.cameras.new("Camera")
         cam_data.lens = 50
         cam = bpy.data.objects.new("Camera", cam_data)
         cam.location = (4.0, -4.0, 2.4)
-        cam.rotation_euler = (target - cam.location).to_track_quat("-Z", "Y").to_euler()
+        aim(cam, target, "-Z")
         stage.objects.link(cam)
         scene.camera = cam
         for name, loc, energy, size in (("Key Light", (3.0, -2.5, 4.0), 600.0, 2.0), ("Fill Light", (-3.5, -2.0, 2.5), 200.0, 3.0),
@@ -463,7 +466,7 @@ def new_blend(spec):
             data.size = size
             light = bpy.data.objects.new(name, data)
             light.location = loc
-            light.rotation_euler = (target - Vector(loc)).to_track_quat("-Z", "Y").to_euler()
+            aim(light, target, "-Z")
             stage.objects.link(light)
         applied.append("EEVEE, a camera aimed at (0, 0, 0.5), key/fill/rim area lights, a dark grey world, "
                        "and a floor (Stage collection, left out of checks and exports)")
@@ -669,6 +672,77 @@ def video_frames(spec):
     return result
 
 
+def _jsonish(value):
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return json.loads(json.dumps(value, default=str))
+
+
+def run_background_script(spec):
+    """Exec a script in this headless copy. The caller's run_script path journals and checkpoints; this one does not."""
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+
+    addon = load_addon()
+    addon.helpers.install_modules()
+    script = spec.get("script")
+    if not isinstance(script, str) or not os.path.isfile(script):
+        raise FileNotFoundError(str(script))
+    function = spec.get("function") or None
+    args = spec.get("args") if isinstance(spec.get("args"), dict) else {}
+    _original, code, info = addon._load_script(script, function)
+    stdout, stderr = io.StringIO(), io.StringIO()
+    namespace = {"__name__": "__main__", "__file__": script, "bpy": bpy, "vsblender": addon.helpers}
+    try:
+        import mathutils
+        namespace["mathutils"] = mathutils
+    except Exception:
+        pass
+    folder = os.path.dirname(os.path.abspath(script))
+    inserted = folder not in sys.path
+    if inserted:
+        sys.path.insert(0, folder)
+    warnings = []
+    try:
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exec(code, namespace)
+            if function:
+                fn = namespace.get(function)
+                if not callable(fn):
+                    raise RuntimeError(f"{function} is not defined in {script}")
+                namespace["result"] = fn(**args)
+            elif info.get("defines") and not info.get("called") and "result" not in namespace \
+                    and callable(namespace.get("main")):
+                returned = namespace["main"]()
+                if returned is not None:
+                    namespace["result"] = returned
+            if info.get("defines") and info.get("called") and "result" not in namespace:
+                warnings.append("main() ran but its return stayed local. Use global result, or return the value from main().")
+    except Exception as exc:
+        extra = ""
+        out, err = stdout.getvalue()[-4000:], stderr.getvalue()[-4000:]
+        if out.strip():
+            extra += "\n--- stdout ---\n" + out
+        if err.strip():
+            extra += "\n--- stderr ---\n" + err
+        raise RuntimeError(f"{type(exc).__name__}: {exc}{extra}") from exc
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(folder)
+            except ValueError:
+                pass
+
+    def clip(text):
+        text = text or ""
+        return text if len(text) <= 8000 else text[-8000:]
+
+    return {"status": "done", "result": _jsonish(namespace.get("result")), "stdout": clip(stdout.getvalue()),
+            "stderr": clip(stderr.getvalue()), "warnings": warnings}
+
+
 def main():
     argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
     if not argv:
@@ -692,6 +766,8 @@ def main():
         return import_reference(spec)
     if kind == "video_frames":
         return video_frames(spec)
+    if kind == "script":
+        return run_background_script(spec)
     raise SystemExit(f"unknown job kind {kind!r}")
 
 

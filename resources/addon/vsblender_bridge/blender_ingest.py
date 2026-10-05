@@ -1169,7 +1169,19 @@ def render_previews(out, man, args):
             cd.lens, cd.sensor_width = 50.0, 36.0
             dist = (diag / 2) / math.sin(math.atan(18.0 / 50.0)) * 1.05
         cam.location = c - Vector(d).normalized() * dist
-        cam.rotation_euler = Vector(d).to_track_quat("-Z", "Y").to_euler()
+        # to_track_quat(..., "Y") is degenerate when the view looks along world Y (the front of a gate).
+        try:
+            from . import helpers
+            helpers.aim(cam, c, track="-Z")
+        except Exception:
+            direction = Vector(c) - Vector(cam.location)
+            if direction.length < 1e-8:
+                cam.rotation_euler = (0.0, 0.0, 0.0)
+            else:
+                dn = direction.normalized()
+                axes = (("Z", Vector((0.0, 0.0, 1.0))), ("Y", Vector((0.0, 1.0, 0.0))), ("X", Vector((1.0, 0.0, 0.0))))
+                up = min(axes, key=lambda item: abs(float(dn.dot(item[1]))))[0]
+                cam.rotation_euler = direction.to_track_quat("-Z", up).to_euler()
         cd.clip_start, cd.clip_end = max(0.001, dist * 0.001), dist * 4 + diag
 
     main = set(man["objects"]) - set(excluded)
@@ -1724,6 +1736,8 @@ DEFAULT_TAIL = """
 ## Intent & constraints
 
 <!-- Hand-written by people, or by the AI after review. Kept across re-ingests. What must not change, and why. -->
+
+References go through import_reference and stay out of the scene.
 
 ## Change log
 

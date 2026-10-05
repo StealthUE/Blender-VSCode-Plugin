@@ -21,6 +21,8 @@ Modelling (see vsblender.geo for solids and mesh builders):
     part("dhd", keys_per_ring=18)        a reusable builder from parts/dhd.py, recorded on the objects
     intent("...")                        NOTES.md's Intent & constraints (kept across re-ingests)
     is_main()                            True in the script run_script runs, False when imported
+    aim(camera, target)                  point an object's track axis at a target (up axis follows the view)
+    dial(current, target, min_travel=0)  signed travel in degrees; add it to the running angle
 """
 from __future__ import annotations
 
@@ -39,7 +41,7 @@ from . import snapshot
 __all__ = [
     "Cancelled", "progress", "cancelled", "sock", "node", "link", "build", "layout", "ramp", "fcurves",
     "fcurve", "resolve", "set_keys", "scale_keys", "bbox_world", "raycast_down", "view3d_override",
-    "mark_derived", "socket_path",
+    "mark_derived", "socket_path", "aim", "dial", "ref_section",
 ]
 
 
@@ -771,6 +773,63 @@ def is_main() -> bool:
     return sys._getframe(1).f_globals.get("__name__") == "__main__"
 
 
+# World axes tried as the "up" hint for to_track_quat, in the order a tie is broken.
+_UP_AXES = (("Z", Vector((0.0, 0.0, 1.0))), ("Y", Vector((0.0, 1.0, 0.0))), ("X", Vector((1.0, 0.0, 0.0))))
+
+
+def aim(ob, target, track: str = "-Z"):
+    """Point `track` (an object's local axis) at target and return the euler it landed on.
+
+    The up axis is the world axis least parallel to the view, so a camera that looks along
+    world Y still gets a finite rotation. to_track_quat(track, "Y") is degenerate in that case.
+    """
+    direction = Vector(target) - Vector(ob.location)
+    if direction.length < 1e-8:
+        return ob.rotation_euler.copy()
+    d = direction.normalized()
+    up = min(_UP_AXES, key=lambda item: abs(float(d.dot(item[1]))))[0]
+    ob.rotation_euler = direction.to_track_quat(track, up).to_euler()
+    return ob.rotation_euler.copy()
+
+
+def dial(current: float, target: float, clockwise: bool = True, min_travel: float = 0.0) -> float:
+    """Signed change in degrees from current to target.
+
+    Modulo is only used to pick the signed delta. Add the result to the running angle and store
+    that: the keys keep the unwrapped angle, so the object does not snap back a turn. When the
+    short delta is below min_travel, one full turn is added.
+    """
+    cur = float(current) % 360.0
+    tgt = float(target) % 360.0
+    if clockwise:
+        delta = (tgt - cur) % 360.0
+        if delta < float(min_travel):
+            delta += 360.0
+        return delta
+    delta = (cur - tgt) % 360.0
+    if delta < float(min_travel):
+        delta += 360.0
+    return -delta
+
+
+def ref_section(name, plane=None, ring=None, **kwargs):
+    """Section a registered reference (references.json) without putting it in the scene.
+
+    ring=True uses a geo.Ring frame (up +Y, front +Z). A dict is passed through as the ring frame.
+    """
+    from . import measure as measure_mod
+
+    params = {"op": "section", "ref": name}
+    if plane is not None:
+        params["plane"] = plane
+    if ring is True:
+        params["ring"] = {}
+    elif isinstance(ring, dict):
+        params["ring"] = ring
+    params.update(kwargs)
+    return measure_mod.measure(params, _root["path"])
+
+
 def spec(obj, **params) -> dict:
     """Record the parameters an object was built from (intent as data), e.g.
     spec(ring, glyphs=39, pitch_deg=9.231, track_r=(2.542, 2.845)). Shown by describe and in NOTES.md.
@@ -802,7 +861,7 @@ from .geom2d import svg_loops  # noqa: E402
 
 __all__ += [
     "warn", "printer", "modifier", "apply_modifiers", "spec", "units", "mm", "m", "to_mm", "units_label",
-    "clear_keys", "intent", "is_main", "part", "part_folders", "reference_roots",
+    "clear_keys", "intent", "is_main", "aim", "dial", "ref_section", "part", "part_folders", "reference_roots",
     "material", "ref_image", "place_on_ground", "place_on_bed", "center_on_origin", "center_on_bed", "set_origin",
     "orient_flat", "stats", "read_stl", "read_obj", "read_3mf", "read_mesh_file", "svg_loops", "geo",
 ]

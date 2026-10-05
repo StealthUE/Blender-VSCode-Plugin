@@ -420,6 +420,20 @@ def _mesh_checks(ob, report: _Report, purpose: str) -> None:
             report.add("materials", f"{sum(1 for s in slots if s.material is None)} empty material slot(s)")
         else:
             report.ok(f"{len(slots)} material(s)")
+            if len(slots) > 1 and len(me.polygons):
+                indices = np.empty(len(me.polygons), dtype=np.int32)
+                me.polygons.foreach_get("material_index", indices)
+                if int(indices.max()) == 0:
+                    report.add("materials", f"{len(slots)} slots, only slot 0 used")
+    if len(me.polygons):
+        sizes = np.empty(len(me.polygons), dtype=np.int32)
+        me.polygons.foreach_get("loop_total", sizes)
+        areas = np.empty(len(me.polygons), dtype=np.float64)
+        me.polygons.foreach_get("area", areas)
+        tris = int(np.maximum(sizes - 2, 0).sum())
+        area = float(areas.sum())
+        if area > 1e-12 and tris / area > 100_000:
+            report.add("density", f"{tris / area:,.0f} tris/m²", level="info")
     if _level("uvs", purpose):
         textured = any(s.material is not None and getattr(s.material, "node_tree", None) is not None and
                        any(n.bl_idname == "ShaderNodeTexImage" for n in s.material.node_tree.nodes) for s in slots)

@@ -24,7 +24,8 @@ Two layers:
 3. Rings (gates, dials, wheels, clock faces): geo.ring(up="+Y", front="+Z") works in clock angles,
    clockwise from the top as seen from the front: ring.pt, ring.theta (for lathe), ring.on (a prism
    mapping onto a surface), ring.band (a sector following a surface), ring.pattern (one segment,
-   mirrored and repeated).
+   mirrored and repeated), ring.svgs (SVG outlines at a radius), ring.chevron (a point, two wings,
+   a shallow V).
 
 Geometry for a child of a rotated root, or an object whose transform is keyed:
 to_object(name, parent=root, space="local"). After booleans: .clean() removes zero-area slivers; a
@@ -124,6 +125,20 @@ def segments_for(radius: float, tol: float | None = None, angle: float = 360.0, 
     n = per_full * abs(angle) / 360.0
     n = int(math.ceil(n / multiple) * multiple) if multiple > 1 else int(math.ceil(n))
     return max(min_seg if angle >= 360 else 2, min(max_seg, n))
+
+
+def _fillet_segments(span: float, radius: float, segments: int | None) -> int:
+    """Segments for a 90 degree round. An explicit count is used as given.
+
+    Otherwise the chord error is 2% of the larger of the solid's span and the radius, and the
+    count stays between 3 and 8. A 9 mm round on a small bead is a handful of segments, not the
+    hundreds segments_for would pick from the radius alone.
+    """
+    if segments is not None:
+        return max(1, int(segments))
+    radius = abs(float(radius))
+    tol = max(abs(float(span)), radius, 1e-9) * 0.02
+    return max(3, segments_for(radius or 1e-9, tol=tol, angle=90.0, min_seg=2, max_seg=8, multiple=1))
 
 
 # ----------------------------------------------------------------------------- low-level builders
@@ -394,6 +409,76 @@ class Ring:
         out = join(*copies)
         out.desc = f"{one.desc}.ring_pattern({count}{', mirror=' + repr(mirror) if mirror else ''}{', symmetric' if symmetric else ''})"
         return out
+
+    def svgs(self, bm, paths, radius: float, height: float, z0: float, z1: float, angles=None, mat: int = 0) -> list:
+        """Each SVG as a prism on the ring: scaled so its y span is `height`, centred in x, placed at radius.
+
+        svg_loops is called without size=, so the file's own y extent is the scale (the same placement
+        a script does by hand). angles is one clock angle per file; the default spaces them evenly.
+        z0 and z1 are the prism heights along the ring's front axis (world Z when front is +Z).
+        """
+        paths = [str(p) for p in paths]
+        if not paths:
+            return []
+        if angles is None:
+            step = 360.0 / len(paths)
+            angles = [step * i for i in range(len(paths))]
+        elif len(list(angles)) != len(paths):
+            raise ValueError("angles must have one entry per SVG")
+        faces = []
+        for path, angle in zip(paths, angles):
+            loops = geom2d.svg_loops(str(path))
+            spans = [float(np.ptp(loop[:, 0])) for loop in loops]
+            if len(loops) > 1:
+                widest = max(spans)
+                kept = [loop for loop, span in zip(loops, spans) if span < widest * 0.8]
+                loops = kept or loops
+            pts = np.vstack(loops)
+            lo, hi = pts.min(axis=0), pts.max(axis=0)
+            scale = float(height) / max(float(hi[1] - lo[1]), 1e-12)
+            centre = (lo + hi) / 2.0
+            placed = [np.column_stack([
+                (loop[:, 0] - centre[0]) * scale,
+                float(radius) + (loop[:, 1] - centre[1]) * scale,
+            ]) for loop in loops]
+            faces += prism(bm, placed, z0, z1, self.on(None, a=float(angle)), mat=mat)
+        return faces
+
+    def chevron(self, bm, angle: float, outer: float, inner: float, spread: float = 28.0, wing: float = 0.45,
+                notch: float = 0.15, z0: float = 0.0, z1: float = 0.02, count: int = 1, mat: int = 0) -> list:
+        """A chevron pointing inward: a triangle, two wings, and a shallow V in the outer edge.
+
+        outer and inner are radii. spread is the full angular width in degrees. wing is the fraction
+        of that width each wing occupies on the outer edge (the rest is the V). notch is how far the
+        V cuts back, as a fraction of the radial span. count repeats it every 360/count degrees.
+        """
+        outer, inner = float(outer), float(inner)
+        span = outer - inner
+        if span <= 0:
+            raise ValueError("outer radius must be greater than inner")
+        wing = min(0.95, max(0.05, float(wing)))
+        notch = min(0.95, max(0.0, float(notch)))
+        half = math.radians(float(spread)) / 2.0
+        shoulder = half * (1.0 - wing)
+        notch_r = outer - span * notch
+
+        def uv(ang: float, radius: float):
+            return (radius * ang, radius)
+
+        loop = [
+            uv(0.0, inner),
+            uv(-half, outer),
+            uv(-shoulder, outer),
+            uv(0.0, notch_r),
+            uv(shoulder, outer),
+            uv(half, outer),
+        ]
+        faces = []
+        n = max(1, int(count))
+        step = 360.0 / n
+        for i in range(n):
+            faces += prism(bm, [loop], z0, z1, self.on(None, a=float(angle) + step * i), mat=mat)
+        return faces
 
 
 def ring(up="+Y", front="+Z", center=(0.0, 0.0, 0.0), clockwise: bool = True) -> Ring:
@@ -961,14 +1046,28 @@ class Solid:
             bm.free()
         me = ob.data
         if materials is not None:
+            import array
+
             from . import looks
 
             mats = [m if isinstance(m, bpy.types.Material) else looks.ensure_material(str(m)) for m in materials]
             current = list(me.materials)
             if [m.name for m in current if m] != [m.name for m in mats]:
-                me.materials.clear()
+                # clear() resets every polygon material_index to 0. Keep the indices the solid
+                # already set, and skip clear() on a mesh that has no slots yet.
+                count = len(me.polygons)
+                saved = array.array("i", [0]) * count if count else None
+                if saved is not None:
+                    me.polygons.foreach_get("material_index", saved)
+                if current:
+                    me.materials.clear()
                 for m in mats:
                     me.materials.append(m)
+                if saved is not None and len(me.materials):
+                    limit = len(me.materials) - 1
+                    if any(i > limit for i in saved):
+                        saved = array.array("i", (i if i <= limit else limit for i in saved))
+                    me.polygons.foreach_set("material_index", saved)
         if smooth_deg is not None:
             smooth_by_angle(me, smooth_deg)
         else:
@@ -1347,7 +1446,11 @@ def box(x: float, y: float | None = None, z: float | None = None, fillet: float 
     s = Solid(bm, _call("box", x, y, z, fillet=fillet, chamfer=chamfer, edges=edges if (fillet or chamfer) and edges != "all" else None))
     if fillet or chamfer:
         width = float(fillet or chamfer)
-        segs = 1 if chamfer and not fillet else int(segments or max(3, segments_for(width, angle=90.0, min_seg=3, multiple=1)))
+        if chamfer and not fillet:
+            segs = 1
+        else:
+            span = max(abs(float(x)), abs(float(y)), abs(float(z)))
+            segs = _fillet_segments(span, width, segments)
         sel = _select_edges(s.bm, "sharp" if edges == "all" else edges, 30.0)
         bmesh.ops.bevel(s.bm, geom=sel, offset=width, offset_type="OFFSET", segments=segs, profile=0.5,
                         affect="EDGES", clamp_overlap=True)
@@ -1371,7 +1474,11 @@ def cylinder(d: float | None = None, h: float = 1.0, r: float | None = None, seg
     s = Solid(bm, _call("cylinder", d=d, r=r, h=h, chamfer=chamfer, fillet=fillet))
     if chamfer or fillet:
         width = float(fillet or chamfer)
-        segs = 1 if chamfer and not fillet else max(3, segments_for(width, angle=90.0, min_seg=3, multiple=1))
+        if chamfer and not fillet:
+            segs = 1
+        else:
+            span = max(abs(radius) * 2.0, abs(float(h)))
+            segs = _fillet_segments(span, width, None)
         sel = _select_edges(s.bm, "top+bottom", 30.0)
         bmesh.ops.bevel(s.bm, geom=sel, offset=width, offset_type="OFFSET", segments=segs, profile=0.5,
                         affect="EDGES", clamp_overlap=True)

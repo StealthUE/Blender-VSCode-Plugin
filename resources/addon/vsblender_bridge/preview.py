@@ -6,6 +6,7 @@ What a preview includes:
 - material and rendered shading copy the scene's colour management (view transform, look, exposure).
   rendered also copies the EEVEE and Cycles settings (volumetrics, shadows, samples cap).
 - The compositor (glare, bloom, lens effects) only with compositor=true, Blender 5 or newer.
+  The user's node group is copied and its Render Layers nodes are pointed at the preview scene.
 - Motion blur only with motion_blur=true. The background is never transparent.
 - Axis views (front, back, left, right, top, bottom) are orthographic by default, iso is perspective.
 - Without a target, the view frames the main subject: ground planes, skies and scattered series are
@@ -14,6 +15,8 @@ What a preview includes:
 - region frames a box or sphere; crop zooms into part of the framed image at full resolution.
 - overlay draws other objects or external mesh files (STL, OBJ, 3MF, SVG) over the image as wire,
   x-ray or silhouette, from a second pass. Hidden and wireframe-display objects work too.
+  An image or a video frame ({"image": "...png"} or {"video", "time"}) is drawn in the frame,
+  or returned as a render / plate / difference triptych with mode "diff".
 - material previews one material on a sphere and floor.
 
 Everything the preview creates is named _vsblender_* and removed again, also after a crash
@@ -23,9 +26,11 @@ from __future__ import annotations
 
 import math
 import os
+import subprocess
 import tempfile
 
 import bpy
+import numpy as np
 from mathutils import Matrix, Vector
 
 from . import sheet
@@ -171,7 +176,11 @@ def subject_bounds(objects):
 
 
 def _look_at(cam, location, target, view: str) -> None:
-    """A camera looks down its local -Z with local Y up. Top and bottom have no single up, so they are set."""
+    """A camera looks down its local -Z with local Y up. Top and bottom have no single up, so they are set.
+
+    Other views go through vsblender.aim, which picks an up axis that is not the view direction.
+    to_track_quat("-Z", "Y") is degenerate when the camera looks along world Y.
+    """
     cam.location = location
     if view == "top":
         cam.rotation_euler = (0.0, 0.0, 0.0)
@@ -179,10 +188,9 @@ def _look_at(cam, location, target, view: str) -> None:
     if view == "bottom":
         cam.rotation_euler = (math.pi, 0.0, 0.0)
         return
-    direction = Vector(target) - Vector(location)
-    if direction.length < 1e-8:
-        return
-    cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+    from . import helpers
+
+    helpers.aim(cam, target, track="-Z")
 
 
 def _collect(src, target_name):
@@ -289,7 +297,7 @@ class _Temps:
         self.items = []
 
 
-def _cleanup(scene, cam, cam_data, private) -> None:
+def _cleanup(scene, cam, cam_data, private, node_group=None) -> None:
     if private is not None:
         for obj in list(private.objects):
             try:
@@ -309,7 +317,18 @@ def _cleanup(scene, cam, cam_data, private) -> None:
             pass
     if scene is not None:
         try:
+            if node_group is not None and hasattr(scene, "compositing_node_group"):
+                scene.compositing_node_group = None
+        except Exception:
+            pass
+        try:
             bpy.data.scenes.remove(scene)
+        except Exception:
+            pass
+    if node_group is not None:
+        try:
+            if getattr(node_group, "users", 1) == 0:
+                bpy.data.node_groups.remove(node_group)
         except Exception:
             pass
     if private is not None:
@@ -318,6 +337,44 @@ def _cleanup(scene, cam, cam_data, private) -> None:
                 bpy.data.collections.remove(private)
         except Exception:
             pass
+
+
+_RLAYER_IDS = ("CompositorNodeRLayers", "CompositorNodeRenderLayers")
+
+
+def _bind_compositor(src, scene):
+    """Copy the user's compositor and point every Render Layers node at the preview scene.
+
+    The original group is left alone. With no Render Layers node the copy is discarded and the
+    preview renders without glare. Returns (copy or None, warning or None).
+    """
+    group = getattr(src, "compositing_node_group", None)
+    if not hasattr(scene, "compositing_node_group"):
+        return None, "compositor previews need Blender 5 or newer (scene.compositing_node_group)"
+    if group is None:
+        return None, "compositor=true, but this scene has no compositor node group"
+    copy = group.copy()
+    copy.name = "_vsblender_compositor"
+    rebound = 0
+    for node in getattr(copy, "nodes", []):
+        bl_id = getattr(node, "bl_idname", "") or ""
+        ntype = getattr(node, "type", "") or ""
+        if bl_id in _RLAYER_IDS or ntype == "R_LAYERS":
+            try:
+                node.scene = scene
+                rebound += 1
+            except Exception:
+                pass
+    if rebound == 0:
+        try:
+            if copy.users == 0:
+                bpy.data.node_groups.remove(copy)
+        except Exception:
+            pass
+        return None, "no Render Layers node; glare was not applied"
+    scene.compositing_node_group = copy
+    scene.render.use_compositing = True
+    return copy, None
 
 
 def purge_leftovers() -> None:
@@ -793,6 +850,301 @@ def _apply_overlays(out: str, entries: list, src, cam, cam_data, width: int, hei
     return notes
 
 
+def _fraction_box(value, what: str) -> list:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(f"{what} must be [x0, y0, x1, y1] as fractions of the image, (0, 0) top left")
+    box = [float(v) for v in value]
+    if max(box) - min(box) <= 0:
+        raise ValueError(f"{what} is empty")
+    return box
+
+
+def _plate_box(entry: dict, scene, cam) -> list:
+    """Where the plate sits: a 3D region projected through the camera, four corners, or a fraction box."""
+    if entry.get("region") is not None:
+        low, high = _region_box(entry["region"])
+        from bpy_extras.object_utils import world_to_camera_view
+
+        front = []
+        for x in (low.x, high.x):
+            for y in (low.y, high.y):
+                for z in (low.z, high.z):
+                    p = world_to_camera_view(scene, cam, Vector((x, y, z)))
+                    if p.z > 1e-5:
+                        front.append((float(p.x), 1.0 - float(p.y)))
+        if not front:
+            raise ValueError("the plate region is behind the camera")
+        xs = [p[0] for p in front]
+        ys = [p[1] for p in front]
+        return [min(xs), min(ys), max(xs), max(ys)]
+    corners = entry.get("corners")
+    if isinstance(corners, (list, tuple)) and len(corners) >= 4:
+        pts = []
+        for corner in corners[:4]:
+            if not isinstance(corner, (list, tuple)) or len(corner) < 2:
+                raise ValueError("plate corners are four [x, y] fractions, (0, 0) top left")
+            pts.append((float(corner[0]), float(corner[1])))
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        return [min(xs), min(ys), max(xs), max(ys)]
+    if entry.get("box") is not None:
+        return _fraction_box(entry["box"], "plate box")
+    return [0.0, 0.0, 1.0, 1.0]
+
+
+def _pixel_rect(box, width: int, height: int) -> tuple:
+    x0, y0, x1, y1 = box
+    c0 = int(round(max(0.0, min(x0, x1)) * width))
+    c1 = int(round(min(1.0, max(x0, x1)) * width))
+    r0 = int(round(max(0.0, min(y0, y1)) * height))
+    r1 = int(round(min(1.0, max(y0, y1)) * height))
+    if c1 - c0 < 2 or r1 - r0 < 2:
+        raise ValueError("the plate covers fewer than 2 pixels; check its box or region")
+    return r0, r1, c0, c1
+
+
+def _extract_frame(video: str, time_s: float, ffmpeg: str, dest: str) -> None:
+    cmd = [ffmpeg, "-y", "-loglevel", "error", "-ss", f"{float(time_s):.3f}", "-i", video, "-frames:v", "1", dest]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0 or not os.path.isfile(dest):
+        detail = (proc.stderr or "").strip()[-400:]
+        raise RuntimeError(f"ffmpeg could not read {video} at {float(time_s):.3f} s: {detail}")
+
+
+def _load_plate(entry: dict, root: str | None, params: dict) -> tuple:
+    """The plate image and a short label. A video frame is extracted with the ffmpeg path the tool passed."""
+    roots = entry.get("_roots") or params.get("reference_roots")
+    if entry.get("video"):
+        video = _resolve_file(str(entry["video"]), root, roots)
+        ffmpeg = params.get("ffmpeg")
+        if not isinstance(ffmpeg, str) or not os.path.isfile(ffmpeg):
+            raise RuntimeError("a video plate needs ffmpeg (install it, or set ffmpeg in .blender-ai/config.json)")
+        dest = os.path.join(tempfile.gettempdir(), f"_vsblender_plate_{os.getpid()}.png")
+        try:
+            _extract_frame(video, float(entry.get("time") or 0.0), ffmpeg, dest)
+            image = sheet.load(dest)
+        finally:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+        label = f"{os.path.basename(video)} @ {float(entry.get('time') or 0):.2f}s"
+        return image, label
+    image_path = _resolve_file(str(entry.get("image") or ""), root, roots)
+    return sheet.load(image_path), os.path.basename(image_path)
+
+
+def _paste_plate(base: np.ndarray, plate: np.ndarray, box, opacity: float) -> np.ndarray:
+    height, width = base.shape[:2]
+    r0, r1, c0, c1 = _pixel_rect(box, width, height)
+    resized = sheet.resize(plate, c1 - c0, r1 - r0)
+    out = base.copy()
+    alpha = np.clip(resized[..., 3], 0.0, 1.0) * float(opacity)
+    region = out[r0:r1, c0:c1]
+    a = alpha[..., None]
+    region[..., :3] = region[..., :3] * (1.0 - a) + resized[..., :3] * a
+    region[..., 3] = np.maximum(region[..., 3], alpha)
+    return out
+
+
+def _apply_plates(out: str, plates: list, scene, cam, root: str | None, params: dict) -> tuple:
+    """Draw plates into the frame. mode diff replaces the file with a render / plate / disagreement triptych.
+
+    Returns (notes, diff stats or None, new width, new height).
+    """
+    if not plates:
+        return [], None, None, None
+    render = sheet.load(out)
+    notes = []
+    diff_entry = None
+    for entry in plates:
+        mode = str(entry.get("mode") or "overlay")
+        if mode not in ("overlay", "diff"):
+            raise ValueError("plate mode must be overlay or diff")
+        if mode == "diff" and diff_entry is None:
+            diff_entry = entry
+            continue
+        plate, label = _load_plate(entry, root, params)
+        box = _plate_box(entry, scene, cam)
+        opacity = float(entry.get("opacity") if entry.get("opacity") is not None else 0.55)
+        render = _paste_plate(render, plate, box, opacity)
+        notes.append(f"plate {label}")
+    diff_stats = None
+    if diff_entry is not None:
+        original = sheet.load(out)
+        plate, label = _load_plate(diff_entry, root, params)
+        box = _plate_box(diff_entry, scene, cam)
+        placed = _paste_plate(np.zeros_like(original), plate, box, 1.0)
+        placed[..., 3] = 1.0
+        r0, r1, c0, c1 = _pixel_rect(box, original.shape[1], original.shape[0])
+        heat, diff_stats = sheet.heatmap(original[r0:r1, c0:c1], placed[r0:r1, c0:c1])
+        disagreement = np.zeros_like(original)
+        disagreement[..., 3] = 1.0
+        disagreement[r0:r1, c0:c1] = heat
+        sheet_img = sheet.compose([original, placed, disagreement], ["render", "plate", "disagreement"], columns=3)
+        sheet.save(out, sheet_img)
+        notes.append(f"diff {label}: {diff_stats['changed_percent']}% of the plate changed")
+        return notes, diff_stats, int(sheet_img.shape[1]), int(sheet_img.shape[0])
+    sheet.save(out, render)
+    return notes, None, None, None
+
+
+def _world_strength(scene) -> float | None:
+    world = scene.world
+    if world is None or not getattr(world, "node_tree", None):
+        return None
+    for node in world.node_tree.nodes:
+        if getattr(node, "type", "") == "BACKGROUND":
+            sock = node.inputs.get("Strength")
+            if sock is not None and not sock.is_linked:
+                return float(sock.default_value)
+    return None
+
+
+def _object_metallic(obj) -> float:
+    peak = 0.0
+    for slot in getattr(obj, "material_slots", []):
+        mat = slot.material
+        tree = getattr(mat, "node_tree", None) if mat else None
+        if tree is None:
+            continue
+        for node in tree.nodes:
+            if getattr(node, "type", "") != "BSDF_PRINCIPLED":
+                continue
+            sock = node.inputs.get("Metallic")
+            if sock is not None and not sock.is_linked:
+                peak = max(peak, float(sock.default_value))
+    return peak
+
+
+def _coverage(scene, cam, obj) -> dict:
+    """How much of the frame an object's bounds cover. y is top-left, matching the image."""
+    from bpy_extras.object_utils import world_to_camera_view
+
+    pts = []
+    behind = 0
+    try:
+        corners = obj.bound_box
+    except Exception:
+        return {"name": obj.name, "miss": True, "clipped": False, "coverage": 0.0}
+    for corner in corners:
+        p = world_to_camera_view(scene, cam, obj.matrix_world @ Vector(corner))
+        if p.z <= 1e-5:
+            behind += 1
+            continue
+        pts.append((float(p.x), 1.0 - float(p.y)))
+    if not pts:
+        return {"name": obj.name, "miss": True, "clipped": False, "coverage": 0.0}
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+    ix0, iy0, ix1, iy1 = max(0.0, x0), max(0.0, y0), min(1.0, x1), min(1.0, y1)
+    area = max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0)
+    clipped = behind > 0 or x0 < -0.001 or y0 < -0.001 or x1 > 1.001 or y1 > 1.001
+    return {"name": obj.name, "miss": area <= 0.0, "clipped": clipped and area > 0.0, "coverage": area}
+
+
+def _frame_read(path: str, scene, cam, cam_data, target_name, width: int, height: int) -> tuple:
+    """One-line read of the picture: content box, coverage, luminance, and objects that miss the frame.
+
+    Returns (lines, subject distance used for the span).
+    """
+    image = sheet.load(path)
+    rgb = image[..., :3]
+    side = min(8, rgb.shape[0], rgb.shape[1])
+    corners = np.concatenate([
+        rgb[:side, :side].reshape(-1, 3),
+        rgb[:side, -side:].reshape(-1, 3),
+        rgb[-side:, :side].reshape(-1, 3),
+        rgb[-side:, -side:].reshape(-1, 3),
+    ], axis=0)
+    background = np.median(corners, axis=0)
+    mask = np.linalg.norm(rgb - background, axis=2) > 0.04
+    coverage = float(mask.mean()) if mask.size else 0.0
+    luma = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+    mean = float(luma[mask].mean()) if mask.any() else float(luma.mean())
+    lines = []
+    if mask.any():
+        ys, xs = np.nonzero(mask)
+        h, w = rgb.shape[:2]
+        lines.append(
+            f"content {xs.min() / w:.2f}-{ (xs.max() + 1) / w:.2f} across, "
+            f"{ys.min() / h:.2f}-{(ys.max() + 1) / h:.2f} down, "
+            f"{coverage * 100:.1f}% of the frame, mean luminance {mean:.2f}")
+    else:
+        lines.append("the frame matches its corners; nothing reads as subject")
+    meshes = [obj for obj in scene.objects
+              if obj.type == "MESH" and not obj.hide_render and not obj.name.startswith("_vsblender")]
+    wanted = []
+    target = bpy.data.objects.get(target_name) if target_name else None
+    if target is not None:
+        wanted.append(target)
+    if len(meshes) <= 16:
+        wanted.extend(obj for obj in meshes if obj not in wanted)
+    metallic = 0.0
+    for obj in wanted:
+        item = _coverage(scene, cam, obj)
+        metallic = max(metallic, _object_metallic(obj))
+        if item["miss"]:
+            lines.append(f"{item['name']} is outside the frame")
+        elif item["clipped"] or item["coverage"] < 0.05:
+            lines.append(f"{item['name']}: {item['coverage'] * 100:.2f}% of the frame" + (", clipped" if item["clipped"] else ""))
+    if metallic >= 0.5 and mean < 0.08:
+        strength = _world_strength(scene)
+        extra = f"{strength:.2f}" if strength is not None else "unset"
+        lines.append(f"the metal is unlit (mean luminance {mean:.2f}); world Background Strength is {extra}")
+    subjects = [target] if target is not None else meshes[:16]
+    centres = []
+    for obj in subjects:
+        try:
+            centres.append(sum((obj.matrix_world @ Vector(corner) for corner in obj.bound_box), Vector()) / 8.0)
+        except Exception:
+            continue
+    distance = None
+    if centres:
+        centre = sum(centres, Vector()) / len(centres)
+        try:
+            local = cam.matrix_world.inverted_safe() @ centre
+            distance = abs(float(local.z)) or None
+        except Exception:
+            distance = None
+    return lines, distance
+
+
+def _span_at(cam_data, distance: float, aspect: float) -> tuple:
+    """Scene units across and down the frame at `distance` from the camera."""
+    if getattr(cam_data, "type", "PERSP") == "ORTHO":
+        scale = float(cam_data.ortho_scale)
+        if aspect >= 1.0:
+            return scale, scale / max(aspect, 1e-6)
+        return scale * aspect, scale
+    sensor_w = float(cam_data.sensor_width)
+    sensor_h = float(getattr(cam_data, "sensor_height", sensor_w * 24.0 / 36.0))
+    lens = max(float(cam_data.lens), 1e-6)
+    fit = str(getattr(cam_data, "sensor_fit", "AUTO"))
+    vertical = fit == "VERTICAL" or (fit == "AUTO" and aspect < 1.0)
+    if vertical:
+        span_h = distance * sensor_h / lens
+        return span_h * aspect, span_h
+    span_w = distance * sensor_w / lens
+    return span_w, span_w / max(aspect, 1e-6)
+
+
+def _camera_summary(name: str | None, cam, cam_data, distance: float | None, aspect: float, region_ignored: bool) -> str:
+    loc = cam.matrix_world.translation
+    lens = float(getattr(cam_data, "lens", 0.0))
+    who = name or "scene camera"
+    if distance is None or distance < 1e-8:
+        span = ""
+    else:
+        span_w, span_h = _span_at(cam_data, distance, aspect)
+        span = f", frame spans {span_w:.3f} x {span_h:.3f}"
+    text = f"camera {who} at ({loc.x:.3f}, {loc.y:.3f}, {loc.z:.3f}), lens {lens:.1f}{span}"
+    if region_ignored:
+        text += "; region is ignored for view camera; use crop to zoom"
+    return text
+
+
 # ----------------------------------------------------------------------------- render
 def _solid_detail(scene, params: dict) -> list:
     """Workbench settings that make relief and edges readable: cavity, outline, shadow, matcap, x-ray."""
@@ -866,7 +1218,18 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
         params = dict(params, aspect="square")
     crop = _parse_crop(params.get("crop"))
     region = _region_box(params["region"]) if params.get("region") else None
-    overlays = _overlay_entries(params, root)
+    raw_overlay = params.get("overlay")
+    plate_entries = []
+    geometry_entries = []
+    if isinstance(raw_overlay, dict):
+        raw_overlay = [raw_overlay]
+    if isinstance(raw_overlay, list):
+        for entry in raw_overlay:
+            if isinstance(entry, dict) and (entry.get("image") or entry.get("video")):
+                plate_entries.append(dict(entry))
+            else:
+                geometry_entries.append(entry)
+    overlays = _overlay_entries(dict(params, overlay=geometry_entries), root) if geometry_entries else []
     in_scene = [e for e in overlays if e["style"] in IN_SCENE_STYLES]
     overlays = [e for e in overlays if e["style"] not in IN_SCENE_STYLES]
     # ref: look at a registered reference itself, shaded, without importing it into the file.
@@ -892,7 +1255,8 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
     applied = []
     framing_note = ""
     temps = _Temps()
-    scene = cam = cam_data = private = None
+    scene = cam = cam_data = private = comp_group = None
+    region_ignored = False
     fixed_box = None
     explicit = objects is not None
     ref_view = bool(ref_entries)
@@ -951,7 +1315,7 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
             cam.matrix_world = src_cam.matrix_world.copy()
             projection = "ortho" if cam_data.type == "ORTHO" else "persp"
             if region is not None:
-                warnings.append("region is ignored for view camera; use crop to zoom")
+                region_ignored = True
         else:
             if view == "camera":
                 view = "iso"
@@ -1051,16 +1415,11 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
             current = int(getattr(getattr(src, "cycles", None), "samples", 32) or 32)
             cycles.samples = max(1, int(samples)) if samples else min(current, 32)
         if params.get("compositor"):
-            group = getattr(src, "compositing_node_group", None)
-            if hasattr(scene, "compositing_node_group"):
-                if group is not None:
-                    scene.compositing_node_group = group
-                    scene.render.use_compositing = True
-                    applied.append("compositor")
-                else:
-                    warnings.append("compositor=true, but this scene has no compositor node group")
-            else:
-                warnings.append("compositor previews need Blender 5 or newer (scene.compositing_node_group)")
+            comp_group, comp_note = _bind_compositor(src, scene)
+            if comp_note:
+                warnings.append(comp_note)
+            elif comp_group is not None:
+                applied.append("compositor")
         else:
             scene.render.use_compositing = False
         if params.get("motion_blur"):
@@ -1095,6 +1454,18 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
             sheet.save(scene.render.filepath, sheet.crop_pixels(sheet.load(scene.render.filepath), pixel_crop))
             width = round(width * (pixel_crop[2] - pixel_crop[0]))
             height = round(height * (pixel_crop[3] - pixel_crop[1]))
+        try:
+            read, distance = _frame_read(scene.render.filepath, scene, cam, cam_data, target_name, width, height)
+        except Exception:
+            read, distance = [], None
+        camera_aspect = width / max(1, height)
+        plate_notes, diff_stats, plate_w, plate_h = _apply_plates(
+            scene.render.filepath, plate_entries, scene, cam, root, params)
+        if plate_notes:
+            applied.append("plate")
+            overlay_notes.extend(plate_notes)
+        if plate_w:
+            width, height = plate_w, plate_h
         result = {
             "file": scene.render.filepath,
             "view": view,
@@ -1117,9 +1488,17 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
             result["reference"] = [_overlay_label(e) for e in ref_entries]
         if camera_name:
             result["camera"] = camera_name
+        if read:
+            result["read"] = read
+        if view == "camera" and cam is not None and cam_data is not None:
+            result["summary"] = _camera_summary(camera_name, cam, cam_data, distance, camera_aspect, region_ignored)
+            result["location"] = [round(float(v), 4) for v in cam.matrix_world.translation]
+            result["lens"] = round(float(cam_data.lens), 3)
+        if diff_stats:
+            result["difference"] = diff_stats
         return result, warnings
     finally:
-        _cleanup(scene, cam, cam_data, private)
+        _cleanup(scene, cam, cam_data, private, comp_group)
         temps.clear()
         # Objects are shared with the preview scene, so evaluating another frame there wrote animated
         # values onto them. Re-evaluate the user's frame to put them back.

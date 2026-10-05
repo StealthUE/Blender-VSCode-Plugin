@@ -21,6 +21,7 @@ and reports the differences. Results are in scene units, with the unit label.
 from __future__ import annotations
 
 import fnmatch
+import json
 import math
 import os
 
@@ -873,10 +874,23 @@ def measure(params: dict, root: str) -> dict:
         diff = _differences(op, result, second, label, other_label)
         result["text"] += f"\n{other_label}: {second['text']}" + (f"\n{diff}" if diff else "")
         result["compare_to"] = {k: v for k, v in second.items() if k not in ("segments", "grid", "edges")}
-    if params.get("image") and params.get("out") and op in ("section", "profile"):
+    out_path = params.get("out")
+    if op == "section" and isinstance(out_path, str) and out_path.lower().endswith(".json"):
+        target = os.path.abspath(out_path if os.path.isabs(out_path) else os.path.join(root, out_path))
+        root_abs = os.path.normcase(os.path.abspath(root))
+        target_abs = os.path.normcase(target)
+        if target_abs != root_abs and not target_abs.startswith(root_abs + os.sep):
+            raise ValueError(f"out must be inside the workspace: {out_path}")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        payload = {"loops": result.get("points") or [], "plane": result.get("plane"), "units": result.get("units")}
+        with open(target, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle)
+        result["file"] = target
+        result["text"] += f"\nwrote {os.path.basename(target)}"
+    elif params.get("image") and out_path and op in ("section", "profile"):
         sets = [result] + ([second] if second else [])
         names = [label] + ([second["source"]] if second else [])
-        result["file"] = _draw(sets, names, params["out"], op)
+        result["file"] = _draw(sets, names, out_path, op)
     for key in ("segments", "grid", "edges"):
         result.pop(key, None)
     if warnings:

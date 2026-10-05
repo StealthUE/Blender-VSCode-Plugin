@@ -7,7 +7,9 @@ socket thread, so they work while a script runs.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -33,14 +35,14 @@ from . import units as units_mod
 bl_info = {
     "name": "VSBlender Bridge",
     "author": "Massive Dynamic Engineering",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     "blender": (3, 2, 0),
     "location": "View3D > Sidebar > VSBlender",
     "description": "Local bridge for the VSBlender VS Code extension",
     "category": "Development",
 }
 
-ADDON_VERSION = "0.4.0"
+ADDON_VERSION = "0.5.0"
 # Answered on the socket thread. Everything else runs on Blender's main thread.
 _NO_MAIN_THREAD = {"ping", "cancel"}
 # How long a connection waits for the main thread. The caller's own timeout is usually shorter.
@@ -144,6 +146,59 @@ def _devices(scene) -> dict:
     return out
 
 
+_AUTOSAVE = re.compile(r"^(?P<stem>.+)_\d+_autosave\.blend$", re.IGNORECASE)
+_WALK_SKIP = {".git", "node_modules", "out", ".blender-ai"}
+
+
+def _find_blend_stem(root: str, stem: str) -> str | None:
+    """The one workspace .blend whose name (without extension) is stem. Autosaves and quit.blend are skipped."""
+    if not root or not os.path.isdir(root) or not stem:
+        return None
+    want = stem.lower()
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in _WALK_SKIP and not name.startswith(".")]
+        for name in filenames:
+            lower = name.lower()
+            if not lower.endswith(".blend") or lower == "quit.blend" or _AUTOSAVE.match(name):
+                continue
+            if os.path.splitext(name)[0].lower() == want:
+                found.append(os.path.join(dirpath, name))
+                if len(found) > 1:
+                    return None
+    return found[0] if found else None
+
+
+def _autosave_note(root: str) -> dict | None:
+    """Recognise a Blender autosave or quit.blend, and the project file the stem matches."""
+    current = bpy.data.filepath
+    if not current:
+        return None
+    name = os.path.basename(current)
+    stem = None
+    if name.lower() == "quit.blend":
+        kind = "quit"
+    else:
+        match = _AUTOSAVE.match(name)
+        if not match:
+            return None
+        kind = "autosave"
+        stem = match.group("stem")
+    project = _find_blend_stem(root, stem) if stem else None
+    note = {"kind": kind, "file": current}
+    if project:
+        rel = history.rel(root, project)
+        note["project"] = project
+        note["text"] = f"this is an autosave of {rel}. Save with path set to {rel} and overwrite: true."
+    elif kind == "quit":
+        note["text"] = ("this file is quit.blend. Save with path set to the project .blend inside the workspace "
+                        "and overwrite: true.")
+    else:
+        note["text"] = ("this file is a Blender autosave. Save with path set to the project .blend inside the workspace "
+                        "and overwrite: true.")
+    return note
+
+
 def session_info() -> dict:
     scene = _scene()
     root = workspace_root()
@@ -195,6 +250,12 @@ def session_info() -> dict:
         info["checkpoints"] = [{k: e.get(k) for k in ("id", "label", "time", "auto")} for e in recent]
     except Exception:
         info["checkpoints"] = []
+    try:
+        recovery = _autosave_note(root)
+        if recovery:
+            info["recovery"] = recovery
+    except Exception:
+        pass
     return info
 
 
@@ -213,6 +274,29 @@ def open_file(params: dict) -> dict:
         return {"opened": False, "reason": "unsaved changes", "file": bpy.data.filepath}
     bpy.ops.wm.open_mainfile(filepath=target)
     return {"opened": True, "file": bpy.data.filepath, "dirty": bool(bpy.data.is_dirty)}
+
+
+def open_blend(params: dict) -> dict:
+    """Open a workspace .blend. Same refusal as open_file when the session has unsaved edits, and a journal line."""
+    root = workspace_root()
+    raw = params.get("path") or params.get("file")
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("path is required")
+    target = os.path.abspath(raw if os.path.isabs(raw) else os.path.join(root, raw))
+    if not _under(target, root):
+        raise ValueError(f"path must be inside the workspace: {raw}")
+    if not target.lower().endswith(".blend"):
+        raise ValueError("path must end in .blend")
+    result = open_file({"path": target})
+    if result.get("opened") and not result.get("already"):
+        try:
+            history.journal(root, {
+                "time": history.now_iso(), "event": "open", "actor": str(params.get("actor") or "ai"),
+                "file": history.rel(root, target), "reason": str(params.get("reason") or "").strip() or None,
+            })
+        except Exception:
+            pass
+    return result
 
 
 # ----------------------------------------------------------------------------- run_script
@@ -303,8 +387,10 @@ def script_directives(source: str) -> dict:
     read-only            no checkpoint; warn if the script changed anything anyway
     atomic off           keep partial changes when the script fails (default: roll back)
     rerun-after a, b     this script repairs what scripts a and b reset (pipeline hint)
+    reads A, B           names this script takes from an earlier script (stale warnings name these)
+    exports A, B         names this script publishes; hashed onto the journal after a run
     """
-    out = {"read_only": False, "atomic": None, "rerun_after": []}
+    out = {"read_only": False, "atomic": None, "rerun_after": [], "reads": [], "exports": []}
     for line in source.splitlines()[:40]:
         match = _DIRECTIVE.match(line)
         if not match:
@@ -321,6 +407,93 @@ def script_directives(source: str) -> dict:
                 out["atomic"] = value.lower() not in ("off", "false", "no", "0")
             elif key == "rerun-after":
                 out["rerun_after"] += [v for v in re.split(r"[,\s]+", value) if v]
+            elif key == "reads":
+                out["reads"] += [v for v in re.split(r"[,\s]+", value) if v]
+            elif key == "exports":
+                out["exports"] += [v for v in re.split(r"[,\s]+", value) if v]
+    return out
+
+
+def _is_main_call(node) -> bool:
+    return isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "main"
+
+
+class _CaptureMain(ast.NodeTransformer):
+    """Turn a discarded module-level main() into a result, without entering functions or classes."""
+
+    def __init__(self):
+        self.called = False
+        self.rewritten = 0
+
+    def visit_FunctionDef(self, node):
+        return node
+
+    def visit_AsyncFunctionDef(self, node):
+        return node
+
+    def visit_ClassDef(self, node):
+        return node
+
+    def visit_Call(self, node):
+        if _is_main_call(node):
+            self.called = True
+        return self.generic_visit(node)
+
+    def visit_Expr(self, node):
+        if not _is_main_call(node.value):
+            return self.generic_visit(node)
+        self.called = True
+        self.rewritten += 1
+        # A None return must not wipe a result the function stored with `global result`.
+        returned = "_vsb_returned"
+        assign = ast.Assign(targets=[ast.Name(id=returned, ctx=ast.Store())], value=node.value)
+        test = ast.Compare(left=ast.Name(id=returned, ctx=ast.Load()), ops=[ast.IsNot()],
+                           comparators=[ast.Constant(value=None)])
+        store = ast.Assign(targets=[ast.Name(id="result", ctx=ast.Store())],
+                           value=ast.Name(id=returned, ctx=ast.Load()))
+        return [assign, ast.If(test=test, body=[store], orelse=[])]
+
+
+def _capture_main_return(source: str) -> tuple:
+    """Rewrite discarded module-level main() calls. The sha stays on the original source.
+
+    Returns (source to compile, info). info.defines is a module-level def main. info.called is any
+    main() outside a function or class, including under `if __name__` and `if vsblender.is_main()`.
+    """
+    info = {"defines": False, "called": False, "rewritten": False}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source, info
+    info["defines"] = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "main"
+                          for node in tree.body)
+    rewriter = _CaptureMain()
+    tree = rewriter.visit(tree)
+    info["called"] = rewriter.called
+    if not rewriter.rewritten:
+        return source, info
+    ast.fix_missing_locations(tree)
+    try:
+        return ast.unparse(tree), {**info, "rewritten": True}
+    except Exception:
+        return source, info
+
+
+def _namespace_hashes(namespace: dict, names: list) -> dict:
+    """sha256[:16] of each exported name. Functions hash their source; other values hash canonical JSON."""
+    out = {}
+    for name in names:
+        if name not in namespace:
+            continue
+        value = namespace[name]
+        try:
+            if callable(value):
+                text = inspect.getsource(value)
+            else:
+                text = json.dumps(value, sort_keys=True, default=str)
+        except Exception:
+            text = repr(value)
+        out[name] = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     return out
 
 
@@ -413,14 +586,24 @@ def _resolve_script(raw, root: str) -> str:
     return script
 
 
-def _load_script(script: str):
+def _load_script(script: str, function=None):
+    """Original source (for the sha) and code to exec. A discarded main() is rewritten after the sha."""
     with open(script, encoding="utf-8") as handle:
-        source = handle.read()
+        original = handle.read()
+    source, main_info = (original, {"defines": False, "called": False, "rewritten": False}) if function \
+        else _capture_main_return(original)
     try:
         code = compile(source, script, "exec")
     except SyntaxError as exc:
-        raise RuntimeError(f"{exc.filename}:{exc.lineno}: {exc.msg}") from exc
-    return source, code
+        if source is not original:
+            try:
+                code = compile(original, script, "exec")
+                main_info = {"defines": False, "called": False, "rewritten": False}
+            except SyntaxError:
+                raise RuntimeError(f"{exc.filename}:{exc.lineno}: {exc.msg}") from exc
+        else:
+            raise RuntimeError(f"{exc.filename}:{exc.lineno}: {exc.msg}") from exc
+    return original, code, main_info
 
 
 class _Run:
@@ -434,10 +617,12 @@ class _Run:
         self.stderr = ""
         self.warnings: list = []
         self.updates: dict = {}
+        self.exports: dict = {}
+        self.local_return = False
 
 
 def _execute(script: str, code, root: str, lib_paths: list, rel_script: str, function=None, args=None,
-             context: dict | None = None) -> _Run:
+             context: dict | None = None, main_info: dict | None = None) -> _Run:
     """Run compiled code in a fresh namespace with the workspace import folders, capturing output,
     warnings, depsgraph geometry updates and the failure (traceback from the user's file)."""
     run = _Run()
@@ -473,7 +658,20 @@ def _execute(script: str, code, root: str, lib_paths: list, rel_script: str, fun
                                 raise RuntimeError(f"{function} is not defined in {script}")
                             run.value = fn(**(args or {}))
                         else:
+                            info = main_info or {}
+                            # Call main once only when the file never called it. A second call would
+                            # rebuild the scene the script just built.
+                            if info.get("defines") and not info.get("called") and "result" not in namespace \
+                                    and callable(namespace.get("main")):
+                                returned = namespace["main"]()
+                                if returned is not None:
+                                    namespace["result"] = returned
                             run.value = namespace.get("result")
+                            if info.get("defines") and info.get("called") and "result" not in namespace:
+                                run.local_return = True
+                        exports = (context or {}).get("exports") or []
+                        if exports:
+                            run.exports = _namespace_hashes(namespace, exports)
                     except helpers.Cancelled as exc:
                         run.cancelled = True
                         run.failure = f"Cancelled at {rel_script}: {exc}."
@@ -492,6 +690,8 @@ def _execute(script: str, code, root: str, lib_paths: list, rel_script: str, fun
                 sys.path.remove(folder)
             except ValueError:
                 pass
+    if run.local_return:
+        run.warnings.append("main() ran but its return stayed local. Use global result, or return the value from main().")
     run.stdout = stdout.getvalue()
     run.stderr = stderr.getvalue()
     if len(run.stdout) > 200000:
@@ -528,7 +728,7 @@ def run_script(params: dict):
     reason = str(params.get("reason") or "").strip()
     cp_opts = params.get("checkpoint") if isinstance(params.get("checkpoint"), dict) else {}
     lib_paths = params.get("lib_paths") or ["scripts/lib"]
-    source, code = _load_script(script)
+    source, code, main_info = _load_script(script, function)
     rel_script = history.rel(root, script)
     script_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
     directives = script_directives(source)
@@ -539,6 +739,7 @@ def run_script(params: dict):
 
     started = time.time()
     anim_before = animated_ids()
+    saved_frame = bpy.context.scene.frame_current if bpy.context.scene else None
     before = snapshot.take()
     checkpoint_entry = None
     if cp_opts.get("auto", True) and not read_only:
@@ -550,9 +751,18 @@ def run_script(params: dict):
         except Exception as exc:
             checkpoint_entry = {"skipped": f"checkpoint failed: {exc}"}
     context = {"printer": params.get("printer") if isinstance(params.get("printer"), dict) else None,
-               "script": rel_script, "reference_roots": params.get("reference_roots") or []}
-    run = _execute(script, code, root, lib_paths, rel_script, function, args, context)
-    report = snapshot.diff(before, snapshot.take(), run.updates)
+               "script": rel_script, "reference_roots": params.get("reference_roots") or [],
+               "exports": directives["exports"]}
+    run = _execute(script, code, root, lib_paths, rel_script, function, args, context, main_info)
+    if read_only and saved_frame is not None and bpy.context.scene is not None:
+        try:
+            bpy.context.scene.frame_set(int(saved_frame))
+        except Exception:
+            pass
+    # A read-only frame_set evaluates materials and visibility. Restoring the frame before the
+    # snapshot, and ignoring the depsgraph, keeps that evaluation out of the journal. A real edit
+    # still differs in the datablocks.
+    report = snapshot.diff(before, snapshot.take(), None if read_only else run.updates)
     lost = _lost_animation(report, anim_before, animated_ids())
     if lost:
         report["lost_animation"] = lost
@@ -570,6 +780,12 @@ def run_script(params: dict):
     stamped = []
     if changed and not run.failure and params.get("provenance", True) is not False:
         stamped = _stamp_provenance(report, rel_script, script_sha, reason)
+    stale, why = [], []
+    if changed:
+        try:
+            stale, why = stale_after(script, root, directives["exports"], run.exports)
+        except Exception:
+            stale, why = [], []
     if changed:
         if not rolled_back:
             _undo_push(f"VSBlender: {os.path.basename(script)}")
@@ -581,7 +797,10 @@ def run_script(params: dict):
             "error": run.failure.splitlines()[-1] if run.failure else None,
             "changes": report, "changed": changed, "ms": ms, "checkpoint": cp_id,
             "blend": history.rel(root, bpy.data.filepath) if bpy.data.filepath else None,
+            "unsaved_runs": history.unsaved().get("runs"),
         }
+        if run.exports:
+            entry["exports"] = run.exports
         if rolled_back:
             entry["rolled_back"] = rolled_back
         result_text = json.dumps(entry["result"], ensure_ascii=False, default=str)
@@ -633,17 +852,16 @@ def run_script(params: dict):
         out["provenance"] = f"{len(stamped)} object(s) stamped with this script (ai_built_by / ai_modified_by)"
     if directives["rerun_after"]:
         out["rerun_after"] = directives["rerun_after"]
-    if changed:
-        try:
-            stale = out_of_date(script, root)
-        except Exception:
-            stale = []
-        if stale:
-            ran = _ran_scripts(root)
-            out["out_of_date"] = [s for s in stale if s in ran]
-            never = [s for s in stale if s not in ran]
-            if never:
-                out["not_run_yet"] = never
+    if stale:
+        ran = _ran_scripts(root)
+        out["out_of_date"] = [s for s in stale if s in ran]
+        never = [s for s in stale if s not in ran]
+        if never:
+            out["not_run_yet"] = never
+        shown = set(out["out_of_date"]) | set(never)
+        detailed = [item for item in why if item.get("script") in shown]
+        if detailed:
+            out["out_of_date_why"] = detailed
     if params.get("save") and (changed or history.has_unsaved_edits()):
         out["saved"] = save_file({"reason": reason or f"after {rel_script}", "actor": params.get("actor") or "ai",
                                   "allow_references": bool(params.get("allow_references"))})
@@ -785,6 +1003,69 @@ def out_of_date(script: str, root: str) -> list:
     return seen
 
 
+def _header_reads(folder: str, stem: str) -> list:
+    path = os.path.join(folder, stem + ".py")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            head = "".join(handle.readline() for _ in range(40))
+    except OSError:
+        return []
+    return script_directives(head)["reads"]
+
+
+def _previous_exports(root: str, rel_script: str) -> dict | None:
+    """The newest export hashes this script wrote. Called before the current run is journaled."""
+    path = os.path.join(history.sidecar_dir(root), "journal.jsonl")
+    found = None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("event") == "script" and entry.get("script") == rel_script and isinstance(entry.get("exports"), dict):
+                    found = entry["exports"]
+    except OSError:
+        return None
+    return found
+
+
+def stale_after(script: str, root: str, declared: list, exports: dict) -> tuple:
+    """Dependents to re-run, and why.
+
+    No `reads` line, or a producer with no `exports`, keeps the whole-script warning. When both
+    name values, a dependent is listed only if a name it reads changed, and the reply names those.
+    """
+    stems = out_of_date(script, root)
+    if not stems:
+        return [], []
+    folder = os.path.dirname(script)
+    previous = _previous_exports(root, history.rel(root, script)) if declared else None
+    kept, why = [], []
+    for stem in stems:
+        reads = _header_reads(folder, stem)
+        if not reads or not declared:
+            kept.append(stem)
+            why.append({"script": stem})
+            continue
+        changed_names = []
+        uncovered = False
+        for name in reads:
+            if name not in (exports or {}):
+                uncovered = True
+                continue
+            if previous is None or previous.get(name) != exports.get(name):
+                changed_names.append(name)
+        if changed_names:
+            kept.append(stem)
+            why.append({"script": stem, "names": changed_names})
+        elif uncovered:
+            kept.append(stem)
+            why.append({"script": stem})
+    return kept, why
+
+
 def run_pipeline(params: dict):
     """Run pipeline steps as one transaction: one checkpoint, one undo step, rolled back on failure."""
     root = workspace_root()
@@ -839,6 +1120,7 @@ def run_pipeline(params: dict):
     cp_id = checkpoint_entry.get("id") if isinstance(checkpoint_entry, dict) else None
     printer = params.get("printer") if isinstance(params.get("printer"), dict) else None
     ran = []
+    recorded = []
     warnings = []
     failure = ""
     failed_step = None
@@ -847,10 +1129,13 @@ def run_pipeline(params: dict):
     for index, name in enumerate(plan):
         script = os.path.join(pipe["folder"], name + ".py")
         rel_script = history.rel(root, script)
-        source, code = _load_script(script)
+        source, code, main_info = _load_script(script)
         sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        recorded.append({"script": rel_script, "script_sha256": sha, "reason": reason or None})
+        directives = script_directives(source)
         run = _execute(script, code, root, lib_paths, f"{rel_pipe} step {index + 1}/{len(plan)}: {name}", None, None,
-                       {"printer": printer, "script": rel_script, "reference_roots": params.get("reference_roots") or []})
+                       {"printer": printer, "script": rel_script, "reference_roots": params.get("reference_roots") or [],
+                        "exports": directives["exports"]}, main_info)
         for attr, names in run.updates.items():
             updates.setdefault(attr, {}).update(names)
         step_after = snapshot.take()
@@ -888,9 +1173,11 @@ def run_pipeline(params: dict):
             _undo_push(f"VSBlender: {os.path.basename(pipe['folder'])} pipeline {plan[0]}..{plan[-1]}")
         history.mark_edited(run=not rolled_back)
         journal_entry = {"time": history.now_iso(), "event": "pipeline", "actor": str(params.get("actor") or "ai"),
-                         "pipeline": rel_pipe, "steps": [r["step"] for r in ran], "reason": reason or None,
+                         "pipeline": rel_pipe, "steps": [r["step"] for r in ran], "scripts": recorded,
+                         "reason": reason or None,
                          "ok": not failure, "changes": report, "changed": changed, "checkpoint": cp_id,
-                         "ms": int((time.time() - started) * 1000)}
+                         "ms": int((time.time() - started) * 1000),
+                         "unsaved_runs": history.unsaved().get("runs")}
         if rolled_back:
             journal_entry["rolled_back"] = rolled_back
         try:
@@ -1093,6 +1380,12 @@ def save_file(params: dict) -> dict:
             raise FileExistsError(f"{history.rel(root, target)} exists: pass overwrite: true to replace it, or another path")
     elif not current:
         raise ValueError("the session has never been saved: pass path (a workspace .blend)")
+    elif not _under(os.path.abspath(current), root):
+        recovery = _autosave_note(root) or {}
+        project = recovery.get("project")
+        where = history.rel(root, project) if project else "the project .blend inside the workspace"
+        raise ValueError("refusing to save: the open file is outside the workspace. "
+                         f"Save with path set to {where} and overwrite: true.")
     refs = marks.reference_objects()
     if refs and not params.get("allow_references"):
         raise ValueError(f"not saved: {len(refs)} reference object(s) are in the scene ({', '.join(refs[:6])}"
@@ -1208,6 +1501,117 @@ def write_role_property(params: dict):
     return {"object": ob.name, "property": "ai_role"}, [], snapshot.flat(report)
 
 
+def _replay_scripts(entry: dict) -> list:
+    """Script runs one journal entry records, in the order they ran. Failed and rolled-back runs are left out."""
+    if entry.get("rolled_back") or entry.get("ok") is False:
+        return []
+    event = entry.get("event")
+    if event == "script" and isinstance(entry.get("script"), str):
+        return [{"script": entry["script"], "script_sha256": entry.get("script_sha256"), "reason": entry.get("reason")}]
+    if event == "pipeline":
+        scripts = entry.get("scripts")
+        if isinstance(scripts, list):
+            return [item for item in scripts if isinstance(item, dict) and isinstance(item.get("script"), str)]
+        steps = entry.get("steps")
+        pipe = entry.get("pipeline")
+        if isinstance(steps, list) and isinstance(pipe, str):
+            folder = os.path.dirname(pipe.replace("\\", "/"))
+            return [{"script": f"{folder}/{step}.py" if folder else f"{step}.py",
+                     "script_sha256": None, "reason": entry.get("reason")}
+                    for step in steps if isinstance(step, str)]
+    return []
+
+
+def _script_on_disk(root: str, rel_script: str) -> str:
+    raw = str(rel_script).replace("/", os.sep)
+    if os.path.isabs(raw):
+        return os.path.abspath(raw)
+    return os.path.abspath(os.path.join(root, raw))
+
+
+def replay(params: dict) -> dict:
+    """Journaled script runs since the last save. Lists them unless run is true.
+
+    A sha that no longer matches the file on disk is named and skipped, unless force.
+    run executes through run_script, which journals the new runs.
+    """
+    root = workspace_root()
+    journal_path = os.path.join(history.sidecar_dir(root), "journal.jsonl")
+    if not os.path.isfile(journal_path):
+        return {"runs": [], "skipped": [], "text": "no journal for this file"}
+    entries = []
+    with open(journal_path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    since = []
+    for entry in reversed(entries):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("event") == "save":
+            break
+        since.append(entry)
+    since.reverse()
+    pending = []
+    for entry in since:
+        pending.extend(_replay_scripts(entry))
+    ready = []
+    skipped = []
+    force = bool(params.get("force"))
+    for item in pending:
+        rel_script = item["script"]
+        recorded = item.get("script_sha256")
+        row = {"script": rel_script, "sha": recorded, "reason": item.get("reason")}
+        path = _script_on_disk(root, rel_script)
+        if not _under(path, root) or not os.path.isfile(path):
+            row["skipped"] = "missing"
+            skipped.append(row)
+            continue
+        with open(path, encoding="utf-8") as handle:
+            current = hashlib.sha256(handle.read().encode("utf-8")).hexdigest()
+        row["sha_now"] = current
+        if recorded and current != recorded and not force:
+            row["skipped"] = "sha mismatch"
+            skipped.append(row)
+            continue
+        if recorded and current != recorded:
+            row["sha_mismatch"] = True
+        ready.append({**row, "path": path})
+    lines = []
+    if not ready and not skipped:
+        lines.append("no script runs since the last save")
+    for row in ready:
+        why = row.get("reason") or "no reason"
+        note = " (sha changed, force)" if row.get("sha_mismatch") else ""
+        lines.append(f"{row['script']} ({why}){note}")
+    for row in skipped:
+        lines.append(f"skipped {row['script']}: {row['skipped']}")
+    if params.get("run") is not True:
+        public = [{k: v for k, v in row.items() if k != "path"} for row in ready]
+        return {"runs": public, "skipped": skipped, "text": "\n".join(lines)}
+    executed = []
+    for row in ready:
+        try:
+            result, warnings, changed = run_script({
+                "path": row["path"],
+                "reason": row.get("reason") or "replay",
+                "actor": str(params.get("actor") or "ai"),
+            })
+            executed.append({"script": row["script"], "ok": True, "result": result.get("result"),
+                             "changed": changed, "warnings": warnings})
+            lines.append(f"ran {row['script']}")
+        except ScriptError as exc:
+            executed.append({"script": row["script"], "ok": False, "error": str(exc)})
+            lines.append(f"stopped at {row['script']}: {str(exc).splitlines()[-1]}")
+            return {"ran": executed, "skipped": skipped, "stopped": row["script"], "text": "\n".join(lines)}
+    return {"ran": executed, "skipped": skipped, "text": "\n".join(lines)}
+
+
 # ----------------------------------------------------------------------------- dispatch
 def _with_text(result) -> dict:
     return result if isinstance(result, dict) else {"value": result}
@@ -1234,6 +1638,10 @@ def dispatch(req: dict) -> dict:
             result = session_info()
         elif method == "open_file":
             result = open_file(params)
+        elif method == "open_blend":
+            result = open_blend(params)
+        elif method == "replay":
+            result = replay(params)
         elif method == "run_script":
             result, warnings, changed = run_script(params)
         elif method == "preview":
