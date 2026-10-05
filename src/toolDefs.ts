@@ -16,12 +16,14 @@ const obj = (properties: Record<string, unknown>, required: string[] = []): Reco
 });
 
 const blendPath = { type: "string", description: "Workspace .blend to read when Blender is not running (then the saved file is used, in a background Blender). Optional when only one exists." };
-const targets = { description: "Objects: a name, a list of names, or a find selector (\"type:MESH and children_of:Lamp\"). Default: the visible mesh, curve and text objects, without references (vsblender_reference) and boolean cutters." };
+const targets = { description: "Objects: a name, a list of names, or a find selector (\"type:MESH and children_of:Lamp\"). Default: the visible mesh, curve and text objects, without references (vsblender_reference), staging (vsblender_stage: template floor, build plate) and boolean cutters." };
 const overlay = {
   type: "array",
   items: { type: "object" },
-  description: "Draw other geometry over the image, from a second pass, so hidden, wire-display or external references show: [{\"objects\": \"_REF *\" | \"file\": \"refs/part.stl\" (STL, OBJ, 3MF, SVG; transform {location, rotation_deg, scale, units: mm}) | \"ref\": name in references.json, \"style\": \"wire\" | \"xray\" | \"silhouette\", \"color\": \"#ff3010\", \"opacity\": 0.35}].",
+  description: "Draw other geometry with the image, so hidden, wire-display or external references show: [{\"objects\": \"_REF *\" | \"file\": \"refs/part.stl\" (STL, OBJ, 3MF, SVG; part: an OBJ material/group; transform {location, rotation_deg, scale, units: mm}) | \"ref\": a references.json name (\"peg\", or \"peg/Chevron\" for one part), \"style\": \"wire\" | \"xray\" | \"silhouette\" (drawn over the image) | \"solid\" | \"cavity\" (shaded in the scene, hidden behind nearer geometry; temporary copies, never in the file), \"color\": \"#ff3010\", \"opacity\": 0.35}].",
 };
+const saveArg = { type: "boolean", description: "Save the .blend after a successful run (journaled). Only when the user allowed it in setup (allowSave); otherwise refused." };
+const allowReferences = { type: "boolean", description: "With save: save even though reference objects (vsblender_reference, _REF*) are in the scene." };
 
 const viewProps = {
   view: { type: "string", description: "camera, front, back, left, right, top, bottom, iso. Default iso." },
@@ -31,6 +33,9 @@ const viewProps = {
   frame: { type: "number", description: "Frame to show, e.g. 120 for the end of the dial sequence. The user's frame is restored afterwards." },
   region: { type: "object", description: "Frame a part of the scene instead: {center: [x, y, z], radius} or {min: [...], max: [...]}, scene units." },
   crop: { type: "array", items: { type: "number" }, description: "Zoom into part of the framed image at full resolution: [x0, y0, x1, y1] as fractions, (0, 0) top left." },
+  camera: { type: "string", description: "Render from this camera object (view camera with another camera than the scene's)." },
+  ref: { description: "Look at a registered reference (references.json; import_reference makes one) on its own, shaded, without importing it: \"peg\", \"peg/Chevron\", or a list. with_scene: true shows it in the scene instead." },
+  with_scene: { type: "boolean", description: "With ref: draw the reference shaded inside the scene (occluded like the rest) instead of alone." },
   overlay,
 };
 
@@ -59,8 +64,8 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "session_info",
-    description: "Live state of the open Blender: version, file, dirty flag, scene, frame, units (what one Blender unit is), template, engine, render devices, recent checkpoints, whether the sidecar describes this session, the printer profile, and gotchas for this Blender version. Read-only.",
-    inputSchema: obj({}),
+    description: "Live state of the open Blender: version, file, dirty flag and unsaved runs (how many runs since the last save, since when), scene, frame, units (what one Blender unit is), template, engine, render devices, recent checkpoints, whether the sidecar describes this session, the printer profile, and gotchas for this Blender version (sent once per session). Read-only.",
+    inputSchema: obj({ gotchas: { type: "string", description: "new (default: the sheet the first time per session), all (again), none." } }),
   },
   {
     name: "launch_blender",
@@ -104,7 +109,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "run_script",
-    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, and libPaths. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`. Set `result`, or pass function and args.",
+    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`. Set `result`, or pass function and args. The reply ends with what is unsaved; the .blend is never saved unless save is passed (and allowed).",
     inputSchema: obj({
       path: { type: "string", description: "Workspace .py file. Keep model scripts next to their .blend: <blend folder>/scripts/, shared code in <blend folder>/scripts/lib/." },
       reason: { type: "string", description: "Why: goes into the journal and the NOTES change log. Give one for every change." },
@@ -113,6 +118,8 @@ export const TOOLS: ToolDef[] = [
       timeout_ms: { type: "number", description: "Default 60000, max 600000. On timeout the script is asked to stop at its next vsblender.progress() call." },
       checkpoint: { type: "boolean", description: "Default true (from setup). false skips the automatic checkpoint (and with it the rollback on failure)." },
       atomic: { type: "boolean", description: "Default true: a failed or cancelled run is rolled back. false keeps the partial changes." },
+      save: saveArg,
+      allow_references: allowReferences,
     }, ["path"]),
   },
   {
@@ -126,6 +133,8 @@ export const TOOLS: ToolDef[] = [
       timeout_ms: { type: "number" },
       checkpoint: { type: "boolean" },
       atomic: { type: "boolean" },
+      save: saveArg,
+      allow_references: allowReferences,
     }, ["path"]),
   },
   {
@@ -140,11 +149,77 @@ export const TOOLS: ToolDef[] = [
       atomic: { type: "boolean" },
       checkpoint: { type: "boolean" },
       timeout_ms: { type: "number", description: "Default 300000, max 600000." },
+      save: saveArg,
+      allow_references: allowReferences,
     }),
   },
   {
+    name: "run_project_pipeline",
+    description: "Exactly run_pipeline, but only for a pipeline.json inside the workspace's trusted folders (\"trustedScripts\"), whose steps are trusted scripts too: allowed without asking together with run_project_script.",
+    inputSchema: obj({
+      pipeline: { type: "string", description: "pipeline.json (or its folder) inside a trusted folder. Optional when one trusted pipeline has the from step." },
+      from: { type: "string" },
+      to: { type: "string" },
+      mode: { type: "string" },
+      reason: { type: "string" },
+      atomic: { type: "boolean" },
+      checkpoint: { type: "boolean" },
+      timeout_ms: { type: "number" },
+      save: saveArg,
+      allow_references: allowReferences,
+    }),
+  },
+  {
+    name: "save",
+    description: "Save the open .blend: the user's file, so call it when the user asked for a save (or allowed it in setup). Journaled with the reason; the watcher's re-ingest then logs the save as the AI's, pointing at its runs. Refuses while reference objects (vsblender_reference, _REF*) are in the scene unless allow_references. path saves as another workspace .blend (which becomes the open file; an existing file needs overwrite). compress defaults to true.",
+    inputSchema: obj({
+      reason: { type: "string", description: "Why now: what this save holds." },
+      path: { type: "string", description: "Save as this workspace .blend instead." },
+      compress: { type: "boolean" },
+      allow_references: { type: "boolean" },
+      overwrite: { type: "boolean", description: "With path: replace an existing other file." },
+    }),
+  },
+  {
+    name: "append",
+    description: "Copy objects from another workspace .blend into the open one (append, not link): their meshes, materials and parents come along, and with_children (default, when the source has been ingested) their children too. Each copy records where it came from (ai_appended_from/object: describe shows it, find from:<file> selects them). One checkpoint, one undo step, journaled, like run_script. For reusing a built mesh; to rebuild a part with other parameters, use vsblender.part in a script.",
+    inputSchema: obj({
+      from: { type: "string", description: "Workspace .blend, e.g. TestObject/SG1/stargate.blend." },
+      objects: { description: "Names or globs: [\"SG DHD*\"]." },
+      collection: { type: "string", description: "Collection to put them in. Default \"Appended <file>\"." },
+      with_children: { type: "boolean" },
+      reason: { type: "string" },
+      checkpoint: { type: "boolean" },
+    }, ["from", "objects"]),
+  },
+  {
+    name: "import_reference",
+    description: "Bring a big reference (a scan, a show model, a CAD export: OBJ, FBX, glTF/GLB, STL, PLY, from any folder) into the sidecar without touching the .blend: Blender's own importer runs in a background Blender, the mesh is split into parts (by material, object, or none), and each part is written as binary STL to the sidecar (<blend folder>/.blender-ai/<blend>/refs/<name>/), plus a light overlay of the whole. Registered in references.json with units and transform, so preview overlay {ref}, preview ref= and measure ref= use it by name (\"peg\", \"peg/Chevron\"). Returns a parts table (triangles, bounds, radial bands with radial). Called again with the same file it reuses the parts and only updates transform or units. Writes only under .blender-ai/.",
+    inputSchema: obj({
+      file: { type: "string", description: "The reference file: absolute, or relative to the workspace." },
+      name: { type: "string", description: "Its name in references.json. Default: the file name." },
+      split: { type: "string", description: "material (default: one part per material, e.g. an OBJ's usemtl names), object, or none." },
+      units: { type: "string", description: "What the file's numbers are: mm, cm, m, in. Default: mm for STL, m for glTF/FBX, m (assumed) for OBJ and PLY." },
+      axes: { type: "string", description: "blender (default: as File > Import, Y-up files stand up in Z) or native (the file's own coordinates; not for glTF)." },
+      transform: { type: "object", description: "Where it sits in the scene: {location, rotation_deg, scale}, scene units. Applied when it is used, so it can be changed later." },
+      overlay_cell: { type: "number", description: "Grid (file units) the light overlay is simplified to. Default: the size / 600." },
+      radial: { type: "object", description: "{axis: z, center: [x, y, z]} (file coordinates): add radius, depth and angle coverage per part to the table." },
+      force: { type: "boolean", description: "Import again even when the parts are cached." },
+      path: { type: "string", description: "The .blend whose sidecar gets it. Default: the open one." },
+    }, ["file"]),
+  },
+  {
+    name: "notes",
+    description: "Write what the next session must know into NOTES.md's Intent & constraints section, which re-ingests keep and context_pack always includes: where the sizes live, conventions (angles, axes, units), which script to re-run after which, which nodes are keyed, what must not change. Write it after the first successful build, and when a decision changes. Writes only the sidecar.",
+    inputSchema: obj({
+      intent: { type: "string", description: "Markdown: short bullets." },
+      mode: { type: "string", description: "append (default) or replace." },
+      path: { type: "string", description: "Workspace .blend. Default: the open one." },
+    }, ["intent"]),
+  },
+  {
     name: "preview",
-    description: "Offscreen image. Never moves the user's viewport, camera or render settings. Axis views are orthographic, iso and camera are perspective. view camera uses the scene camera's aspect. Without a target, the frame is set on the main subject. Compositor, depth of field and motion blur are off unless asked for. region and crop frame a detail; overlay draws references (objects, or STL/OBJ/3MF/SVG files) as wire, x-ray or silhouette; material shows one material on a sphere. Images that would be too large come back as a smaller JPEG. Works on the saved file when Blender is not running. Not kept unless save=true.",
+    description: "Offscreen image. Never moves the user's viewport, camera or render settings. Axis views are orthographic, iso and camera are perspective. view camera uses the scene camera's aspect (camera picks another camera). Without a target, the frame is set on the main subject. Compositor, depth of field and motion blur are off unless asked for. region and crop frame a detail; overlay draws references (objects, STL/OBJ/3MF/SVG files, or references.json names) as wire, x-ray, silhouette, or shaded solid/cavity inside the scene; ref shows a registered reference on its own, shaded, without importing it; material shows one material on a sphere. Images that would be too large come back as a smaller JPEG. Works on the saved file when Blender is not running. Not kept unless save=true.",
     inputSchema: obj({
       ...viewProps,
       ...solidProps,
@@ -166,7 +241,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "check_model",
-    description: "Is the model fit for its purpose? Read-only. purpose general/render/game/print decides which checks run and how serious each is: open edges are fine for a render, a warning for a game asset, an error for a print. Checks the evaluated meshes (modifiers applied): open edges and holes, non-manifold edges, flipped or inside-out normals, zero-area and coincident (z-fighting) faces, unapplied transforms, triangle budget, materials, UVs, flat shading, unit mix-ups. For print, in mm against the printer profile: fits the build volume, self-intersections, bed contact, parts floating in mid-air, overhangs over the limit, thin walls (ray samples), and a rough filament estimate; suggest_orientation ranks orientations. Returns an image with problem faces coloured (temporary copies only). Works on the saved file when Blender is not running.",
+    description: "Is the model fit for its purpose? Read-only. purpose general/render/game/print decides which checks run and how serious each is: open edges are fine for a render, a warning for a game asset, an error for a print. Checks the evaluated meshes (modifiers applied) at the current frame, or at frame: open edges and holes, non-manifold edges, flipped or inside-out normals, zero-area and coincident (z-fighting) faces, unapplied transforms, triangle budget, materials, UVs, flat shading, unit mix-ups. An object hidden by keyed visibility is reported as such (and from which frame it shows), and its own mesh is checked. For print, in mm against the printer profile: fits the build volume, self-intersections, bed contact, parts floating in mid-air, overhangs over the limit, thin walls (ray samples), and a rough filament estimate; suggest_orientation ranks orientations. Returns an image with problem faces coloured (temporary copies only). Works on the saved file when Blender is not running.",
     inputSchema: obj({
       targets,
       purpose,
@@ -178,6 +253,7 @@ export const TOOLS: ToolDef[] = [
       image: { type: "boolean", description: "Default true." },
       views: { type: "array", items: { type: "string" }, description: "Image views, default iso (print: iso and bottom)." },
       size: { type: "number" },
+      frame: { type: "number", description: "Check the model as it is at this frame (the user's frame is restored)." },
       save: { type: "boolean" },
       path: blendPath,
     }),
@@ -205,11 +281,12 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "render",
-    description: "Final render with the scene's own settings, as a background job: the session is copied, and a separate headless Blender renders the copy, so Blender's UI stays usable and overrides never reach the scene. Waits up to wait_seconds, then returns a job id for job_status. Writes images (or an .mp4) in the workspace.",
+    description: "Final render with the scene's own settings, as a background job: the session is copied, and a separate headless Blender renders the copy, so Blender's UI stays usable and overrides never reach the scene. Waits up to wait_seconds, then returns a job id for job_status (frames rendered of frames expected). Writes images, or an .mp4 that appears at its path only when complete: with ffmpeg (found on PATH or set as \"ffmpeg\" in .blender-ai/config.json) every frame is rendered, then encoded as H.264, yuv420p, +faststart, which plays everywhere; without it, Blender's own writer. frames and mp4 without frames render the scene's whole frame range.",
     inputSchema: obj({
       frame: { type: "number", description: "One frame. Default: the current frame." },
-      frames: { description: "{start, end, step} for a range, or a list such as [1, 36, 216, 260] (not for mp4)." },
-      as: { type: "string", description: "still (default for one frame), frames, sheet (one labelled contact sheet, at most max_tiles frames), mp4." },
+      frames: { description: "{start, end, step} for a range, or a list such as [1, 36, 216, 260] (not for mp4). Default for frames and mp4: the scene's frame range." },
+      as: { type: "string", description: "still (default for one frame), frames, sheet (one labelled contact sheet, at most max_tiles frames), mp4 (2 frames or more)." },
+      keep_frames: { type: "boolean", description: "mp4 with ffmpeg: keep the rendered PNG frames next to the video." },
       max_tiles: { type: "number", description: "Most frames in a sheet. Default 16, up to 36." },
       camera: { type: "string", description: "Camera object to render from." },
       output: { type: "string", description: "Workspace path: .png for a still or sheet, .mp4 for video, a folder for frames. Default .blender-ai/renders/." },
@@ -239,8 +316,8 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "api",
-    description: "Blender Python API lookup, compact (identifier: TYPE = default {enum items}). query: a type (ShaderNodeTexSky), Type.property (ColorManagedViewSettings.look), a live path (scene.view_settings.look, scene.eevee, object.data), or a word to search. Live paths list dynamic enum values RNA leaves out (looks, engines). Read-only.",
-    inputSchema: obj({ query: { type: "string" } }, ["query"]),
+    description: "Blender Python API lookup, compact (identifier: TYPE = default {enum items}). query: a type (ShaderNodeTexSky), Type.property (ColorManagedViewSettings.look), a live path (scene.view_settings.look, scene.eevee, object.data), or a word to search. Live paths list dynamic enum values RNA leaves out (looks, engines). The properties every Node or ID has (location, width, select, users...) are left out unless inherited. Read-only.",
+    inputSchema: obj({ query: { type: "string" }, inherited: { type: "boolean" } }, ["query"]),
   },
   {
     name: "node_schema",
@@ -249,12 +326,16 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "describe",
-    description: "Everything about one datablock: an object (transform, world bounds, data, modifiers, constraints, materials, animation with readable channel names, role, which script built it, its spec, what uses it), or MA:/WO:/NT:/CO:/ME:/AC: ids. Read-only. Works on the saved file when Blender is not running.",
-    inputSchema: obj({ target: { type: "string", description: "Name, or a typed id such as MA:SG Stone." }, path: blendPath }, ["target"]),
+    description: "Everything about one datablock: an object (transform, world bounds, data, modifiers, constraints, materials, animation with readable channel names, keyed visibility, role, which script built it, its spec, which file it was appended from, what uses it), or MA:/WO:/NT:/CO:/ME:/AC: ids. frame describes it at that frame. Read-only. Works on the saved file when Blender is not running.",
+    inputSchema: obj({
+      target: { type: "string", description: "Name, or a typed id such as MA:SG Stone." },
+      frame: { type: "number", description: "Describe it as it is at this frame (the user's frame is restored)." },
+      path: blendPath,
+    }, ["target"]),
   },
   {
     name: "find",
-    description: "Objects matching a selector, with why each matched. Terms: name glob (\"SG Rock *\"), type:MESH, collection:X, material:X, parent:X, children_of:X, role~text, has:modifier[:TYPE], has:constraint, prop:key[=value], built_by:script, animated, emissive, visible, hidden, selected, active, derived, built, reference, within:[x0,y0,z0,x1,y1,z1], near:\"X\"<2 (scene units). Combine with and, or, not, ( ). Read-only. Works on the saved file when Blender is not running.",
+    description: "Objects matching a selector, with why each matched. Terms: name glob (\"SG Rock *\"), type:MESH, collection:X, material:X, parent:X, children_of:X, role~text, has:modifier[:TYPE], has:constraint, prop:key[=value], built_by:script, part:name (built by vsblender.part), from:file (appended), animated, emissive, visible, hidden, selected, active, derived, built, reference (measuring references), stage (template floor, build plate), within:[x0,y0,z0,x1,y1,z1], near:\"X\"<2 (scene units). Combine with and, or, not, ( ). Read-only. Works on the saved file when Blender is not running.",
     inputSchema: obj({ selector: { type: "string" }, limit: { type: "number" }, path: blendPath }, ["selector"]),
   },
   {
@@ -280,23 +361,34 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "measure",
-    description: "Shapes, not just bounds. Read-only. op section (outline of a slice: plane {axis: z, at: 1.2} or {point, normal}; width, depth, area, points), profile (min/max of one axis binned along another or along a radius: a ring's cross-section; value, along, axis, center, bins), depthmap (a height map seen from view top/front/...: ASCII rows and an image; res up to 128), angular (occupancy against angle about an axis within radius [r0, r1] and height bands: notches, gaps), pitch (the repeat period of that pattern). On scene objects (targets) or an external file (file + transform {location, rotation_deg, scale, units: mm}) without importing it; compare_to measures a second source the same way and reports differences. Scene units. Works on the saved file when Blender is not running.",
+    description: "Shapes, not just bounds. Read-only. op section (outline of a slice: plane {axis: z, at: 1.2}, {point, normal}, or {angle: 20}: the half-plane through the ring axis, radius across and depth up; the points are in the reply, image draws the cut on a grid), profile (min/max of value binned along r (radius), angle, depth, x, y or z: a ring's cross-section), depthmap (a height map seen from view top/front/...), angular (occupancy against angle: notches, gaps, arcs; segment folds a repeat onto one), pitch (the repeat period). Frames: axis + center (angles counter-clockwise from the first other axis), or ring {up, front, center, clockwise} (clock angles from the top seen from the front, depth toward the viewer, as geo.ring). Every op takes the windows angle [a0, a1], radius [r0, r1], height (or depth) [d0, d1]. Sources: targets, file (+ part: an OBJ material or group; outside the workspace only under referenceRoots), or ref (\"peg\", \"peg/Chevron\": references.json, with its units and transform). compare_to measures a second source on the same bins and reports per-bin deltas, the largest deviation, and for sections the outline distance; image draws both. Scene units; warns when a file's units look wrong. Works on the saved file when Blender is not running.",
     inputSchema: obj({
-      op: { type: "string" },
+      op: { type: "string", description: "section (default), profile, depthmap, angular, pitch." },
       targets,
-      file: { type: "string", description: "STL, OBJ, 3MF or SVG in the workspace." },
+      file: { type: "string", description: "STL, OBJ, 3MF or SVG." },
+      part: { description: "With file or ref: the part(s) to measure, names or globs." },
+      ref: { type: "string", description: "A references.json name: \"peg\" (all parts), \"peg/Chevron\" (one part)." },
+      units: { type: "string", description: "The file's units when it has none: mm (default for files), cm, m, in." },
       transform: { type: "object" },
       plane: { type: "object" },
-      value: { type: "string" },
-      along: { type: "string" },
+      value: { type: "string", description: "profile: what is measured (min and max): depth (ring), x, y, z, r, angle. Default z, or depth with ring." },
+      along: { type: "string", description: "profile: the binned coordinate: r (radius; default), angle, depth, x, y, z." },
       axis: { type: "string" },
       center: { type: "array", items: { type: "number" } },
+      ring: { type: "object", description: "{up: \"+Y\", front: \"+Z\", center: [x, y, z], clockwise: true}: clock angles, radius and depth like geo.ring." },
+      angle: { type: "array", items: { type: "number" }, description: "Angle window [a0, a1] in degrees (wraps; [-20, 20] is the 40 degrees around 0)." },
       bins: { type: "number" },
+      step: { type: "number", description: "angular: bin size in degrees instead of bins." },
+      segment: { type: "number", description: "angular: fold every this many degrees onto one segment (from segment_start or the window start)." },
       radius: { type: "array", items: { type: "number" } },
-      height: { type: "array", items: { type: "number" } },
+      height: { type: "array", items: { type: "number" }, description: "Height (along the axis) or depth (ring) window [d0, d1]." },
+      min: { type: "number", description: "profile: first bin edge." },
+      max: { type: "number", description: "profile: last bin edge." },
       view: { type: "string" },
       res: { type: "number" },
-      compare_to: { description: "Another source: {targets} or {file, transform}." },
+      image: { type: "boolean", description: "section and profile: draw the result (and compare_to) on a labelled grid." },
+      max_points: { type: "number", description: "section: points kept per reply (default 200; text_points shown in the text, default 60)." },
+      compare_to: { description: "Another source measured the same way: {targets}, {file, transform, units}, or {ref}." },
       path: blendPath,
     }),
   },
@@ -342,12 +434,19 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "reference",
-    description: "Reference images next to a matching preview of the open session, to check accuracy against a real design. images: workspace paths or https URLs the user gave (downloaded, images only, 15 MB max). For a reference mesh (STL, OBJ, 3MF), use preview with overlay instead.",
+    description: "Reference images next to a matching preview of the open session, to check accuracy against a real design. images: workspace paths or https URLs the user gave (downloaded, images only, 15 MB max). video: frames of a reference video (workspace or referenceRoots; needs ffmpeg) as one labelled sheet, at times [...] or every 1/fps seconds from start to end, optionally cropped; diff marks in red what changed since the frame before (a small moving light). For a reference mesh, use preview with ref or overlay instead.",
     inputSchema: obj({
       images: { type: "array", items: { type: "string" } },
+      video: { type: "string", description: "A video file: frames instead of images." },
+      times: { type: "array", items: { type: "number" }, description: "video: seconds, e.g. [3.5, 8.3, 13.1]." },
+      fps: { type: "number", description: "video: frames per second between start and end (default 1)." },
+      start: { type: "number" },
+      end: { type: "number" },
+      diff: { type: "boolean", description: "video: mark what changed since the frame before." },
+      max_tiles: { type: "number", description: "video: most frames in the sheet. Default 16, up to 36." },
       ...viewProps,
       size: { type: "number", description: "Default 512." },
-    }, ["images"]),
+    }),
   },
 ];
 
@@ -377,6 +476,7 @@ export const AUTO_APPROVE = [
   "compare",
   "checkpoint",
   "launch_blender",
+  "notes",
 ];
 
 /** Runs arbitrary Python in the user's Blender. Only auto-approved when the user ticks it in setup. */
@@ -385,6 +485,10 @@ export const SCRIPT_TOOL = "run_script";
 export const PIPELINE_TOOL = "run_pipeline";
 /** run_script restricted to trusted folders: approved on its own setup tick. */
 export const TRUSTED_SCRIPT_TOOL = "run_project_script";
+/** run_pipeline restricted to trusted folders: approved with run_project_script. */
+export const TRUSTED_PIPELINE_TOOL = "run_project_pipeline";
+/** Saves the user's .blend: only auto-approved when the user ticks it in setup. */
+export const SAVE_TOOL = "save";
 
 export function claudeRule(tool: string): string {
   return `mcp__vsblender__${tool}`;

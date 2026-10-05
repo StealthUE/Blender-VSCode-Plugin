@@ -8,16 +8,22 @@ import {
   bridgeError,
   bridgeFailure,
   callWithProgress,
+  checkpointLine,
+  checkpointParams,
   errorText,
   fail,
   imageReply,
+  importPaths,
   launchBlender,
   liveBlend,
   ok,
   PREVIEW_BYTES,
   printerContext,
+  referenceRoots,
   routeCall,
   runScript,
+  saveLines,
+  saveRefusal,
   sourceNote,
   tempPng,
 } from "./tools";
@@ -52,7 +58,7 @@ export async function checkModel(ctx: WorkspaceContext, args: Record<string, unk
   if (purpose && !PURPOSES.includes(purpose)) return fail(`purpose must be one of ${PURPOSES.join(", ")}`);
   const printer = printerContext(ctx, args["printer"]);
   const params: Record<string, unknown> = {
-    ...copyKeys(args, ["targets", "purpose", "deep", "max_tris", "mm_per_unit", "suggest_orientation", "place_on_bed", "views", "size"]),
+    ...copyKeys(args, ["targets", "purpose", "deep", "max_tris", "mm_per_unit", "suggest_orientation", "place_on_bed", "views", "size", "frame"]),
     printer,
     image: args["image"] !== false,
     out: tempPng("check"),
@@ -227,9 +233,11 @@ export async function newBlend(ctx: WorkspaceContext, args: Record<string, unkno
 // ----------------------------------------------------------------------------- measure
 export async function measure(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   const op = str(args["op"]) ?? "section";
-  const params: Record<string, unknown> = { ...args, op };
+  const params: Record<string, unknown> = { ...args, op, reference_roots: referenceRoots(ctx) };
   delete params["path"];
   if (op === "depthmap" && args["image"] !== false) params["out"] = tempPng("depthmap");
+  // A section or profile drawn on a grid (both sources, with compare_to) is often worth more than the numbers.
+  if ((op === "section" || op === "profile") && args["image"] === true) params["out"] = tempPng(`measure-${op}`);
   const timeout = 180000;
   try {
     const routed = await routeCall(ctx, "measure", params, timeout, args["path"], extras);
@@ -268,7 +276,8 @@ function findPipelines(workspace: string): string[] {
   return found;
 }
 
-function pipelineFor(ctx: WorkspaceContext, args: Record<string, unknown>): string {
+/** The pipeline.json a call is about. within: only look in these workspace folders (the trusted ones). */
+function pipelineFor(ctx: WorkspaceContext, args: Record<string, unknown>, within?: string[]): string {
   const requested = str(args["pipeline"]);
   if (requested) {
     const abs = resolveInside(ctx.workspace, requested);
@@ -281,7 +290,9 @@ function pipelineFor(ctx: WorkspaceContext, args: Record<string, unknown>): stri
     return abs;
   }
   const step = str(args["from"]);
+  const roots = within?.map((folder) => path.resolve(ctx.workspace, folder));
   const all = findPipelines(ctx.workspace).filter((file) => {
+    if (roots && !roots.some((root) => !path.relative(root, file).startsWith(".."))) return false;
     if (!step) return true;
     try {
       const steps = (JSON.parse(fs.readFileSync(file, "utf8")) as { steps?: string[] }).steps ?? [];
@@ -295,22 +306,28 @@ function pipelineFor(ctx: WorkspaceContext, args: Record<string, unknown>): stri
   throw new Error(`more than one pipeline.json; pass pipeline:\n${all.map((f) => relativeTo(ctx.workspace, f)).join("\n")}`);
 }
 
-export async function runPipeline(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+export async function runPipeline(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {},
+  resolved?: string): Promise<ToolOutcome> {
   let file: string;
   try {
-    file = pipelineFor(ctx, args);
+    file = resolved ?? pipelineFor(ctx, args);
   } catch (error) {
     return fail(errorText(error));
   }
+  const refused = saveRefusal(ctx, args);
+  if (refused) return fail(refused);
   const params: Record<string, unknown> = {
     pipeline: file,
     ...copyKeys(args, ["from", "to", "mode", "reason"]),
     actor: "ai",
     atomic: args["atomic"] !== false,
-    checkpoint: { auto: ctx.checkpoints.auto && args["checkpoint"] !== false, keep: ctx.checkpoints.keep, max_mb: ctx.checkpoints.maxMb },
-    lib_paths: ctx.libPaths,
+    checkpoint: checkpointParams(ctx, args),
+    lib_paths: importPaths(ctx),
+    reference_roots: referenceRoots(ctx),
     printer: printerContext(ctx),
   };
+  if (args["save"] === true) params["save"] = true;
+  if (args["allow_references"] === true) params["allow_references"] = true;
   const timeout = Math.min(600000, Math.max(1000, Number(args["timeout_ms"]) || 300000));
   const rel = relativeTo(ctx.workspace, file);
   try {
@@ -318,32 +335,31 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
     if (!response.ok) return fail(`pipeline: ${rel}\n${bridgeError(response, "run_pipeline")}`, { changed: response.changed ?? [] });
     const result = response.result ?? {};
     const steps = (result["steps"] as Record<string, unknown>[] | undefined) ?? [];
-    const lines = [`pipeline: ${rel}`, `ran ${steps.length} step(s) as one undo step${result["checkpoint"] ? `; checkpoint ${String(result["checkpoint"])} undoes all of them` : ""}`];
+    const lines = [`pipeline: ${rel}`, `ran ${steps.length} step(s) as one undo step`, checkpointLine(result, "all of them")];
     for (const step of steps) lines.push(`- ${String(step["step"])}: ${String(step["changes"] ?? "")}`);
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
+    lines.push(...saveLines(result));
     return ok(lines.join("\n"), { details: result });
   } catch (error) {
     return failed(ctx, error, timeout);
   }
 }
 
-/** run_script for files in the workspace's trusted folders only, so it can be allowed without asking. */
-export async function runProjectScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+/** The real path of a file when it is inside one of the trusted folders, else why not. */
+function trustedPath(ctx: WorkspaceContext, requested: string, what: string): { real: string } | { problem: string } {
   const trusted = ctx.trustedScripts ?? [];
   if (!trusted.length) {
-    return fail("no trusted script folders. Add \"trustedScripts\": [\"Models/scripts\"] to .blender-ai/config.json "
-      + "(and tick \"Run trusted project scripts without asking\" in setup), or use run_script.");
+    return { problem: "no trusted script folders. Add \"trustedScripts\": [\"Models/scripts\"] to .blender-ai/config.json "
+      + `(and tick "Run trusted project scripts without asking" in setup), or use ${what === "pipeline" ? "run_pipeline" : "run_script"}.` };
   }
-  const requested = str(args["path"]);
-  if (!requested) return fail("path is required");
   let real: string;
   try {
     real = fs.realpathSync(resolveInside(ctx.workspace, requested));
   } catch (error) {
-    return fail(errorText(error));
+    return { problem: errorText(error) };
   }
   const rel = relativeTo(ctx.workspace, real);
-  if (rel.split("/").includes(".blender-ai")) return fail("scripts under .blender-ai/ are never trusted");
+  if (rel.split("/").includes(".blender-ai")) return { problem: `${what}s under .blender-ai/ are never trusted` };
   const inside = trusted.some((folder) => {
     let root: string;
     try {
@@ -354,8 +370,32 @@ export async function runProjectScript(ctx: WorkspaceContext, args: Record<strin
     const relative = path.relative(root, real);
     return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);
   });
-  if (!inside) return fail(`${rel} is not inside a trusted folder (${trusted.join(", ")}). Use run_script for other scripts.`);
-  return runScript(ctx, { ...args, path: real }, extras);
+  if (!inside) {
+    return { problem: `${rel} is not inside a trusted folder (${trusted.join(", ")}). Use ${what === "pipeline" ? "run_pipeline" : "run_script"} for other ${what}s.` };
+  }
+  return { real };
+}
+
+/** run_script for files in the workspace's trusted folders only, so it can be allowed without asking. */
+export async function runProjectScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  const requested = str(args["path"]);
+  if ((ctx.trustedScripts ?? []).length && !requested) return fail("path is required");
+  const found = trustedPath(ctx, requested ?? ".", "script");
+  if ("problem" in found) return fail(found.problem);
+  return runScript(ctx, { ...args, path: found.real }, extras);
+}
+
+/** run_pipeline for a pipeline.json inside a trusted folder: its steps are trusted scripts too. */
+export async function runProjectPipeline(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  let file: string;
+  try {
+    file = pipelineFor(ctx, args, ctx.trustedScripts ?? []);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  const found = trustedPath(ctx, relativeTo(ctx.workspace, file), "pipeline");
+  if ("problem" in found) return fail(found.problem);
+  return runPipeline(ctx, args, extras, found.real);
 }
 
 export function blendCount(ctx: WorkspaceContext): number {

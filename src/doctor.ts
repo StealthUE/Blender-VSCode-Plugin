@@ -101,6 +101,7 @@ export async function runDoctor(
       launch,
       ...(saved?.allowScripts !== undefined ? { allowScripts: saved.allowScripts } : {}),
       ...(saved?.allowTrustedScripts !== undefined ? { allowTrustedScripts: saved.allowTrustedScripts } : {}),
+      ...(saved?.allowSave !== undefined ? { allowSave: saved.allowSave } : {}),
       ...(saved?.ignoreClientConfig !== undefined ? { ignoreClientConfig: saved.ignoreClientConfig } : {}),
       ...(saved?.checkpoints ? { checkpoints: saved.checkpoints } : {}),
       ...(saved?.libPaths ? { libPaths: saved.libPaths } : {}),
@@ -120,6 +121,21 @@ export async function runDoctor(
       checks.push(check("blender", false, `${version} at ${ctx.blender}. VSBlender needs ${MIN_BLENDER} or newer (4.2+ recommended). Pick another install in Setup.`));
     } else {
       checks.push(check("blender", true, `${version} at ${ctx.blender}`));
+    }
+    if (version) {
+      // What a Blender opened by hand loads; launch_blender loads the shipped copy instead.
+      const majorMinor = version.split(".").slice(0, 2).join(".");
+      const installed = installedAddons(majorMinor);
+      const stale = installed.filter((item) => item.version !== ADDON_VERSION);
+      if (!installed.length) {
+        checks.push(check("add-on", false, `not installed in Blender ${majorMinor}'s user folder: a Blender you open yourself has no bridge `
+          + "(launch_blender still works: it loads the shipped add-on). doctor_fix installs it.", true));
+      } else if (stale.length) {
+        checks.push(check("add-on", false, stale.map((item) => `${item.version} (${item.where})`).join("; ")
+          + ` is installed, and a Blender you open yourself loads it, not ${ADDON_VERSION}. doctor_fix replaces it; then restart Blender.`, true));
+      } else {
+        checks.push(check("add-on", true, `${ADDON_VERSION} installed (${installed.map((item) => item.where).join("; ")})`));
+      }
     }
   }
 
@@ -152,8 +168,23 @@ export async function runDoctor(
         : `read-only tools run without asking; ${scripts}`, true));
   }
 
+  const orphans = orphanSidecars(ctx.workspace);
+  if (orphans.length && options?.fix) {
+    const moved = orphans.map((folder) => {
+      try {
+        return `${relativeTo(ctx.workspace, folder)} -> ${relativeTo(ctx.workspace, archiveSidecar(folder))}`;
+      } catch (error) {
+        return `${relativeTo(ctx.workspace, folder)} (not moved: ${error instanceof Error ? error.message : String(error)})`;
+      }
+    });
+    checks.push(check("orphan sidecars", true, `archived ${moved.join(", ")}`));
+  } else if (orphans.length) {
+    checks.push(check("orphan sidecars", false, `${orphans.map((folder) => relativeTo(ctx.workspace, folder)).join(", ")}: their .blend no longer `
+      + "exists (renamed or deleted). doctor_fix moves them to .blender-ai/_archive/.", true));
+  }
+
   const bridge = await probeBridge(ctx.port);
-  let live: { file?: string; dirty?: boolean; status?: string; detail?: string } = {};
+  let live: { file?: string; dirty?: boolean; status?: string; detail?: string; unsaved?: string } = {};
   if (bridge.ok && bridge.version && bridge.version !== ADDON_VERSION) {
     checks.push(check("bridge", false, `${bridge.detail}, but the add-on in Blender is ${bridge.version} and this extension ships ${ADDON_VERSION}. Run doctor_fix, then restart Blender (or close Blender and use launch_blender, which loads the shipped add-on).`, true));
   } else if (bridge.state === "absent") {
@@ -164,12 +195,15 @@ export async function runDoctor(
       try {
         const info = await callBridge(ctx.port, "session_info", {}, 15000);
         const sidecar = info.result?.["sidecar"] as { status?: string; detail?: string } | undefined;
+        const unsaved = info.result?.["unsaved"] as { runs?: number; text?: string } | undefined;
         live = {
           file: String(info.result?.["file"] ?? ""),
           dirty: info.result?.["dirty"] === true,
           ...(sidecar?.status ? { status: sidecar.status } : {}),
           ...(sidecar?.detail ? { detail: sidecar.detail } : {}),
+          ...(unsaved?.runs ? { unsaved: unsaved.text ?? `${unsaved.runs} run(s) since the last save` } : {}),
         };
+        if (live.unsaved) checks.push(check("unsaved", false, `${live.file}: ${live.unsaved}`, true));
       } catch {
         live = {};
       }
@@ -194,6 +228,102 @@ export async function runDoctor(
 
   const ok = checks.every((item) => item.ok || item.optional);
   return { ok, checks, text: formatReport(checks) };
+}
+
+/** Blender's user folder for a version ("5.2"): where add-ons and extensions are installed. */
+export function blenderUserDirs(majorMinor: string, env: NodeJS.ProcessEnv = process.env): string[] {
+  const dirs: string[] = [];
+  if (process.platform === "win32") {
+    if (env["APPDATA"]) dirs.push(path.join(env["APPDATA"], "Blender Foundation", "Blender", majorMinor));
+  } else if (process.platform === "darwin") {
+    if (env["HOME"]) dirs.push(path.join(env["HOME"], "Library", "Application Support", "Blender", majorMinor));
+  } else {
+    const config = env["XDG_CONFIG_HOME"] || (env["HOME"] ? path.join(env["HOME"], ".config") : "");
+    if (config) dirs.push(path.join(config, "blender", majorMinor));
+  }
+  return dirs;
+}
+
+/** The version of an installed copy of the add-on: from blender_manifest.toml, or bl_info in __init__.py. */
+export function installedAddonVersion(folder: string): string | undefined {
+  try {
+    const manifest = fs.readFileSync(path.join(folder, "blender_manifest.toml"), "utf8");
+    const match = /^\s*version\s*=\s*"([^"]+)"/m.exec(manifest);
+    if (match?.[1]) return match[1];
+  } catch {
+    // An old legacy add-on has no manifest.
+  }
+  try {
+    const init = fs.readFileSync(path.join(folder, "__init__.py"), "utf8");
+    const match = /"version"\s*:\s*\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)\)/.exec(init);
+    if (match) return `${match[1]}.${match[2]}.${match[3]}`;
+  } catch {
+    return undefined;
+  }
+  return "unknown";
+}
+
+/** Copies of the add-on in Blender's user folders, which a Blender opened by hand loads. */
+export function installedAddons(majorMinor: string, env: NodeJS.ProcessEnv = process.env): { where: string; version: string }[] {
+  const found: { where: string; version: string }[] = [];
+  for (const base of blenderUserDirs(majorMinor, env)) {
+    for (const [kind, folder] of [["legacy add-on", path.join(base, "scripts", "addons", "vsblender_bridge")],
+      ["extension", path.join(base, "extensions", "user_default", "vsblender_bridge")]] as const) {
+      if (!fs.existsSync(path.join(folder, "__init__.py"))) continue;
+      found.push({ where: `${kind} ${folder}`, version: installedAddonVersion(folder) ?? "unknown" });
+    }
+  }
+  return found;
+}
+
+const SIDECAR_SKIP = new Set(["live", "jobs", "renders", "references", "_archive", "untitled", "texts"]);
+
+/** Sidecar folders whose .blend no longer exists (renamed or deleted files). */
+export function orphanSidecars(workspace: string, maxDepth = 6): string[] {
+  const found: string[] = [];
+  const skip = new Set(["node_modules", ".git", "out", "dist"]);
+  const walk = (dir: string, depth: number): void => {
+    if (depth > maxDepth) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const full = path.join(dir, entry.name);
+      if (entry.name === ".blender-ai") {
+        let sidecars: fs.Dirent[] = [];
+        try {
+          sidecars = fs.readdirSync(full, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const side of sidecars) {
+          if (!side.isDirectory() || SIDECAR_SKIP.has(side.name)) continue;
+          const inner = path.join(full, side.name);
+          const isSidecar = ["state.json", "manifest.json", "NOTES.md"].some((file) => fs.existsSync(path.join(inner, file)));
+          if (isSidecar && !fs.existsSync(path.join(dir, `${side.name}.blend`))) found.push(inner);
+        }
+        continue;
+      }
+      if (!entry.name.startsWith(".") && !skip.has(entry.name)) walk(full, depth + 1);
+    }
+  };
+  walk(workspace, 0);
+  return found.sort();
+}
+
+/** Move an orphan sidecar into .blender-ai/_archive/<name>-<date>/ next to it. Returns the new path. */
+export function archiveSidecar(folder: string): string {
+  const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const archive = path.join(path.dirname(folder), "_archive");
+  fs.mkdirSync(archive, { recursive: true });
+  let target = path.join(archive, `${path.basename(folder)}-${stamp}`);
+  for (let n = 2; fs.existsSync(target); n += 1) target = path.join(archive, `${path.basename(folder)}-${stamp}-${n}`);
+  fs.renameSync(folder, target);
+  return target;
 }
 
 /** The workspace is this extension's own repository (its package.json names vsblender, or it holds the add-on source). */

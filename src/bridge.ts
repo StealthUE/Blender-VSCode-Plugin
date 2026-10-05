@@ -9,6 +9,8 @@ export interface ChangeReport {
   modified: Record<string, Record<string, string[]>>;
   /** Removed or rebuilt datablocks that had animation (keys, drivers, NLA), and removed actions. */
   lost_animation?: string[];
+  /** Built and removed again within the run (an import that was measured and deleted). Not a change. */
+  temporary?: string[];
 }
 
 export interface BridgeResponse {
@@ -150,5 +152,6 @@ export function formatChanges(report: ChangeReport | undefined, limit = 12): str
     const shown = names.slice(0, limit).map((name) => `${name} (${(items[name] ?? []).slice(0, 4).join(", ")})`);
     lines.push(`modified ${category}: ${shown.join(", ")}${names.length > limit ? ` (+${names.length - limit} more)` : ""}`);
   }
+  if (report.temporary?.length) lines.push(`temporary (added and removed again, not a change): ${list(report.temporary)}`);
   return lines;
 }

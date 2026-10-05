@@ -265,6 +265,7 @@ async function refreshClientFiles(context: vscode.ExtensionContext, folder: stri
       launch,
       ...(config.allowScripts !== undefined ? { allowScripts: config.allowScripts } : {}),
       ...(config.allowTrustedScripts !== undefined ? { allowTrustedScripts: config.allowTrustedScripts } : {}),
+      ...(config.allowSave !== undefined ? { allowSave: config.allowSave } : {}),
       ...(config.ignoreClientConfig !== undefined ? { ignoreClientConfig: config.ignoreClientConfig } : {}),
       ...(config.checkpoints ? { checkpoints: config.checkpoints } : {}),
       ...(config.libPaths ? { libPaths: config.libPaths } : {}),

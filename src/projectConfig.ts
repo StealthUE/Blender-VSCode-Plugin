@@ -20,6 +20,9 @@ export function readConfig(workspace: string): ProjectConfig | undefined {
     const blender = typeof raw.blender === "string" && raw.blender.trim() ? raw.blender.trim() : undefined;
     const libPaths = stringList(raw.libPaths);
     const trustedScripts = stringList(raw.trustedScripts);
+    const referenceRoots = stringList(raw.referenceRoots);
+    const sharedLibs = stringList(raw.sharedLibs);
+    const ffmpeg = typeof raw.ffmpeg === "string" && raw.ffmpeg.trim() ? raw.ffmpeg.trim() : undefined;
     const printer = normalizePrinterSetting(raw.printer);
     return {
       version: 1,
@@ -34,6 +37,10 @@ export function readConfig(workspace: string): ProjectConfig | undefined {
       ...(printer !== undefined ? { printer } : {}),
       ...(trustedScripts ? { trustedScripts } : {}),
       ...(typeof raw.allowTrustedScripts === "boolean" ? { allowTrustedScripts: raw.allowTrustedScripts } : {}),
+      ...(typeof raw.allowSave === "boolean" ? { allowSave: raw.allowSave } : {}),
+      ...(referenceRoots ? { referenceRoots } : {}),
+      ...(sharedLibs ? { sharedLibs } : {}),
+      ...(ffmpeg ? { ffmpeg } : {}),
     };
   } catch {
     return undefined;

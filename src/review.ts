@@ -6,6 +6,7 @@ import { findCheckpoint, readCheckpoints, relativeTo, resolveInside, sidecarDir 
 import { callBridge, probeBridge } from "./bridge";
 import { diffHeadless, ingestScript, manifestHeadless } from "./ingest";
 import * as jobs from "./jobs";
+import { isVideoArg, videoReference } from "./references";
 import { bridgeFailure, currentBlend, errorText, fail, imageReply, ok, PREVIEW_BYTES, previewParams, tempPng } from "./tools";
 import { CallExtras, ToolOutcome, WorkspaceContext } from "./types";
 
@@ -263,9 +264,10 @@ function download(url: string, redirects = 3): Promise<{ data: Buffer; type: str
   });
 }
 
-export async function reference(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+export async function reference(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  if (isVideoArg(args)) return videoReference(ctx, args, extras);
   const images = Array.isArray(args["images"]) ? args["images"].filter((item): item is string => typeof item === "string" && Boolean(item.trim())) : [];
-  if (!images.length) return fail("images is required: workspace image paths or https URLs");
+  if (!images.length) return fail("images is required (workspace image paths or https URLs), or video with times or fps");
   if (images.length > 6) return fail("at most 6 reference images");
   const files: string[] = [];
   const labels: string[] = [];

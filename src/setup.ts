@@ -18,6 +18,7 @@ interface PanelState {
   replaceLegacy: boolean;
   allowScripts: boolean;
   allowTrustedScripts: boolean;
+  allowSave: boolean;
   trustedScripts: string;
   printer: string;
   ignoreClientConfig: boolean;
@@ -57,6 +58,7 @@ async function collectState(workspace: string): Promise<PanelState> {
     replaceLegacy: saved?.replaceLegacy ?? settings.get<boolean>("replaceLegacy") !== false,
     allowScripts: saved?.allowScripts ?? hasScriptRule(readText(path.join(workspace, ".claude", "settings.local.json"))),
     allowTrustedScripts: saved?.allowTrustedScripts ?? false,
+    allowSave: saved?.allowSave ?? false,
     trustedScripts: (saved?.trustedScripts ?? []).join(", "),
     printer: typeof saved?.printer === "string" ? saved.printer : saved?.printer && typeof saved.printer === "object" ? "custom" : "",
     ignoreClientConfig: saved?.ignoreClientConfig ?? true,
@@ -114,6 +116,7 @@ function html(state: PanelState): string {
     <p class="muted">Claude Code runs the read-only VSBlender tools (session_info, context_pack, preview, ingest, describe, find, api and the like) without asking. Tools that change Blender still ask.</p>
     <label><input type="checkbox" id="allowScripts" ${state.allowScripts ? "checked" : ""}> Also let Claude Code run scripts in Blender without asking (run_script runs any Python). Saved in .claude/settings.local.json, which is personal and not committed.</label>
     <label><input type="checkbox" id="allowTrustedScripts" ${state.allowTrustedScripts ? "checked" : ""}> Let Claude Code run scripts from trusted folders without asking (run_project_script), while run_script still asks. Anything the AI can write into those folders then runs unasked; Claude Code still asks before it edits files.</label>
+    <label><input type="checkbox" id="allowSave" ${state.allowSave ? "checked" : ""}> Let the AI save the .blend (the save tool runs without asking, and runs can pass save: true). Off: the save tool asks you each time. Checkpoints keep unsaved work safe either way.</label>
     <label>Trusted script folders (comma separated, workspace relative) <input type="text" id="trustedScripts" value="${escapeAttr(state.trustedScripts)}" placeholder="Models/scripts"></label>
     <label><input type="checkbox" id="ignoreClientConfig" ${state.ignoreClientConfig ? "checked" : ""}> Keep the MCP config files out of git. .mcp.json and the others hold paths for this machine; each person runs setup.</label>
   </fieldset>
@@ -151,6 +154,7 @@ function html(state: PanelState): string {
         replaceLegacy: document.getElementById("replace").checked,
         allowScripts: document.getElementById("allowScripts").checked,
         allowTrustedScripts: document.getElementById("allowTrustedScripts").checked,
+        allowSave: document.getElementById("allowSave").checked,
         trustedScripts: document.getElementById("trustedScripts").value,
         printer: document.getElementById("printer").value,
         ignoreClientConfig: document.getElementById("ignoreClientConfig").checked
@@ -217,7 +221,7 @@ export async function showSetup(
 
   current.webview.onDidReceiveMessage(async (message: {
     type?: string; blender?: string; port?: number; clients?: unknown; replaceLegacy?: boolean;
-    allowScripts?: boolean; ignoreClientConfig?: boolean; allowTrustedScripts?: boolean; trustedScripts?: string; printer?: string;
+    allowScripts?: boolean; ignoreClientConfig?: boolean; allowTrustedScripts?: boolean; allowSave?: boolean; trustedScripts?: string; printer?: string;
   }) => {
     if (message.type === "launch") {
       await vscode.commands.executeCommand("vsblender.launch");
@@ -261,12 +265,13 @@ export async function showSetup(
     const saved = readConfig(workspace);
     const allowScripts = message.allowScripts === true;
     const allowTrustedScripts = message.allowTrustedScripts === true;
+    const allowSave = message.allowSave === true;
     const trustedScripts = String(message.trustedScripts ?? "").split(",").map((item) => item.trim()).filter(Boolean);
     const printer = typeof message.printer === "string" && message.printer && message.printer !== "custom" ? message.printer : undefined;
     const ignoreClientConfig = message.ignoreClientConfig !== false;
     const applied = applyWorkspace({
       workspace, extensionRoot, port, blender, clients, replaceLegacy, launch, allowScripts, ignoreClientConfig,
-      allowTrustedScripts, trustedScripts,
+      allowTrustedScripts, allowSave, trustedScripts,
       ...(printer ? { printer } : {}),
       ...(saved?.checkpoints ? { checkpoints: saved.checkpoints } : {}),
       ...(saved?.libPaths ? { libPaths: saved.libPaths } : {}),

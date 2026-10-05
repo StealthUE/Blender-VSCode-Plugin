@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { AUTO_APPROVE, claudeRule, PIPELINE_TOOL, SCRIPT_TOOL, TOOL_NAMES, TRUSTED_SCRIPT_TOOL } from "./toolDefs";
+import { AUTO_APPROVE, claudeRule, PIPELINE_TOOL, SAVE_TOOL, SCRIPT_TOOL, TOOL_NAMES, TRUSTED_PIPELINE_TOOL, TRUSTED_SCRIPT_TOOL } from "./toolDefs";
 import { ServerLaunch, SERVER_NAME } from "./types";
 
 export interface LaunchInput {
@@ -104,9 +104,13 @@ export function claudeServerEntry(launch: ServerLaunch): JsonRecord {
   return { command: launch.command, args: launch.args, env: launch.env };
 }
 
-/** Cline reads alwaysAllow from the server entry: the read-only tools, plus the script tools when allowed. */
-export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean, allowTrusted = false): JsonRecord {
-  const extra = [...(allowScripts ? [SCRIPT_TOOL, PIPELINE_TOOL] : []), ...(allowScripts || allowTrusted ? [TRUSTED_SCRIPT_TOOL] : [])];
+/** Cline reads alwaysAllow from the server entry: the read-only tools, plus the script and save tools when allowed. */
+export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean, allowTrusted = false, allowSave = false): JsonRecord {
+  const extra = [
+    ...(allowScripts ? [SCRIPT_TOOL, PIPELINE_TOOL] : []),
+    ...(allowScripts || allowTrusted ? [TRUSTED_SCRIPT_TOOL, TRUSTED_PIPELINE_TOOL] : []),
+    ...(allowSave ? [SAVE_TOOL] : []),
+  ];
   return { ...claudeServerEntry(launch), alwaysAllow: [...AUTO_APPROVE, ...extra], disabled: false };
 }
 
@@ -173,10 +177,13 @@ const GITIGNORE_BASE = [
   ".blender-ai/jobs/",
   ".blender-ai/renders/",
   ".blender-ai/references/",
-  ".blender-ai/**/state.json",
-  ".blender-ai/**/previews/",
-  ".blender-ai/**/checkpoints/",
-  ".blender-ai/**/texts/",
+  // Sidecars sit next to each .blend, in any folder: unanchored patterns.
+  "**/.blender-ai/_archive/",
+  "**/.blender-ai/**/state.json",
+  "**/.blender-ai/**/previews/",
+  "**/.blender-ai/**/checkpoints/",
+  "**/.blender-ai/**/texts/",
+  "**/.blender-ai/**/refs/",
   ".claude/settings.local.json",
 ];
 
@@ -249,20 +256,26 @@ export const mergeClaudeDeny = mergeClaudeSettings;
  * asking". allow undefined leaves the file as it is.
  */
 export function mergeClaudeLocal(existing: string | undefined, allowScripts: boolean | undefined,
-  allowTrusted?: boolean): string | undefined {
-  if (allowScripts === undefined && allowTrusted === undefined) return existing;
+  allowTrusted?: boolean, allowSave?: boolean): string | undefined {
+  if (allowScripts === undefined && allowTrusted === undefined && allowSave === undefined) return existing;
   const settings = parseSettings(existing);
   if (!settings) return undefined;
   const permissions = isRecord(settings["permissions"]) ? { ...settings["permissions"] } : {};
   let allow = ruleList(permissions, "allow");
   const want = new Map<string, boolean>();
-  // run_script and run_pipeline run any workspace script; run_project_script only trusted folders.
+  // run_script and run_pipeline run any workspace script; run_project_script and run_project_pipeline
+  // only trusted folders.
   if (allowScripts !== undefined) {
     want.set(claudeRule(SCRIPT_TOOL), allowScripts);
     want.set(claudeRule(PIPELINE_TOOL), allowScripts);
   }
   const trusted = allowTrusted ?? (allowScripts === true ? true : undefined);
-  if (trusted !== undefined) want.set(claudeRule(TRUSTED_SCRIPT_TOOL), trusted || allowScripts === true);
+  if (trusted !== undefined) {
+    want.set(claudeRule(TRUSTED_SCRIPT_TOOL), trusted || allowScripts === true);
+    want.set(claudeRule(TRUSTED_PIPELINE_TOOL), trusted || allowScripts === true);
+  }
+  // Saving the user's file is its own decision.
+  if (allowSave !== undefined) want.set(claudeRule(SAVE_TOOL), allowSave);
   let changed = false;
   for (const [rule, on] of want) {
     const has = allow.includes(rule);

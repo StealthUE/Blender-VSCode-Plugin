@@ -19,6 +19,13 @@ export function gotchasFor(version: string): string[] {
     "A negative scale flips the winding: normals point in after applying it. Exporters that ignore the sign flip the model inside out; check_model flags it.",
     "Lengths are Blender units. In a print_mm project 1 unit = 1 mm: the default cube is 2 mm, and light power, physics and camera clipping are still per unit. vsblender.mm()/m() convert real sizes.",
     "glTF and USD are metres by definition. export_model scales a millimetre scene to metres for them; STL and 3MF are written in millimetres.",
+    "geo.lathe and polar_block measure angles counter-clockwise from +X. Gates, dials and clock faces think clockwise from the top seen from the front: use geo.ring(up=, front=) (ring.pt, ring.theta, ring.on, ring.band, ring.pattern) instead of converting by hand.",
+    "Solid.to_object writes world-space geometry into an object's current pose. For a child of a rotated root, or an object whose transform is keyed, build in its own frame and pass space=\"local\" (and parent=).",
+    "set_keys only adds keys: a re-run keeps the old ones. Pass replace=True, or call vsblender.clear_keys(target) first.",
+    "geo.finish() after booleans welds touching shells into coincident faces. Use Solid.clean() for the zero-area slivers booleans leave. A cutter whose shells overlap each other cuts crescents: pass union_cutters=True.",
+    "Keyed hide_viewport takes an object out of the depsgraph: its evaluated mesh is empty at those frames. check_model and describe say so and take frame=.",
+    "A reference mesh imported into the scene goes into every checkpoint and the saved file. import_reference keeps it in the sidecar; look at it with preview ref= or a solid overlay, measure it with measure ref=.",
+    "Blender's FFmpeg writer leaves an unplayable file while it writes. render as mp4 writes to a temporary name and moves the finished file into place; with ffmpeg it encodes H.264 yuv420p +faststart.",
   ];
   if (major < 5) return general;
   return [

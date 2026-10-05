@@ -26,6 +26,7 @@ const PRIORITY = [
   "object tree",
   "materials",
   "animation",
+  "animation beats",
   "parameters",
   "built by scripts",
   "text blocks inside the .blend",
@@ -136,6 +137,7 @@ function keepForFocus(heading: string, line: string, set: FocusSet): boolean {
     case "materials":
       return lineCovers(line, material, set.materials);
     case "animation":
+    case "animation beats":
       return lineCovers(line, object, set.objects) || lineCovers(line, material, set.materials);
     case "built by scripts":
       return [...set.objects].some((name) => line.includes(name)) || lineCovers(line.replace(/^-\s*`[^`]*`:\s*/, "- **") + "**", object, set.objects);
@@ -199,7 +201,7 @@ export function packNotes(markdown: string, budgetTokens: number, focus?: string
     const force = key === "" || REQUIRED.has(key);
     let body = section.body;
     if (focus && !force) {
-      if (["object tree", "materials", "animation", "previews", "parameters", "built by scripts"].includes(key)) {
+      if (["object tree", "materials", "animation", "animation beats", "previews", "parameters", "built by scripts"].includes(key)) {
         body = focusFilter(section.heading, section.body, focus, set);
         if (!body.split(/\r?\n/).some((line) => /^\s*- /.test(line))) continue;
       } else if (!`${section.heading}\n${body}`.toLowerCase().includes(focus.toLowerCase())) {

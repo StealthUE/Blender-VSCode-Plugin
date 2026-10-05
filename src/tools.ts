@@ -6,13 +6,16 @@ import * as path from "path";
 import { listBlendFiles, relativeTo, resolveInside, sidecarDir } from "./blendFiles";
 import { BridgeResponse, callBridge, cancelScript, ChangeReport, formatChanges, probeBridge } from "./bridge";
 import { buildContextPack } from "./contextPack";
+import { journalIntent, notesPathFor, writeIntent } from "./notes";
 import { runDoctor } from "./doctor";
 import { gotchasFor } from "./gotchas";
 import { ingestScript, runIngest } from "./ingest";
 import * as jobs from "./jobs";
 import * as modeling from "./modeling";
+import { findFfmpeg } from "./ffmpeg";
 import { describePrinter, printerParams, resolvePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
+import { importReference } from "./references";
 import { compare, diff, reference, setRole } from "./review";
 import {
   CallExtras,
@@ -65,7 +68,21 @@ export function loadWorkspaceContext(env: NodeJS.ProcessEnv = process.env, cwd =
     libPaths: config?.libPaths ?? DEFAULT_LIB_PATHS,
     ...(config?.printer !== undefined ? { printer: config.printer } : {}),
     ...(config?.trustedScripts ? { trustedScripts: config.trustedScripts } : {}),
+    ...(config?.allowSave !== undefined ? { allowSave: config.allowSave } : {}),
+    ...(config?.referenceRoots ? { referenceRoots: config.referenceRoots } : {}),
+    ...(config?.sharedLibs ? { sharedLibs: config.sharedLibs } : {}),
+    ...(config?.ffmpeg ? { ffmpeg: config.ffmpeg } : {}),
   };
+}
+
+/** Folders scripts import from: libPaths, then another project's shared folders (sharedLibs). */
+export function importPaths(ctx: WorkspaceContext): string[] {
+  return [...ctx.libPaths, ...(ctx.sharedLibs ?? []).filter((entry) => !ctx.libPaths.includes(entry))];
+}
+
+/** Absolute folders outside the workspace that read-only tools may read reference files from. */
+export function referenceRoots(ctx: WorkspaceContext): string[] {
+  return (ctx.referenceRoots ?? []).map((entry) => path.resolve(ctx.workspace, entry));
 }
 
 export function ok(text: string, extra?: Partial<ToolOutcome>): ToolOutcome {
@@ -216,12 +233,23 @@ export async function doctor(ctx: WorkspaceContext, fix: boolean): Promise<ToolO
   return report.ok ? ok(report.text, { details: report.checks }) : fail(report.text, report.checks);
 }
 
-export async function sessionInfo(ctx: WorkspaceContext): Promise<ToolOutcome> {
+/** Blender versions whose gotcha sheet this server process has already sent. */
+const gotchasSent = new Set<string>();
+
+export async function sessionInfo(ctx: WorkspaceContext, args: Record<string, unknown> = {}): Promise<ToolOutcome> {
   try {
     const response = await callBridge(ctx.port, "session_info", {}, 15000);
     if (!response.ok) return fail(response.error || "session_info failed");
     const version = String(response.result?.["blender_version"] ?? "");
     const { profile, warnings } = resolvePrinter(ctx.printer);
+    // The sheet is about 1.5k tokens: sent the first time per Blender version, or when asked for.
+    const mode = typeof args["gotchas"] === "string" ? args["gotchas"] : "new";
+    let gotchas: string[] | string;
+    if (mode === "none") gotchas = "left out (gotchas: \"all\" lists them)";
+    else if (mode === "all" || !gotchasSent.has(version)) {
+      gotchas = gotchasFor(version);
+      gotchasSent.add(version);
+    } else gotchas = `sent earlier in this session for Blender ${version} (gotchas: "all" repeats them)`;
     const info = {
       ...response.result,
       workspace: ctx.workspace,
@@ -229,7 +257,8 @@ export async function sessionInfo(ctx: WorkspaceContext): Promise<ToolOutcome> {
       printer: ctx.printer !== undefined
         ? `${describePrinter(profile)}${warnings.length ? ` (${warnings.join("; ")})` : ""}`
         : `none set (purpose print uses ${describePrinter(profile)}); set "printer" in .blender-ai/config.json`,
-      gotchas: gotchasFor(version),
+      save: ctx.allowSave ? "the user lets the AI save (save tool, save: true on runs)" : "the save tool asks the user; save: true on runs is off",
+      gotchas,
     };
     return ok(JSON.stringify(info, null, 2), { details: info });
   } catch (error) {
@@ -315,6 +344,50 @@ function changesText(report: ChangeReport | undefined): string {
   return lines.length ? `changes:\n  ${lines.join("\n  ")}` : "changes: none";
 }
 
+/** save: true on a script tool saves the user's file, which only the user can allow (allowSave in setup). */
+export function saveRefusal(ctx: WorkspaceContext, args: Record<string, unknown>): string | undefined {
+  if (args["save"] !== true || ctx.allowSave === true) return undefined;
+  return "save: true needs the user's permission: tick \"Let the AI save the .blend\" in VSBlender: Setup "
+    + "(\"allowSave\": true in .blender-ai/config.json). Run without save, then call the save tool, which asks the user.";
+}
+
+export function checkpointParams(ctx: WorkspaceContext, args: Record<string, unknown>): Record<string, unknown> {
+  return {
+    auto: ctx.checkpoints.auto && args["checkpoint"] !== false,
+    keep: ctx.checkpoints.keep,
+    max_mb: ctx.checkpoints.maxMb,
+    budget_mb: ctx.checkpoints.budgetMb,
+  };
+}
+
+function mb(bytes: unknown): string {
+  return `${(Number(bytes) / 1e6).toFixed(1)} MB`;
+}
+
+/** The checkpoint a run took, with its size and what all checkpoints of the file take, or why there is none. */
+export function checkpointLine(result: Record<string, unknown>, what: string): string {
+  const id = typeof result["checkpoint"] === "string" ? result["checkpoint"] : "";
+  if (!id) return `checkpoint: ${String(result["checkpoint_note"] ?? "none")}`;
+  let line = `checkpoint: ${id} (restore_checkpoint ${id} undoes ${what})`;
+  if (result["checkpoint_bytes"] !== undefined) {
+    line += `; ${mb(result["checkpoint_bytes"])}, ${String(result["checkpoints_count"])} checkpoints take ${mb(result["checkpoints_total_bytes"])}`;
+  }
+  if (Array.isArray(result["checkpoints_dropped"]) && result["checkpoints_dropped"].length) {
+    line += `; dropped the oldest to stay within the budget: ${(result["checkpoints_dropped"] as string[]).join(", ")}`;
+  }
+  return line;
+}
+
+/** The last lines of a run: what was saved, and what the file on disk does not have yet. */
+export function saveLines(result: Record<string, unknown>): string[] {
+  const lines: string[] = [];
+  const saved = result["saved"] as Record<string, unknown> | undefined;
+  if (saved && typeof saved === "object") lines.push(`saved: ${String(saved["saved"])} (${mb(saved["bytes"])})`);
+  const unsaved = result["unsaved"] as Record<string, unknown> | undefined;
+  if (unsaved && typeof unsaved === "object" && !saved) lines.push(`unsaved changes: ${String(unsaved["text"] ?? "")}`);
+  return lines;
+}
+
 export async function runScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   if (typeof args["path"] !== "string" || !args["path"].trim()) return fail("path is required");
   let script: string;
@@ -326,14 +399,19 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
   if (!script.toLowerCase().endsWith(".py")) return fail("path must be a .py file");
   if (!fs.existsSync(script)) return fail(`file not found: ${args["path"]}`);
   const reason = typeof args["reason"] === "string" ? args["reason"].trim() : "";
+  const refused = saveRefusal(ctx, args);
+  if (refused) return fail(refused);
   const params: Record<string, unknown> = {
     path: script,
     reason,
     actor: "ai",
-    checkpoint: { auto: ctx.checkpoints.auto && args["checkpoint"] !== false, keep: ctx.checkpoints.keep, max_mb: ctx.checkpoints.maxMb },
-    lib_paths: ctx.libPaths,
+    checkpoint: checkpointParams(ctx, args),
+    lib_paths: importPaths(ctx),
+    reference_roots: referenceRoots(ctx),
     printer: printerContext(ctx),
   };
+  if (args["save"] === true) params["save"] = true;
+  if (args["allow_references"] === true) params["allow_references"] = true;
   if (typeof args["atomic"] === "boolean") params["atomic"] = args["atomic"];
   if (typeof args["function"] === "string" && args["function"]) params["function"] = args["function"];
   if (args["args"] && typeof args["args"] === "object") params["args"] = args["args"];
@@ -348,11 +426,10 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
     }
     const result = response.result ?? {};
     const report = result["changes"] as ChangeReport | undefined;
-    const checkpoint = typeof result["checkpoint"] === "string" ? result["checkpoint"] : "";
     const lines = [
       `file: ${rel}`,
       `result: ${JSON.stringify(result["result"])}`,
-      checkpoint ? `checkpoint: ${checkpoint} (restore_checkpoint ${checkpoint} undoes this script)` : "checkpoint: none (nothing changed, or checkpoints are off)",
+      checkpointLine(result, "this script"),
       changesText(report),
     ];
     if (typeof result["provenance"] === "string") lines.push(`provenance: ${result["provenance"]}`);
@@ -363,11 +440,15 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
       lines.push(`now out of date: ${(result["out_of_date"] as string[]).join(", ")} (pipeline.json or their rerun-after header). `
         + "Run them again, or run_pipeline from this step.");
     }
+    if (Array.isArray(result["not_run_yet"]) && result["not_run_yet"].length) {
+      lines.push(`later steps that have not run yet: ${(result["not_run_yet"] as string[]).join(", ")}`);
+    }
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
     const stdout = typeof result["stdout"] === "string" ? result["stdout"] : "";
     const stderr = typeof result["stderr"] === "string" ? result["stderr"] : "";
     if (stdout.trim()) lines.push(`stdout:\n${stdout.trimEnd()}`);
     if (stderr.trim()) lines.push(`stderr:\n${stderr.trimEnd()}`);
+    lines.push(...saveLines(result));
     return ok(lines.join("\n"), { details: { ...result, changed: response.changed ?? [] } });
   } catch (error) {
     if (/timed out/i.test(errorText(error))) {
@@ -460,10 +541,29 @@ export async function ingest(ctx: WorkspaceContext, args: Record<string, unknown
   return ok(summary, { details: result });
 }
 
+export async function notes(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const text = typeof args["intent"] === "string" ? args["intent"].trim() : "";
+  if (!text) return fail("intent is required: what the next session must know (where sizes live, conventions, what to re-run, what is keyed)");
+  const mode = args["mode"] === "replace" ? "replace" : "append";
+  let blend: string;
+  try {
+    blend = await currentBlend(ctx, args["path"]);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  const file = notesPathFor(blend);
+  if (!fs.existsSync(file)) return fail(`${relativeTo(ctx.workspace, blend)} has no NOTES.md yet. Call ingest first.`);
+  const section = writeIntent(file, text, mode);
+  journalIntent(blend, ctx.workspace, mode, text);
+  return ok(`${mode === "replace" ? "rewrote" : "added to"} Intent & constraints in ${relativeTo(ctx.workspace, file)} `
+    + `(${section.split(/\r?\n/).length} line(s)); re-ingests keep it, and context_pack always includes it.`);
+}
+
 export async function contextPack(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
   let blend: string;
   try {
-    blend = pickBlend(ctx, args["path"]);
+    // The file named, else the one open in Blender, else the only one.
+    blend = await currentBlend(ctx, args["path"]);
   } catch (error) {
     return fail(errorText(error));
   }
@@ -513,7 +613,7 @@ export function tempPng(prefix: string): string {
 
 const PREVIEW_KEYS = ["view", "shading", "size", "width", "height", "aspect", "target", "isolate", "projection", "samples",
   "compositor", "dof", "motion_blur", "views", "framing", "crop", "region", "overlay", "cavity", "outline", "shadow", "matcap",
-  "xray", "color_type", "material"];
+  "xray", "color_type", "material", "camera", "ref", "with_scene"];
 
 export function previewParams(args: Record<string, unknown>): Record<string, unknown> {
   const params: Record<string, unknown> = {};
@@ -529,7 +629,7 @@ export function previewParams(args: Record<string, unknown>): Record<string, unk
 
 export async function preview(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   const out = tempPng(`preview-${String(args["view"] ?? "iso")}`);
-  const params = { ...previewParams(args), out };
+  const params = { ...previewParams(args), out, reference_roots: referenceRoots(ctx) };
   const timeout = 240000;
   try {
     const routed = await routeCall(ctx, "preview", params, timeout, args["path"], extras);
@@ -542,6 +642,8 @@ export async function preview(ctx: WorkspaceContext, args: Record<string, unknow
     const lines = [
       sourceNote(ctx, routed).trim(),
       result["material"] ? `material ball: ${String(result["material"])}` : "",
+      Array.isArray(result["reference"]) ? `reference (from references.json, not in the file): ${(result["reference"] as string[]).join(", ")}` : "",
+      result["camera"] ? `camera: ${String(result["camera"])}` : "",
       result["views"] ? `views: ${(result["views"] as string[]).join(", ")}` : `view: ${String(result["view"] ?? "")}`,
       `shading: ${String(result["shading"] ?? "")} (${String(result["engine"] ?? "")})`,
       `size: ${String(result["width"])}x${String(result["height"])}`,
@@ -598,10 +700,19 @@ function renderOutput(ctx: WorkspaceContext, id: string, mode: string, requested
 
 export async function render(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   if (!ctx.blender || !fs.existsSync(ctx.blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
-  const frames = args["frames"] && typeof args["frames"] === "object" ? args["frames"] as Record<string, unknown> | number[] : undefined;
+  let frames = args["frames"] && typeof args["frames"] === "object" ? args["frames"] as Record<string, unknown> | number[] : undefined;
   const mode = typeof args["as"] === "string" && args["as"] ? args["as"] : frames ? "sheet" : "still";
   if (!["still", "frames", "sheet", "mp4"].includes(mode)) return fail("as must be still, frames, sheet or mp4");
   if (mode === "still" && frames) return fail("as=still renders one frame; pass frame, or as=frames/sheet/mp4 with frames");
+  if (mode === "sheet" && !frames) return fail("as=sheet needs frames: a list such as [1, 36, 216, 260], or {start, end, step}");
+  // A video or a frame sequence of one frame is never what was asked for: without frames they cover
+  // the scene's frame range, and the reply says so.
+  let defaulted = "";
+  if (!frames && (mode === "mp4" || mode === "frames")) {
+    if (args["frame"] !== undefined) return fail(`as=${mode} renders a range: pass frames {start, end, step}, not frame`);
+    frames = {};
+    defaulted = "the scene's frame range (no frames given)";
+  }
   if (frames) {
     const problem = await checkFrames(ctx, frames, mode, args["max_tiles"]);
     if (problem) return fail(problem);
@@ -658,20 +769,36 @@ export async function render(ctx: WorkspaceContext, args: Record<string, unknown
   else if (args["frame"] !== undefined) spec["frame"] = Number(args["frame"]);
   if (typeof args["camera"] === "string" && args["camera"]) spec["camera"] = args["camera"];
   if (scene) spec["scene"] = scene;
+  if (mode === "mp4") {
+    const ffmpeg = findFfmpeg(ctx.ffmpeg);
+    if (ffmpeg) spec["ffmpeg"] = ffmpeg;
+    if (args["keep_frames"] === true) spec["keep_frames"] = true;
+  }
+  let label = `${mode} render of ${source}`;
+  if (defaulted) {
+    const range = frames && !Array.isArray(frames) && frames["start"] !== undefined ? ` ${String(frames["start"])}-${String(frames["end"])}` : "";
+    label += `; frames: ${defaulted}${range}`;
+  }
   let job: jobs.Job;
   try {
-    job = jobs.startJob(ctx, id, { blend, spec, kind: "render", label: `${mode} render of ${source}`, ...(scratch ? { scratch } : {}), autoexec });
+    job = jobs.startJob(ctx, id, { blend, spec, kind: "render", label, ...(scratch ? { scratch } : {}), autoexec });
   } catch (error) {
     return fail(errorText(error));
   }
   const wait = Math.max(0, Math.min(600, args["wait_seconds"] === undefined ? 90 : Number(args["wait_seconds"]) || 0)) * 1000;
-  const poll = extras.progress ? setInterval(() => extras.progress?.(jobs.fraction(job), `rendering ${job.progress.done + 1}/${job.progress.total}`), 1000) : undefined;
+  const poll = extras.progress ? setInterval(() => extras.progress?.(jobs.fraction(job), job.progress.stage === "encoding"
+    ? `encoding ${job.progress.total} frames`
+    : `rendering ${Math.min(job.progress.done + 1, job.progress.total)}/${job.progress.total}`), 1000) : undefined;
   await jobs.waitFor(job, wait, extras.signal);
   if (poll) clearInterval(poll);
   return jobReply(ctx, job);
 }
 
-/** Frame lists and ranges: not empty, end after start, mp4 needs a range, and a sheet has at most max_tiles tiles. */
+/**
+ * Frame lists and ranges: not empty, end after start, mp4 needs a range of 2 frames or more, and a
+ * sheet has at most max_tiles tiles. A range missing start or end is completed from the open scene
+ * (in place); with Blender closed the job uses the saved file's range.
+ */
 async function checkFrames(ctx: WorkspaceContext, frames: Record<string, unknown> | number[], mode: string, maxTiles: unknown): Promise<string | undefined> {
   let count: number;
   if (Array.isArray(frames)) {
@@ -687,13 +814,20 @@ async function checkFrames(ctx: WorkspaceContext, frames: Record<string, unknown
         const info = await callBridge(ctx.port, "session_info", {}, 8000);
         if (!Number.isFinite(start)) start = Number(info.result?.["frame_start"] ?? 1);
         if (!Number.isFinite(end)) end = Number(info.result?.["frame_end"] ?? start);
+        frames["start"] = start;
+        frames["end"] = end;
       } catch {
-        if (!Number.isFinite(start) || !Number.isFinite(end)) return "frames needs start and end when Blender is not running";
+        // Blender is closed: the job reads the range from the saved file and checks it there.
+        if (mode === "mp4" || mode === "frames") return undefined;
+        return "frames needs start and end when Blender is not running";
       }
     }
     if (end < start) return `frames end ${end} is before start ${start}`;
     const step = Math.max(1, Number(frames["step"]) || 1);
     count = Math.floor((end - start) / step) + 1;
+  }
+  if (mode === "mp4" && count < 2) {
+    return `as=mp4 of ${count} frame is not a video. Pass frames {start, end} covering 2 frames or more, or use as=still.`;
   }
   const cap = Math.max(1, Math.min(36, Number(maxTiles) || 16));
   if (mode === "sheet" && count > cap) {
@@ -732,6 +866,80 @@ export async function cancelJob(_ctx: WorkspaceContext, args: Record<string, unk
   return jobs.cancel(id) ? ok(`cancelled ${id}`) : fail(`${id} is not a running job`);
 }
 
+// ----------------------------------------------------------------------------- saving
+export async function save(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const probe = await probeBridge(ctx.port);
+  if (!probe.ok) {
+    return fail(probe.state === "absent"
+      ? "Blender is not running, so there is nothing unsaved: the .blend on disk is the latest version."
+      : `${probe.detail}. Not saving.`);
+  }
+  const params: Record<string, unknown> = { reason: args["reason"] ?? null, actor: "ai", compress: args["compress"] !== false };
+  for (const key of ["allow_references", "overwrite"]) if (args[key] === true) params[key] = true;
+  if (typeof args["path"] === "string" && args["path"].trim()) {
+    try {
+      const abs = resolveInside(ctx.workspace, args["path"]);
+      if (!abs.toLowerCase().endsWith(".blend")) return fail("path must end in .blend");
+      params["path"] = abs;
+    } catch (error) {
+      return fail(errorText(error));
+    }
+  }
+  try {
+    const response = await callBridge(ctx.port, "save_file", params, 300000);
+    if (!response.ok) return fail(bridgeError(response, "save_file"));
+    const result = response.result ?? {};
+    const runs = Number(result["runs"] ?? 0);
+    const lines = [
+      `saved: ${String(result["saved"])} (${mb(result["bytes"])}${result["compress"] ? ", compressed" : ""})`,
+      runs ? `${runs} run(s) since the last save are in the file now.` : "There were no runs through the bridge since the last save.",
+      "Journaled with the reason. The watcher re-ingests the saved file; its change log says the changes came from the AI's runs.",
+    ];
+    if (Array.isArray(result["references_kept"])) lines.push(`kept reference objects in the file (allow_references): ${(result["references_kept"] as string[]).join(", ")}`);
+    return ok(lines.join("\n"), { details: result });
+  } catch (error) {
+    return fail(bridgeFailure(ctx.port, error, 300000));
+  }
+}
+
+// ----------------------------------------------------------------------------- append
+export async function append(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const from = typeof args["from"] === "string" ? args["from"].trim() : "";
+  if (!from) return fail("from is required: the workspace .blend to copy objects from");
+  let source: string;
+  try {
+    source = resolveInside(ctx.workspace, from);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  if (!source.toLowerCase().endsWith(".blend") || !fs.existsSync(source)) return fail(`not a .blend in the workspace: ${from}`);
+  const objects = typeof args["objects"] === "string" ? [args["objects"]] : Array.isArray(args["objects"]) ? args["objects"] : [];
+  if (!objects.length) return fail("objects is required: names or globs, e.g. [\"SG DHD*\"]");
+  const params: Record<string, unknown> = {
+    from: source, objects, reason: args["reason"] ?? null, actor: "ai", checkpoint: checkpointParams(ctx, args),
+    with_children: args["with_children"] !== false,
+  };
+  if (typeof args["collection"] === "string" && args["collection"].trim()) params["collection"] = args["collection"].trim();
+  try {
+    const response = await callBridge(ctx.port, "append_objects", params, 300000);
+    if (!response.ok) return fail(bridgeError(response, "append_objects"));
+    const result = response.result ?? {};
+    const appended = (result["appended"] as string[] | undefined) ?? [];
+    const lines = [
+      `appended ${appended.length} object(s) from ${relativeTo(ctx.workspace, source)} into collection ${String(result["collection"])}: `
+        + `${appended.slice(0, 20).join(", ")}${appended.length > 20 ? ` (+${appended.length - 20} more)` : ""}`,
+      "Each records where it came from (ai_appended_from, ai_appended_object): describe shows it, find from:<file> selects them.",
+      checkpointLine(result, "the append"),
+      changesText(result["changes"] as ChangeReport | undefined),
+    ];
+    if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
+    lines.push(...saveLines(result));
+    return ok(lines.join("\n"), { details: result });
+  } catch (error) {
+    return fail(bridgeFailure(ctx.port, error, 300000));
+  }
+}
+
 // ----------------------------------------------------------------------------- history
 export async function checkpoint(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
   const label = typeof args["label"] === "string" && args["label"].trim() ? args["label"].trim() : "manual";
@@ -759,7 +967,7 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
     case "doctor_fix":
       return doctor(ctx, true);
     case "session_info":
-      return sessionInfo(ctx);
+      return sessionInfo(ctx, args);
     case "launch_blender":
       return launchBlender(ctx, args, false);
     case "launch_blender_background":
@@ -770,6 +978,8 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
       return ingest(ctx, args);
     case "context_pack":
       return contextPack(ctx, args);
+    case "notes":
+      return notes(ctx, args);
     case "preview":
       return preview(ctx, args, extras);
     case "render":
@@ -782,12 +992,19 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
       return checkpoint(ctx, args);
     case "restore_checkpoint":
       return restoreCheckpoint(ctx, args);
+    case "save":
+      return save(ctx, args);
+    case "append":
+      return append(ctx, args);
+    case "import_reference":
+      return importReference(ctx, args, extras);
     case "api":
-      return bridgeTool(ctx, "api", { query: args["query"] }, 30000);
+      return bridgeTool(ctx, "api", { query: args["query"], inherited: args["inherited"] === true }, 30000);
     case "node_schema":
       return bridgeTool(ctx, "node_schema", { bl_idname: args["bl_idname"], props: args["props"] ?? null }, 30000);
     case "describe":
-      return bridgeTool(ctx, "describe", { target: args["target"] }, 60000, undefined, args["path"], extras);
+      return bridgeTool(ctx, "describe", { target: args["target"], ...(args["frame"] !== undefined ? { frame: Number(args["frame"]) } : {}) },
+        60000, undefined, args["path"], extras);
     case "find":
       return bridgeTool(ctx, "find", { selector: args["selector"], limit: args["limit"] ?? 100 }, 60000, undefined, args["path"], extras);
     case "spatial":
@@ -806,6 +1023,8 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
       return modeling.runPipeline(ctx, args, extras);
     case "run_project_script":
       return modeling.runProjectScript(ctx, args, extras);
+    case "run_project_pipeline":
+      return modeling.runProjectPipeline(ctx, args, extras);
     case "set_role":
       return setRole(ctx, args);
     case "diff":
@@ -813,7 +1032,7 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
     case "compare":
       return compare(ctx, args, extras);
     case "reference":
-      return reference(ctx, args);
+      return reference(ctx, args, extras);
     default:
       return fail(`unknown tool ${name}`);
   }

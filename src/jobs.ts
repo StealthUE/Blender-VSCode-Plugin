@@ -15,6 +15,8 @@ export interface JobProgress {
   total: number;
   frame?: number;
   samples?: [number, number];
+  /** rendering, encoding: what a video job is doing. */
+  stage?: string;
 }
 
 export interface Job {
@@ -68,6 +70,7 @@ export function parseJobLine(job: Job, line: string): void {
       const data = JSON.parse(line.slice("VSB_PROGRESS ".length)) as Partial<JobProgress>;
       job.progress = { ...job.progress, done: Number(data.done ?? 0), total: Number(data.total ?? 1) };
       if (data.frame !== undefined) job.progress.frame = Number(data.frame);
+      if (typeof data.stage === "string") job.progress.stage = data.stage;
       delete job.progress.samples;
     } catch {
       // A malformed progress line only costs a progress update.
@@ -245,14 +248,27 @@ export function describeJob(job: Job, workspace: string): string {
   const seconds = Math.round(((job.finished ?? Date.now()) - job.started) / 1000);
   const lines = [`${job.id}: ${job.state} (${job.label}, ${seconds}s)`];
   if (job.state === "running") {
-    const { done, total, frame, samples } = job.progress;
-    lines.push(`progress: ${Math.round(fraction(job) * 100)}% - frame ${Math.min(done + 1, total)} of ${total}`
-      + (frame !== undefined ? ` (frame ${frame})` : "") + (samples ? `, sample ${samples[0]}/${samples[1]}` : ""));
+    const { done, total, frame, samples, stage } = job.progress;
+    if (stage === "encoding") {
+      lines.push(`progress: all ${total} frames rendered, encoding the video. The file appears at its path when it is complete.`);
+    } else {
+      lines.push(`progress: ${Math.round(fraction(job) * 100)}% - ${done} of ${total} frame(s) rendered`
+        + (frame !== undefined ? `, now frame ${frame}` : "") + (samples ? `, sample ${samples[0]}/${samples[1]}` : ""));
+    }
   }
   const files = job.result?.["files"];
   if (Array.isArray(files) && files.length) {
     lines.push(`output: ${files.slice(0, 6).map(rel).join(", ")}${files.length > 6 ? ` (+${files.length - 6} more)` : ""}`);
   }
+  const expected = Number(job.result?.["frames_expected"]);
+  if (Number.isFinite(expected) && expected > 1) {
+    const rendered = Number(job.result?.["frames_rendered"] ?? expected);
+    const list = job.result?.["frames"];
+    const span = Array.isArray(list) && list.length ? ` (frames ${String(list[0])}-${String(list[list.length - 1])})` : "";
+    lines.push(`frames: ${rendered} of ${expected} rendered${span}`
+      + (job.result?.["fps"] ? ` at ${String(job.result["fps"])} fps, ${(expected / Number(job.result["fps"])).toFixed(1)} s` : ""));
+  }
+  if (typeof job.result?.["encoder"] === "string") lines.push(`encoder: ${job.result["encoder"]}`);
   if (job.result?.["resolution"]) lines.push(`resolution: ${JSON.stringify(job.result["resolution"])}, engine ${String(job.result["engine"] ?? "")}`);
   const warnings = job.result?.["warnings"];
   if (Array.isArray(warnings) && warnings.length) lines.push(`warnings: ${warnings.join("; ")}`);
