@@ -20,7 +20,7 @@ const targets = { description: "Objects: a name, a list of names, or a find sele
 const overlay = {
   type: "array",
   items: { type: "object" },
-  description: "Draw other geometry with the image, so hidden, wire-display or external references show: [{\"objects\": \"_REF *\" | \"file\": \"refs/part.stl\" (STL, OBJ, 3MF, SVG; part: an OBJ material/group; transform {location, rotation_deg, scale, units: mm}) | \"ref\": a references.json name (\"peg\", or \"peg/Chevron\" for one part), \"style\": \"wire\" | \"xray\" | \"silhouette\" (drawn over the image) | \"solid\" | \"cavity\" (shaded in the scene, hidden behind nearer geometry; temporary copies, never in the file), \"color\": \"#ff3010\", \"opacity\": 0.35}].",
+  description: "Draw other geometry or a show plate with the image. Geometry: [{\"objects\": \"_REF *\" | \"file\": \"refs/part.stl\" (STL, OBJ, 3MF, SVG; part: an OBJ material/group; transform {location, rotation_deg, scale, units: mm}) | \"ref\": a references.json name (\"peg\", or \"peg/Chevron\" for one part), \"style\": \"wire\" | \"xray\" | \"silhouette\" (drawn over the image) | \"solid\" | \"cavity\" (shaded in the scene, hidden behind nearer geometry; temporary copies, never in the file), \"color\": \"#ff3010\", \"opacity\": 0.35}]. A plate: {\"image\": \"plates/chevron.png\"} or {\"video\": \"plates/dial.mp4\", \"time\": 52}, placed with box [x0, y0, x1, y1] (fractions, (0, 0) top left; default the whole frame), corners (four [x, y] fractions), or region (a 3D box projected through this camera). mode \"overlay\" (default) draws it in the frame; mode \"diff\" returns a triptych of the render, the plate and where they disagree.",
 };
 const saveArg = { type: "boolean", description: "Save the .blend after a successful run (journaled). Only when the user allowed it in setup (allowSave); otherwise refused." };
 const allowReferences = { type: "boolean", description: "With save: save even though reference objects (vsblender_reference, _REF*) are in the scene." };
@@ -59,8 +59,10 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "doctor_fix",
-    description: "Repair: reinstall the add-on into Blender (runs a headless Blender, 10-60 s) and rewrite the MCP config and guide files. Restart Blender afterwards to load the new add-on.",
-    inputSchema: obj({}),
+    description: "Repair: reinstall the add-on into Blender (runs a headless Blender, 10-60 s) and rewrite the MCP config and guide files. Restart Blender afterwards to load the new add-on. archive: true also moves orphan sidecars (a .blend that was renamed or deleted) into .blender-ai/_archive/.",
+    inputSchema: obj({
+      archive: { type: "boolean", description: "Move orphan sidecars to .blender-ai/_archive/. Default false: they are reported and left where they are." },
+    }),
   },
   {
     name: "session_info",
@@ -109,7 +111,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "run_script",
-    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`. Set `result`, or pass function and args. The reply ends with what is unsaved; the .blend is never saved unless save is passed (and allowed).",
+    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`, `# vsblender: reads NAME`, `# vsblender: exports NAME` (an out-of-date warning then names the values that changed). `result` is a global, or the value main() returns. Or pass function and args. background: true runs the script on a copy in a headless Blender and throws the copy away: nothing is checkpointed, journaled, or written to the open file. The reply starts with how many runs the file on disk does not have; the .blend is never saved unless save is passed (and allowed).",
     inputSchema: obj({
       path: { type: "string", description: "Workspace .py file. Keep model scripts next to their .blend: <blend folder>/scripts/, shared code in <blend folder>/scripts/lib/." },
       reason: { type: "string", description: "Why: goes into the journal and the NOTES change log. Give one for every change." },
@@ -120,6 +122,7 @@ export const TOOLS: ToolDef[] = [
       atomic: { type: "boolean", description: "Default true: a failed or cancelled run is rolled back. false keeps the partial changes." },
       save: saveArg,
       allow_references: allowReferences,
+      background: { type: "boolean", description: "Run on a copy in a headless Blender and throw the copy away. Nothing is checkpointed, journaled, or written to the open file. The reply is stdout, stderr and result." },
     }, ["path"]),
   },
   {
@@ -135,7 +138,24 @@ export const TOOLS: ToolDef[] = [
       atomic: { type: "boolean" },
       save: saveArg,
       allow_references: allowReferences,
+      background: { type: "boolean", description: "Run on a copy in a headless Blender and throw the copy away. The open file is unchanged." },
     }, ["path"]),
+  },
+  {
+    name: "open_blend",
+    description: "Open a workspace .blend in the Blender that is already listening. Refuses when that file has unsaved changes, and refuses a path outside the workspace. Journaled as an open. To start Blender, use launch_blender.",
+    inputSchema: obj({
+      path: { type: "string", description: "Workspace .blend." },
+      reason: { type: "string" },
+    }, ["path"]),
+  },
+  {
+    name: "replay",
+    description: "The journaled script runs since the last save, in order: script, sha and reason. Lists them unless run is true, which executes them on the open file (each run is journaled again). A script whose sha no longer matches the file on disk is named and skipped unless force is true.",
+    inputSchema: obj({
+      run: { type: "boolean", description: "Execute the runs. Default false: list them." },
+      force: { type: "boolean", description: "Run a script even when its sha does not match the file on disk." },
+    }),
   },
   {
     name: "run_pipeline",
@@ -236,6 +256,7 @@ export const TOOLS: ToolDef[] = [
       dof: { type: "boolean", description: "Use the camera's depth of field (view camera)." },
       motion_blur: { type: "boolean" },
       save: { type: "boolean", description: "Keep a copy in .blender-ai/live/." },
+      name: { type: "string", description: "Keep the preview as .blender-ai/live/<camera>-<name>.png (implies save). The last few per camera are kept." },
       path: blendPath,
     }),
   },
@@ -389,6 +410,7 @@ export const TOOLS: ToolDef[] = [
       image: { type: "boolean", description: "section and profile: draw the result (and compare_to) on a labelled grid." },
       max_points: { type: "number", description: "section: points kept per reply (default 200; text_points shown in the text, default 60)." },
       compare_to: { description: "Another source measured the same way: {targets}, {file, transform, units}, or {ref}." },
+      out: { type: "string", description: "section: a workspace .json path. Writes {loops, plane, units} (the simplified loops). An image path is used when image or depthmap draws a picture." },
       path: blendPath,
     }),
   },

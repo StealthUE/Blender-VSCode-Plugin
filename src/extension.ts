@@ -2,13 +2,14 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
-import { probeBridge } from "./bridge";
+import { callBridge, probeBridge } from "./bridge";
 import { serverLaunch } from "./configWrite";
 import { findNode } from "./findBlender";
 import { runIngest, ingestScript } from "./ingest";
 import { readConfig } from "./projectConfig";
 import { syncRuntime } from "./runtime";
 import { showSetup } from "./setup";
+import { installIfStale } from "./doctor";
 import { doctor, launchBlender, loadWorkspaceContext } from "./tools";
 import { ADDON_VERSION, WorkspaceContext } from "./types";
 import { applyWorkspace } from "./workspaceSetup";
@@ -21,6 +22,8 @@ let cachedRoot: { folder: string | undefined } | undefined;
 let runtime: string | undefined;
 const pending = new Map<string, NodeJS.Timeout>();
 const ingestQueue: { file: string; actor: string; manual: boolean }[] = [];
+/** Journal files already offered a save for this dirty streak. A save event clears the key. */
+const dirtyJournals = new Set<string>();
 let draining = false;
 
 function workspaceRoot(): string | undefined {
@@ -219,6 +222,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   blendWatcher.onDidDelete(onBlendSet);
   context.subscriptions.push(blendWatcher);
 
+  const journalWatcher = vscode.workspace.createFileSystemWatcher("**/.blender-ai/**/journal.jsonl");
+  const onJournal = (uri: vscode.Uri): void => { void offerSave(uri); };
+  journalWatcher.onDidCreate(onJournal);
+  journalWatcher.onDidChange(onJournal);
+  context.subscriptions.push(journalWatcher);
+
   const folder = root();
   if (!folder) return;
   if (!readConfig(folder)) {
@@ -231,7 +240,71 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   void startWorkspace(context, folder, output);
 }
 
+async function ensureAddon(context: vscode.ExtensionContext, folder: string, output: vscode.OutputChannel): Promise<void> {
+  const config = readConfig(folder);
+  if (!config?.blender || !fs.existsSync(config.blender)) return;
+  try {
+    const outcome = await installIfStale(config.blender, runtimeRoot(context, output), config.port);
+    if (outcome.installed) {
+      output.appendLine(`Installed the VSBlender add-on (${ADDON_VERSION}). Restart Blender to load it. ${outcome.message}`);
+    }
+  } catch (error) {
+    output.appendLine(`Add-on install skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** One notification when a build leaves the file on disk behind. Save uses the same save_file path as the save tool. */
+async function offerSave(uri: vscode.Uri): Promise<void> {
+  const folder = workspaceRoot();
+  if (!folder || !readConfig(folder)) return;
+  const key = uri.fsPath;
+  let last = "";
+  try {
+    const lines = fs.readFileSync(uri.fsPath, "utf8").split(/\r?\n/).filter((line) => line.trim());
+    last = lines[lines.length - 1] ?? "";
+  } catch {
+    return;
+  }
+  if (!last) return;
+  let event: Record<string, unknown>;
+  try {
+    event = JSON.parse(last) as Record<string, unknown>;
+  } catch {
+    return;
+  }
+  if (event["event"] === "save") {
+    dirtyJournals.delete(key);
+    return;
+  }
+  if (event["event"] !== "script" && event["event"] !== "pipeline") return;
+  const runs = Number(event["unsaved_runs"] ?? 0);
+  if (!(runs > 0) || dirtyJournals.has(key)) return;
+  dirtyJournals.add(key);
+  const file = typeof event["blend"] === "string" && event["blend"]
+    ? event["blend"]
+    : typeof event["file"] === "string" && event["file"] ? event["file"] : "the open file";
+  const choice = await vscode.window.showInformationMessage(
+    `${runs} runs, the file on disk does not have them (${file})`,
+    "Save",
+    "Not now"
+  );
+  if (choice !== "Save") return;
+  const config = readConfig(folder);
+  if (!config) return;
+  try {
+    const response = await callBridge(config.port, "save_file", { reason: "save from the editor", actor: "user" }, 60000);
+    if (!response.ok) {
+      void vscode.window.showErrorMessage(response.error || "Could not save.");
+      return;
+    }
+    dirtyJournals.delete(key);
+  } catch (error) {
+    void vscode.window.showErrorMessage(error instanceof Error ? error.message : String(error));
+  }
+}
+
 async function startWorkspace(context: vscode.ExtensionContext, folder: string, output: vscode.OutputChannel): Promise<void> {
+  void ensureAddon(context, folder, output);
   await refreshClientFiles(context, folder, output);
   if (!autoIngestOn()) return;
   for (const file of listBlendFiles(folder)) {

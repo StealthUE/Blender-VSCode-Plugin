@@ -4,6 +4,7 @@ import { listBlendFiles, relativeTo, resolveInside, sidecarDir } from "./blendFi
 import { callBridge, probeBridge } from "./bridge";
 import * as jobs from "./jobs";
 import { describePrinter, printerParams, resolvePrinter } from "./printers";
+import { readConfig, writeConfig } from "./projectConfig";
 import {
   bridgeError,
   bridgeFailure,
@@ -24,6 +25,7 @@ import {
   runScript,
   saveLines,
   saveRefusal,
+  unsavedBanner,
   sourceNote,
   tempPng,
 } from "./tools";
@@ -177,6 +179,18 @@ export async function exportModel(ctx: WorkspaceContext, args: Record<string, un
   return ok(lines.join("\n"), { details: { files: rows, format: job["format"] } });
 }
 
+/** Trust <blend folder>/scripts, including before that folder exists. Returns the prefix, or undefined when the workspace has no config. */
+export function trustScriptsFolder(workspace: string, blendFile: string): string | undefined {
+  const prefix = relativeTo(workspace, path.join(path.dirname(blendFile), "scripts"));
+  const config = readConfig(workspace);
+  if (!config) return undefined;
+  const have = (config.trustedScripts ?? []).map((item) => item.replace(/\\/g, "/").replace(/\/+$/, ""));
+  if (!have.includes(prefix)) {
+    writeConfig(workspace, { ...config, trustedScripts: [...(config.trustedScripts ?? []), prefix] });
+  }
+  return prefix;
+}
+
 // ----------------------------------------------------------------------------- new_blend
 export async function newBlend(ctx: WorkspaceContext, args: Record<string, unknown>, _extras: CallExtras = {}): Promise<ToolOutcome> {
   if (!ctx.blender || !fs.existsSync(ctx.blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
@@ -206,13 +220,14 @@ export async function newBlend(ctx: WorkspaceContext, args: Record<string, unkno
   }
   const rel = relativeTo(ctx.workspace, abs);
   const lines = [`created ${rel} from the ${template} template (${String(result["units"])})`];
+  const trusted = trustScriptsFolder(ctx.workspace, abs);
   for (const item of (result["applied"] as string[] | undefined) ?? []) lines.push(`- ${item}`);
   if (template === "print_mm") lines.push(`printer: ${describePrinter(profile)}${warnings.length ? `; ${warnings.join("; ")}` : ""}`);
   if (args["open"] === true) {
     const probe = await probeBridge(ctx.port);
     if (probe.ok) {
       try {
-        const opened = await callBridge(ctx.port, "open_file", { path: abs }, 90000);
+        const opened = await callBridge(ctx.port, "open_blend", { path: abs, reason: "new_blend", actor: "ai" }, 90000);
         if (opened.ok && opened.result?.["opened"] === true) lines.push(`opened it in the running Blender`);
         else lines.push(`not opened: ${String(opened.result?.["reason"] ?? opened.error ?? "the open file could not be replaced")}. `
           + "Blender keeps the file it has open; save that first, then launch_blender with this file.");
@@ -226,7 +241,12 @@ export async function newBlend(ctx: WorkspaceContext, args: Record<string, unkno
   } else {
     lines.push(`open it with launch_blender {"file": "${rel}"} (or new_blend with open: true)`);
   }
-  lines.push("Put its scripts in " + path.posix.join(path.dirname(rel).split(path.sep).join("/") || ".", "scripts") + "/ and shared code in scripts/lib/.");
+  if (trusted) {
+    lines.push(`Put its scripts in ${trusted}/ (trusted, including before that folder exists) and shared code in scripts/lib/.`);
+  } else {
+    const prefix = relativeTo(ctx.workspace, path.join(path.dirname(abs), "scripts"));
+    lines.push(`Put its scripts in ${prefix}/ and shared code in scripts/lib/.`);
+  }
   return ok(lines.join("\n"), { details: result });
 }
 
@@ -235,9 +255,19 @@ export async function measure(ctx: WorkspaceContext, args: Record<string, unknow
   const op = str(args["op"]) ?? "section";
   const params: Record<string, unknown> = { ...args, op, reference_roots: referenceRoots(ctx) };
   delete params["path"];
-  if (op === "depthmap" && args["image"] !== false) params["out"] = tempPng("depthmap");
+  const requestedOut = str(args["out"]);
+  const jsonOut = op === "section" && !!requestedOut?.toLowerCase().endsWith(".json");
+  if (jsonOut && requestedOut) {
+    try {
+      params["out"] = resolveInside(ctx.workspace, requestedOut);
+    } catch (error) {
+      return fail(errorText(error));
+    }
+  } else if (op === "depthmap" && args["image"] !== false) {
+    params["out"] = tempPng("depthmap");
+  }
   // A section or profile drawn on a grid (both sources, with compare_to) is often worth more than the numbers.
-  if ((op === "section" || op === "profile") && args["image"] === true) params["out"] = tempPng(`measure-${op}`);
+  if (!jsonOut && (op === "section" || op === "profile") && args["image"] === true) params["out"] = tempPng(`measure-${op}`);
   const timeout = 180000;
   try {
     const routed = await routeCall(ctx, "measure", params, timeout, args["path"], extras);
@@ -247,7 +277,9 @@ export async function measure(ctx: WorkspaceContext, args: Record<string, unknow
     const text = sourceNote(ctx, routed) + String(result["text"] ?? JSON.stringify(result, null, 1))
       + (response.warnings?.length ? `\nwarnings: ${response.warnings.join("; ")}` : "");
     const file = typeof result["file"] === "string" ? result["file"] : "";
-    if (file && fs.existsSync(file)) return { ...imageReply(file, ctx.workspace, [text], args["save"] === true), details: result };
+    if (file && fs.existsSync(file) && !file.toLowerCase().endsWith(".json")) {
+      return { ...imageReply(file, ctx.workspace, [text], args["save"] === true), details: result };
+    }
     return ok(text, { details: result });
   } catch (error) {
     return failed(ctx, error, timeout);
@@ -339,6 +371,8 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
     for (const step of steps) lines.push(`- ${String(step["step"])}: ${String(step["changes"] ?? "")}`);
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
     lines.push(...saveLines(result));
+    const banner = unsavedBanner(result);
+    if (banner) lines.unshift(banner);
     return ok(lines.join("\n"), { details: result });
   } catch (error) {
     return failed(ctx, error, timeout);
@@ -348,6 +382,11 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
 /** The real path of a file when it is inside one of the trusted folders, else why not. */
 function trustedPath(ctx: WorkspaceContext, requested: string, what: string): { real: string } | { problem: string } {
   const trusted = ctx.trustedScripts ?? [];
+  const underPrefix = (relFile: string, folder: string): boolean => {
+    const root = folder.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+$/, "");
+    if (!root || root.split("/").includes("..")) return false;
+    return relFile === root || relFile.startsWith(`${root}/`);
+  };
   if (!trusted.length) {
     return { problem: "no trusted script folders. Add \"trustedScripts\": [\"Models/scripts\"] to .blender-ai/config.json "
       + `(and tick "Run trusted project scripts without asking" in setup), or use ${what === "pipeline" ? "run_pipeline" : "run_script"}.` };
@@ -365,7 +404,8 @@ function trustedPath(ctx: WorkspaceContext, requested: string, what: string): { 
     try {
       root = fs.realpathSync(resolveInside(ctx.workspace, folder));
     } catch {
-      return false;
+      // new_blend trusts <blend folder>/scripts before that folder exists.
+      return underPrefix(rel, folder);
     }
     const relative = path.relative(root, real);
     return !!relative && !relative.startsWith("..") && !path.isAbsolute(relative);

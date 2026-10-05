@@ -228,8 +228,8 @@ export async function currentBlend(ctx: WorkspaceContext, requested: unknown): P
 }
 
 // ----------------------------------------------------------------------------- connection
-export async function doctor(ctx: WorkspaceContext, fix: boolean): Promise<ToolOutcome> {
-  const report = await runDoctor(ctx, { fix, electronPath: process.execPath });
+export async function doctor(ctx: WorkspaceContext, fix: boolean, archive = false): Promise<ToolOutcome> {
+  const report = await runDoctor(ctx, { fix, archive, electronPath: process.execPath });
   return report.ok ? ok(report.text, { details: report.checks }) : fail(report.text, report.checks);
 }
 
@@ -280,7 +280,7 @@ export async function launchBlender(ctx: WorkspaceContext, args: Record<string, 
   if (probe.ok) {
     if (!file) return ok(`Blender bridge already listening on ${ctx.port}.`);
     try {
-      const opened = await callBridge(ctx.port, "open_file", { path: file }, 90000);
+      const opened = await callBridge(ctx.port, "open_blend", { path: file, reason: "launch_blender", actor: "user" }, 90000);
       if (opened.ok && opened.result?.["opened"] === true) {
         const already = opened.result?.["already"] === true;
         return ok(already ? `Already open: ${file}` : `Opened ${file}`);
@@ -378,6 +378,16 @@ export function checkpointLine(result: Record<string, unknown>, what: string): s
   return line;
 }
 
+/** The first line of a run that left the file on disk behind: the count, and which file. */
+export function unsavedBanner(result: Record<string, unknown>): string | undefined {
+  if (result["saved"]) return undefined;
+  const unsaved = result["unsaved"] as { runs?: number; file?: string } | undefined;
+  const runs = Number(unsaved?.runs ?? 0);
+  if (!(runs > 0)) return undefined;
+  const file = unsaved?.file ? String(unsaved.file) : "the open file";
+  return `${runs} runs, the file on disk does not have them (${file})`;
+}
+
 /** The last lines of a run: what was saved, and what the file on disk does not have yet. */
 export function saveLines(result: Record<string, unknown>): string[] {
   const lines: string[] = [];
@@ -388,7 +398,70 @@ export function saveLines(result: Record<string, unknown>): string[] {
   return lines;
 }
 
+/** A script on a throwaway copy. The open file, its journal and its checkpoints are not touched. */
+async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  if (!ctx.blender || !fs.existsSync(ctx.blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
+  if (typeof args["path"] !== "string" || !args["path"].trim()) return fail("path is required");
+  let script: string;
+  try {
+    script = resolveInside(ctx.workspace, args["path"]);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  if (!script.toLowerCase().endsWith(".py")) return fail("path must be a .py file");
+  if (!fs.existsSync(script)) return fail(`file not found: ${args["path"]}`);
+  const rel = relativeTo(ctx.workspace, script);
+  const probe = await probeBridge(ctx.port);
+  const id = jobs.newJobId("script");
+  const dir = path.join(jobs.jobsDir(ctx.workspace), id);
+  fs.mkdirSync(dir, { recursive: true });
+  let blend: string;
+  let source: string;
+  let scratch: string | undefined;
+  if (probe.ok) {
+    const copy = path.join(dir, "scene.blend");
+    try {
+      const response = await callBridge(ctx.port, "save_copy", { path: copy }, 300000);
+      if (!response.ok) return fail(bridgeError(response, "save_copy"));
+      blend = copy;
+      scratch = copy;
+      source = "a copy of the open session (thrown away; the open file is unchanged)";
+    } catch (error) {
+      return fail(bridgeFailure(ctx.port, error, 300000));
+    }
+  } else if (probe.state !== "absent") {
+    return fail(`${probe.detail}. Not running the script.`);
+  } else {
+    try {
+      blend = pickBlend(ctx, args["blend"] ?? args["file"]);
+    } catch (error) {
+      return fail(`Blender is not running, so the saved file is used, and ${errorText(error)}`);
+    }
+    source = `the saved file ${relativeTo(ctx.workspace, blend)} (Blender is not running; the file is not written)`;
+  }
+  const spec: Record<string, unknown> = { kind: "script", script };
+  if (typeof args["function"] === "string" && args["function"]) spec["function"] = args["function"];
+  if (args["args"] && typeof args["args"] === "object") spec["args"] = args["args"];
+  const timeout = Math.min(600000, Math.max(1000, Number(args["timeout_ms"]) || 60000));
+  try {
+    const result = await jobs.runToEnd(ctx, {
+      blend, spec, kind: "script", label: `background ${rel}`, ...(scratch ? { scratch } : {}),
+    }, timeout);
+    const lines = [`background: ${rel}`, source, `result: ${JSON.stringify(result["result"])}`];
+    const stdout = typeof result["stdout"] === "string" ? result["stdout"] : "";
+    const stderr = typeof result["stderr"] === "string" ? result["stderr"] : "";
+    if (Array.isArray(result["warnings"]) && result["warnings"].length) lines.push(`warnings:\n${(result["warnings"] as string[]).join("\n")}`);
+    if (stdout.trim()) lines.push(`stdout:\n${stdout.trimEnd()}`);
+    if (stderr.trim()) lines.push(`stderr:\n${stderr.trimEnd()}`);
+    lines.push("The copy was thrown away. Nothing was checkpointed or journaled, and the open file is unchanged.");
+    return ok(lines.join("\n"), { details: result });
+  } catch (error) {
+    return fail(errorText(error));
+  }
+}
+
 export async function runScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  if (args["background"] === true) return runScriptInBackground(ctx, args);
   if (typeof args["path"] !== "string" || !args["path"].trim()) return fail("path is required");
   let script: string;
   try {
@@ -437,7 +510,11 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
       lines.push(`pipeline: this script repairs what ${(result["rerun_after"] as string[]).join(", ")} reset; run it again after those`);
     }
     if (Array.isArray(result["out_of_date"]) && result["out_of_date"].length) {
-      lines.push(`now out of date: ${(result["out_of_date"] as string[]).join(", ")} (pipeline.json or their rerun-after header). `
+      const why = Array.isArray(result["out_of_date_why"]) ? result["out_of_date_why"] as { script?: string; names?: string[] }[] : [];
+      const named = why.filter((item) => Array.isArray(item.names) && item.names.length)
+        .map((item) => `${item.script} (${item.names!.join(", ")})`);
+      const detail = named.length ? ` Changed: ${named.join("; ")}.` : "";
+      lines.push(`now out of date: ${(result["out_of_date"] as string[]).join(", ")} (pipeline.json or their rerun-after header).${detail} `
         + "Run them again, or run_pipeline from this step.");
     }
     if (Array.isArray(result["not_run_yet"]) && result["not_run_yet"].length) {
@@ -449,6 +526,8 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
     if (stdout.trim()) lines.push(`stdout:\n${stdout.trimEnd()}`);
     if (stderr.trim()) lines.push(`stderr:\n${stderr.trimEnd()}`);
     lines.push(...saveLines(result));
+    const banner = unsavedBanner(result);
+    if (banner) lines.unshift(banner);
     return ok(lines.join("\n"), { details: { ...result, changed: response.changed ?? [] } });
   } catch (error) {
     if (/timed out/i.test(errorText(error))) {
@@ -585,16 +664,17 @@ export function mimeFor(file: string): string {
   return /\.jpe?g$/i.test(file) ? "image/jpeg" : "image/png";
 }
 
-export function imageReply(file: string, workspace: string, lines: string[], keep: boolean): ToolOutcome {
+export function imageReply(file: string, workspace: string, lines: string[], keep: boolean, liveBase?: string,
+  livePrefix?: string): ToolOutcome {
   const size = fs.statSync(file).size;
   const data = size <= PREVIEW_BYTES ? fs.readFileSync(file).toString("base64") : undefined;
   let shown = file;
   if (keep || !data) {
     const liveDir = path.join(workspace, ".blender-ai", "live");
     fs.mkdirSync(liveDir, { recursive: true });
-    shown = path.join(liveDir, path.basename(file));
+    shown = path.join(liveDir, liveBase || path.basename(file));
     if (path.resolve(shown) !== path.resolve(file)) fs.copyFileSync(file, shown);
-    pruneLive(liveDir, LIVE_KEEP);
+    pruneLive(liveDir, LIVE_KEEP, livePrefix);
   }
   if (path.resolve(shown) !== path.resolve(file)) fs.rmSync(file, { force: true });
   const text = [
@@ -613,7 +693,7 @@ export function tempPng(prefix: string): string {
 
 const PREVIEW_KEYS = ["view", "shading", "size", "width", "height", "aspect", "target", "isolate", "projection", "samples",
   "compositor", "dof", "motion_blur", "views", "framing", "crop", "region", "overlay", "cavity", "outline", "shadow", "matcap",
-  "xray", "color_type", "material", "camera", "ref", "with_scene"];
+  "xray", "color_type", "material", "camera", "ref", "with_scene", "name"];
 
 export function previewParams(args: Record<string, unknown>): Record<string, unknown> {
   const params: Record<string, unknown> = {};
@@ -628,8 +708,8 @@ export function previewParams(args: Record<string, unknown>): Record<string, unk
 }
 
 export async function preview(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
-  const out = tempPng(`preview-${String(args["view"] ?? "iso")}`);
-  const params = { ...previewParams(args), out, reference_roots: referenceRoots(ctx) };
+  const out = tempPng(`preview-${safeToken(String(args["camera"] ?? args["view"] ?? "iso"))}`);
+  const params = { ...previewParams(args), out, reference_roots: referenceRoots(ctx), ffmpeg: findFfmpeg(ctx.ffmpeg) };
   const timeout = 240000;
   try {
     const routed = await routeCall(ctx, "preview", params, timeout, args["path"], extras);
@@ -639,11 +719,15 @@ export async function preview(ctx: WorkspaceContext, args: Record<string, unknow
     const file = String(result["file"] ?? out);
     if (!fs.existsSync(file)) return fail(`Blender reported ${file}, but the file is not there`);
     const applied = Array.isArray(result["applied"]) && result["applied"].length ? (result["applied"] as string[]).join(", ") : "none";
+    const summary = typeof result["summary"] === "string" ? result["summary"] : "";
+    const read = Array.isArray(result["read"]) ? (result["read"] as string[]).join("\n") : "";
     const lines = [
+      summary,
+      read,
       sourceNote(ctx, routed).trim(),
       result["material"] ? `material ball: ${String(result["material"])}` : "",
       Array.isArray(result["reference"]) ? `reference (from references.json, not in the file): ${(result["reference"] as string[]).join(", ")}` : "",
-      result["camera"] ? `camera: ${String(result["camera"])}` : "",
+      result["camera"] && !summary ? `camera: ${String(result["camera"])}` : "",
       result["views"] ? `views: ${(result["views"] as string[]).join(", ")}` : `view: ${String(result["view"] ?? "")}`,
       `shading: ${String(result["shading"] ?? "")} (${String(result["engine"] ?? "")})`,
       `size: ${String(result["width"])}x${String(result["height"])}`,
@@ -655,26 +739,41 @@ export async function preview(ctx: WorkspaceContext, args: Record<string, unknow
       typeof result["note"] === "string" ? String(result["note"]) : "",
       response.warnings?.length ? `warnings: ${response.warnings.join("; ")}` : "",
     ];
-    return { ...imageReply(file, ctx.workspace, lines, args["save"] === true), details: result };
+    const given = typeof args["name"] === "string" ? args["name"].trim() : "";
+    const camera = safeToken(String(args["camera"] ?? result["camera"] ?? args["view"] ?? "view"));
+    const liveBase = given ? `${camera}-${safeToken(given)}.png` : undefined;
+    const keep = args["save"] === true || given.length > 0;
+    return { ...imageReply(file, ctx.workspace, lines, keep, liveBase, liveBase ? `${camera}-` : undefined), details: result };
   } catch (error) {
     if (/did not finish|failed:|not running/i.test(errorText(error))) return fail(errorText(error));
     return fail(bridgeFailure(ctx.port, error, timeout));
   }
 }
 
-function pruneLive(dir: string, keep: number): void {
-  let files: { full: string; mtime: number }[];
+export function safeToken(value: string): string {
+  const cleaned = value.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  return cleaned || "preview";
+}
+
+function pruneLive(dir: string, keep: number, prefix?: string, prefixKeep = 4): void {
+  let files: { full: string; name: string; mtime: number }[];
   try {
     files = fs.readdirSync(dir)
       .filter((name) => /\.(png|jpe?g)$/i.test(name))
       .map((name) => {
         const full = path.join(dir, name);
-        return { full, mtime: fs.statSync(full).mtimeMs };
+        return { full, name, mtime: fs.statSync(full).mtimeMs };
       });
   } catch {
     return;
   }
   files.sort((a, b) => b.mtime - a.mtime);
+  if (prefix) {
+    const matched = files.filter((item) => item.name.startsWith(prefix));
+    for (const item of matched.slice(prefixKeep)) fs.rmSync(item.full, { force: true });
+    const dropped = new Set(matched.slice(prefixKeep).map((item) => item.full));
+    files = files.filter((item) => !dropped.has(item.full));
+  }
   for (const item of files.slice(keep)) fs.rmSync(item.full, { force: true });
 }
 
@@ -940,6 +1039,65 @@ export async function append(ctx: WorkspaceContext, args: Record<string, unknown
   }
 }
 
+export async function openBlend(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const requested = typeof args["path"] === "string" && args["path"].trim()
+    ? args["path"].trim()
+    : typeof args["file"] === "string" ? args["file"].trim() : "";
+  if (!requested) return fail("path is required: a workspace .blend");
+  let abs: string;
+  try {
+    abs = resolveInside(ctx.workspace, requested);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  if (!abs.toLowerCase().endsWith(".blend")) return fail("path must end in .blend");
+  if (!fs.existsSync(abs)) return fail(`file not found: ${requested}`);
+  const probe = await probeBridge(ctx.port);
+  if (!probe.ok) {
+    return fail(probe.state === "absent"
+      ? "Blender is not running. Use launch_blender to open the file."
+      : `${probe.detail}. Not opening.`);
+  }
+  try {
+    const response = await callBridge(ctx.port, "open_blend", {
+      path: abs, reason: args["reason"] ?? null, actor: "ai",
+    }, 90000);
+    if (!response.ok) return fail(bridgeError(response, "open_blend"));
+    const result = response.result ?? {};
+    if (result["opened"] !== true) {
+      return fail(`${String(result["reason"] ?? "the open file could not be replaced")}. The bridge was left on the file it already had open.`);
+    }
+    const rel = relativeTo(ctx.workspace, abs);
+    const text = result["already"] === true ? `Already open: ${rel}` : `Opened ${rel}`;
+    return ok(text, { details: result });
+  } catch (error) {
+    return fail(bridgeFailure(ctx.port, error, 90000));
+  }
+}
+
+/** Journaled script runs since the last save. run: true executes them; a sha mismatch is skipped unless force. */
+export async function replay(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const probe = await probeBridge(ctx.port);
+  if (!probe.ok) {
+    return fail(probe.state === "absent"
+      ? "Blender is not running, so there is no open session to replay into."
+      : `${probe.detail}. Not replaying.`);
+  }
+  const run = args["run"] === true;
+  const timeout = run ? 600000 : 30000;
+  try {
+    const response = await callBridge(ctx.port, "replay", {
+      run, force: args["force"] === true, actor: "ai",
+    }, timeout);
+    if (!response.ok) return fail(bridgeError(response, "replay"));
+    const result = response.result ?? {};
+    const text = typeof result["text"] === "string" ? result["text"] : JSON.stringify(result, null, 1);
+    return ok(text, { details: result });
+  } catch (error) {
+    return fail(bridgeFailure(ctx.port, error, timeout));
+  }
+}
+
 // ----------------------------------------------------------------------------- history
 export async function checkpoint(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
   const label = typeof args["label"] === "string" && args["label"].trim() ? args["label"].trim() : "manual";
@@ -965,7 +1123,11 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
     case "doctor":
       return doctor(ctx, false);
     case "doctor_fix":
-      return doctor(ctx, true);
+      return doctor(ctx, true, args["archive"] === true);
+    case "open_blend":
+      return openBlend(ctx, args);
+    case "replay":
+      return replay(ctx, args);
     case "session_info":
       return sessionInfo(ctx, args);
     case "launch_blender":

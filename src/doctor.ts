@@ -63,9 +63,22 @@ export async function installAddon(blender: string, extensionRoot: string, port:
   return { ok: false, message: tail || "Blender did not confirm the add-on install" };
 }
 
+/** Install the shipped add-on when Blender's user folder has none, or a different version. A current install is left alone. */
+export async function installIfStale(blender: string, extensionRoot: string, port: number): Promise<{ installed: boolean; message: string }> {
+  const version = await blenderVersion(blender);
+  if (!version) return { installed: false, message: "could not read the Blender version, so the add-on was left as it is" };
+  const majorMinor = version.split(".").slice(0, 2).join(".");
+  const found = installedAddons(majorMinor);
+  if (found.length && found.every((item) => item.version === ADDON_VERSION)) {
+    return { installed: false, message: `${ADDON_VERSION} is already installed` };
+  }
+  const result = await installAddon(blender, extensionRoot, port);
+  return { installed: result.ok, message: result.message };
+}
+
 export async function runDoctor(
   ctx: WorkspaceContext,
-  options?: { fix?: boolean; electronPath?: string }
+  options?: { fix?: boolean; archive?: boolean; electronPath?: string }
 ): Promise<DoctorReport> {
   const checks: Check[] = [];
   const script = path.join(ctx.extensionRoot, "out", "mcp.js");
@@ -169,7 +182,7 @@ export async function runDoctor(
   }
 
   const orphans = orphanSidecars(ctx.workspace);
-  if (orphans.length && options?.fix) {
+  if (orphans.length && options?.archive) {
     const moved = orphans.map((folder) => {
       try {
         return `${relativeTo(ctx.workspace, folder)} -> ${relativeTo(ctx.workspace, archiveSidecar(folder))}`;
@@ -180,7 +193,7 @@ export async function runDoctor(
     checks.push(check("orphan sidecars", true, `archived ${moved.join(", ")}`));
   } else if (orphans.length) {
     checks.push(check("orphan sidecars", false, `${orphans.map((folder) => relativeTo(ctx.workspace, folder)).join(", ")}: their .blend no longer `
-      + "exists (renamed or deleted). doctor_fix moves them to .blender-ai/_archive/.", true));
+      + "exists (renamed or deleted). doctor_fix with archive: true moves them to .blender-ai/_archive/.", true));
   }
 
   const bridge = await probeBridge(ctx.port);
@@ -204,6 +217,8 @@ export async function runDoctor(
           ...(unsaved?.runs ? { unsaved: unsaved.text ?? `${unsaved.runs} run(s) since the last save` } : {}),
         };
         if (live.unsaved) checks.push(check("unsaved", false, `${live.file}: ${live.unsaved}`, true));
+        const recovery = info.result?.["recovery"] as { text?: string } | undefined;
+        if (recovery?.text) checks.push(check("recovery", false, recovery.text, true));
       } catch {
         live = {};
       }
@@ -224,6 +239,14 @@ export async function runDoctor(
       return `${rel} (${ingestStatus(file)})`;
     }).join(", ");
     checks.push(check("blend files", true, summary));
+    const recoveryFiles = blends.filter((file) => {
+      const name = path.basename(file);
+      return name.toLowerCase() === "quit.blend" || /_\d+_autosave\.blend$/i.test(name);
+    });
+    if (recoveryFiles.length) {
+      checks.push(check("recovery files", false, recoveryFiles.map((file) => relativeTo(ctx.workspace, file)).join(", ")
+        + ": Blender autosave or quit.blend in the workspace. Save into the project .blend with path and overwrite: true.", true));
+    }
   }
 
   const ok = checks.every((item) => item.ok || item.optional);
