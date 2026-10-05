@@ -21,70 +21,89 @@ Call `doctor` for each file's ingest status, and `session_info` for the file ope
 ## Before you change a model
 
 1. Call `doctor`, and `ingest` the file if its status is not `current`. Use `live: true` when Blender has unsaved changes. Ingest only writes sidecar files. It never saves the `.blend`.
-2. Call `context_pack` and read **Before you modify** before any edit. Keyframed values, generated objects and named constraints are listed there. `focus` keeps one object with its children, materials and animation.
-3. Put Python in `<blend folder>/scripts/*.py` (shared code in `<blend folder>/scripts/lib/`) and run it with `run_script`, and always pass a `reason`. Each call is checkpointed, journaled and made one undo step, and a failed or cancelled run is rolled back. The reply says what changed, by category, and warns when animated data was lost.
+2. Call `context_pack` and read **Before you modify** and **Intent & constraints** before any edit. Keyframed values, generated objects and named constraints are listed there; **Animation beats** says what happens when. `focus` keeps one object with its children, materials and animation.
+3. Put Python in `<blend folder>/scripts/*.py` (shared code in `<blend folder>/scripts/lib/`) and run it with `run_script`, and always pass a `reason`. Each call is checkpointed, journaled and made one undo step, and a failed or cancelled run is rolled back. The reply says what changed, by category, warns when animated data was lost, gives the checkpoint's size, and ends with what is unsaved.
 4. Check the result with `preview`, or with `compare` against the checkpoint from before the script. Use `render` for a final image with the scene's own settings.
 5. If a pass goes wrong, use `restore_checkpoint` with the id from the `run_script` reply, or `last`.
+6. After the first successful build, call `notes` with what the next session must know: where the sizes live, the angle convention, what to re-run after what, which nodes are keyed.
+
+## Saving
+
+Saving the `.blend` is the user's decision. Run replies and `session_info` say how many runs are unsaved and since when; tell the user when work is piling up. When they ask for a save, call `save` with a reason: it is journaled, and the change log then says the saved changes came from your runs. `save` refuses while reference objects are in the scene. If the user ticked "Let the AI save the .blend" in setup, `save` runs without asking and the script tools accept `save: true`.
 
 ## Building a model
 
 1. A new model starts with `new_blend`: `empty` (metres), `render` (metres; camera, three lights, floor), `game` (metres), or `print_mm` (1 unit = 1 mm, with the printer's build plate). It never overwrites a file.
 2. Write a script with `from vsblender import geo` (below) and `vsblender.material`, and run it. Re-running it updates the same objects in place.
-3. Look at it with `preview` (solid shading shows the materials' colours, cavity and outlines; `views`, `crop`, `region`, `material` for one material on a sphere).
-4. `check_model` with the model's purpose: `general`, `render`, `game` or `print`. It returns an image with the problem faces coloured. Fix what it reports and check again.
+3. Look at it with `preview` (solid shading shows the materials' colours, cavity and outlines; `views`, `crop`, `region`, `camera`, `material` for one material on a sphere).
+4. `check_model` with the model's purpose: `general`, `render`, `game` or `print`. It returns an image with the problem faces coloured. Fix what it reports and check again. Animated models: pass `frame`.
 5. `export_model`: 3MF or STL for a slicer, GLB/glTF, FBX, USD, OBJ or PLY for other tools. Files go to `<blend folder>/exports/`; nothing is overwritten unless `overwrite: true`.
+
+## Working from a reference
+
+1. A reference model (a scan, a show model, a CAD export) goes through `import_reference`, never into the scene: it is imported in a background Blender, split into parts by material or object, cached as STL in the sidecar, and registered by name in `references.json` with its units and transform. Call it again with another `transform` to align it; the parts are reused.
+2. Look at it with `preview` `ref: "peg"` (alone, shaded), or `overlay: [{"ref": "peg", "style": "solid"}]` (in the scene, hidden behind nearer geometry), `wire`, `xray` or `silhouette`. `"peg/Chevron"` is one part at full resolution.
+3. Measure it with `measure` `ref: "peg/Chevron"`. `ring: {up, front}` measures in clock angles; `angle: [a0, a1]`, `radius` and `height` windows narrow any op; `plane: {angle: 20}` cuts a ring's cross-section (`image: true` draws it); `compare_to: {targets: "AG Gate Ring"}` measures your model on the same bins and reports the deviations.
+4. Files outside the workspace need their folder in `"referenceRoots"` of `.blender-ai/config.json` (`import_reference` reads from anywhere, after the user approves it). Reference videos: `reference` with `video`, `times` or `fps`, `crop`, and `diff: true` to see what moved.
 
 ## Tools
 
 | Tool | Use it for |
 |---|---|
-| `doctor` | Read-only check of config, Blender, the add-on, the bridge, the printer profile, and each `.blend`'s ingest status. |
-| `doctor_fix` | Reinstall the add-on and rewrite client config. Restart Blender afterwards. |
+| `doctor` | Read-only check of config, Blender, the installed add-on, the bridge, the printer profile, unsaved runs, orphan sidecars, and each `.blend`'s ingest status. |
+| `doctor_fix` | Reinstall the add-on, rewrite client config, archive orphan sidecars. Restart Blender afterwards. |
 | `launch_blender` / `launch_blender_background` | Open Blender with the bridge, with a window or headless. Never starts a second Blender while one holds the port. |
 | `new_blend` | A new `.blend` from a template (`empty`, `render`, `game`, `print_mm`), made in a background Blender. |
-| `session_info` | Live file, dirty flag, frame, units, template, engine, render devices, sidecar status, recent checkpoints, printer, and gotchas for this Blender version. |
+| `session_info` | Live file, dirty flag, unsaved runs, frame, units, template, engine, render devices, sidecar status, recent checkpoints, printer, and gotchas for this Blender version (once per session). |
 | `ingest` | Write `.blender-ai/<name>/` from the saved file (headless), or from the open session with `live: true`. |
 | `context_pack` | `NOTES.md` cut to a token budget. Reports what was cut. |
+| `notes` | Write the Intent & constraints section of `NOTES.md` (kept across re-ingests). |
 | `run_script` | Run a workspace `.py` in Blender, with a `reason`. Blocks Blender's UI while it runs. Rolled back on failure (`atomic: false` keeps partial changes). |
 | `run_pipeline` | Run the steps of a `pipeline.json` from one step to another as one checkpoint and one undo step. |
-| `run_project_script` | `run_script` for files in the trusted folders of `.blender-ai/config.json` only. |
-| `preview` | Offscreen image. `views`, `crop`, `region`, `overlay` (reference objects or STL/OBJ/3MF/SVG files as wire, x-ray or silhouette), `material`, `cavity`, `matcap`, `aspect`, `isolate`, `projection`, `compositor`, `dof`, `samples`. |
-| `check_model` | Fitness for a purpose: open, non-manifold, flipped, coincident and degenerate faces, transforms, triangle budget, materials, UVs; for print: fits the printer, self-intersections, bed contact, floating parts, overhangs, thin walls, filament. |
+| `run_project_script` / `run_project_pipeline` | `run_script` and `run_pipeline` for files in the trusted folders of `.blender-ai/config.json` only. |
+| `save` | Save the open `.blend` when the user asks; journaled. |
+| `append` | Copy objects from another workspace `.blend`, recording where they came from. |
+| `import_reference` | A big reference model as cached STL parts in the sidecar, registered by name. |
+| `preview` | Offscreen image. `views`, `crop`, `region`, `camera`, `ref`, `overlay` (objects, files or references as wire, x-ray, silhouette, solid or cavity), `material`, `cavity`, `matcap`, `aspect`, `isolate`, `projection`, `compositor`, `dof`, `samples`. |
+| `check_model` | Fitness for a purpose: open, non-manifold, flipped, coincident and degenerate faces, transforms, triangle budget, materials, UVs; for print: fits the printer, self-intersections, bed contact, floating parts, overhangs, thin walls, filament. `frame` for animated models. |
 | `export_model` | 3MF/STL in mm (on the bed for print), or GLB, glTF, FBX, USD, OBJ, PLY through Blender's exporters on a copy. |
-| `measure` | Sections, profiles, depth maps, angular occupancy and repeat pitch, of scene objects or of external mesh files. |
+| `measure` | Sections (with points and images), profiles, depth maps, angular occupancy and repeat pitch, of scene objects, files or references, with angle/radius/height windows, ring frames and `compare_to` deltas. |
 | `timeline` | Every keyframe in time order with readable channels, or a channel's values at given frames. |
-| `render` / `job_status` / `cancel_job` | Final render as a background job on a copy of the session: `still`, `frames`, `sheet` (16 frames at most), or `mp4`. `frames` is a range or a list. |
-| `checkpoint` / `restore_checkpoint` | Compressed snapshots in `.blender-ai/<name>/checkpoints/`. The user's file is not touched. |
+| `render` / `job_status` / `cancel_job` | Final render as a background job on a copy of the session: `still`, `frames`, `sheet` (16 frames at most), or `mp4` (the scene's frame range by default; H.264 through ffmpeg when found). |
+| `checkpoint` / `restore_checkpoint` | Compressed snapshots in `.blender-ai/<name>/checkpoints/`, within a disk budget. The user's file is not touched. |
 | `diff` | What changed between `sidecar`, `live` and checkpoint ids. |
-| `compare` / `reference` | Before and after with a difference heatmap. Reference images next to a matching preview. |
-| `describe` / `find` / `spatial` | One datablock in full (with the script that built it and its spec). Objects by selector (`type:MESH and children_of:"X"`, `built_by:lamp.py`). Bounds, raycasts, drops, distances. |
-| `api` / `node_schema` | Blender API lookup, including live enum values. A node's sockets by identifier and name. |
+| `compare` / `reference` | Before and after with a difference heatmap. Reference images or video frames next to a matching preview. |
+| `describe` / `find` / `spatial` | One datablock in full (with the script that built it, its spec, where it was appended from; `frame`). Objects by selector (`type:MESH and children_of:"X"`, `built_by:lamp.py`, `part:dhd`, `stage`, `reference`). Bounds, raycasts, drops, distances. |
+| `api` / `node_schema` | Blender API lookup, including live enum values (inherited Node/ID properties left out). A node's sockets by identifier and name. |
 | `set_role` | Record what an object is for in `roles.json`. It survives re-ingests. |
 
 ## Scripts
 
 - `import vsblender` gives helpers that hide Blender version drift:
   - `sock(node, "Fac")` gets a socket by identifier or by name. `build(tree, {...}, links=[...])` creates and lays out a node graph.
-  - `set_keys` and `scale_keys` edit keyframes. They handle layered actions, and accept paths like `"Principled BSDF/Emission Strength"`.
+  - `set_keys` and `scale_keys` edit keyframes. They handle layered actions, and accept paths like `"Principled BSDF/Emission Strength"`. `set_keys(..., replace=True)` rebuilds a channel; `clear_keys(target, path=None)` removes keys (all of them, and the orphaned action, without a path), so animation scripts can be re-run.
   - `material(name, color="#c8a24a", metallic=1, roughness=0.3)` makes or updates a Principled material and its viewport colour. Names like `"brass"`, `"steel"`, `"red"` work as colours.
   - `modifier(obj, "BEVEL", width=0.002)` gets or creates a modifier by name, so re-runs do not stack them. `apply_modifiers(obj)` bakes them without operators.
   - `place_on_ground(objs)`, `center_on_origin(objs)`, `set_origin(obj, "base")`, `orient_flat(obj)`, `stats(obj)`.
   - `units()`, `mm(20)`, `m(1.5)`, `to_mm(x)`: what a Blender unit is, and real sizes in Blender units. `printer()` is the printer profile.
   - `bbox_world`, `raycast_down` and `view3d_override` cover bounds, ground contact and operators that need a 3D view.
   - `progress(fraction, message)` reports progress, and lets the client cancel the script.
-  - `spec(obj, teeth=24, pitch_deg=15)` records the parameters an object was built from; `mark_derived(obj, sources)` records what it is generated from. Objects a script builds are stamped with the script automatically.
-  - `read_stl`, `read_obj`, `read_3mf`, `svg_loops(path)` read reference files.
+  - `spec(obj, teeth=24, pitch_deg=15)` records the parameters an object was built from; `mark_derived(obj, sources)` records what it is generated from. Objects a script builds are stamped with the script automatically. `intent("...")` writes to NOTES' Intent & constraints.
+  - `part("dhd", keys_per_ring=18)` builds a reusable part from `parts/dhd.py` (`def build(**params)`, `PARAMS` defaults) in the script's folder or above it, and records the part and its parameters on the objects.
+  - `read_stl`, `read_obj` (keeps OBJ materials and groups as parts), `read_3mf`, `svg_loops(path)` read reference files.
 - `from vsblender import geo` builds meshes. Solids are values: nothing exists in Blender until `to_object`.
   - Primitives stand on z = 0, centred in x and y: `geo.box(x, y, z, fillet=, chamfer=, edges="vertical")`, `cylinder(d=, h=)`, `cone`, `tube`, `sphere`, `torus`, `revolve(profile)`, `extrude(loops, h)`, `sweep(profile, path)`, `loft(sections)`, `text("A1", size, depth)`.
   - Mechanical parts (sizes from ISO tables): `thread(m=8, length=)`, `hole(m=3, depth=, fit="normal"|"tap"|"insert", counterbore=True)`, `nut_trap(3)`. `m=` sizes are millimetres; every other length is in scene units.
-  - `a + b`, `a - b`, `a & b` are booleans (Manifold solver when the inputs are closed). `geo.join(a, b)` combines without a boolean, which is enough for render and game models.
+  - `a + b`, `a - b`, `a & b` are booleans (Manifold solver when the inputs are closed). `geo.join(a, b)` combines without a boolean, which is enough for render and game models. A cutter whose shells overlap each other: `a.difference(b, union_cutters=True)` (the warning says when). `.clean()` removes the zero-area slivers booleans leave, without welding shells.
   - `.move()`, `.rotate(x=, y=, z=)`, `.scale()`, `.mirror()`, `.bevel(width)`, `.array(n, offset)`, `.polar(n)`, `.on_ground()`, `.check()`.
-  - `.to_object("Name", materials=[...], modifiers=[("BEVEL", {...})], smooth_deg=30, uv="box")` creates the object or updates it in place: material slots, modifiers and animation survive.
+  - `.to_object("Name", materials=[...], modifiers=[("BEVEL", {...})], smooth_deg=30, uv="box")` creates the object or updates it in place: material slots, modifiers and animation survive. `parent="Root", space="local"` writes geometry in the parent's frame and never touches a keyed transform.
+  - Rings, dials, gates and wheels: `ring = geo.ring(up="+Y", front="+Z")` works in clock angles (clockwise from the top, seen from the front): `ring.pt(a, r, depth)`, `ring.theta(a)` for `lathe`, `ring.on(depth_fn, a)` as a `prism` mapping, `ring.band(bm, a0, a1, r0, r1, depth_fn, lo, hi)`, `ring.pattern(segment, 9, mirror="back", symmetric=True)`.
   - For detailed shapes, builders add faces to a BMesh: `geo.lathe(bm, profile)`, `geo.prism(bm, loops, h0, h1, to3d)`, `geo.sweep(bm, ...)`, `geo.polar_block`, `geo.mirror_weld`, `geo.finish(bm)`, `geo.replace_mesh(obj, bm)`.
   - Let parts that are joined or cut overlap a little (0.1 mm in a print project): coplanar faces make booleans fail. Emboss text by sinking it into the surface.
-- Every lib/ folder from the script's folder up to the workspace root is importable, as are libPaths. Edits are picked up on the next call.
+- Every lib/ folder from the script's folder up to the workspace root is importable, as are libPaths and sharedLibs (another project's script folders). Edits are picked up on the next call.
+- Keep build code in functions and the run code under `if __name__ == "__main__":` (or `if vsblender.is_main():`), so another project can import the builder without running it.
 - Header lines: `# vsblender: read-only` (no checkpoint), `# vsblender: atomic off` (keep partial changes on failure), `# vsblender: rerun-after 03_mesh` (this script repairs what 03_mesh resets). A `pipeline.json` next to the scripts (`{"steps": [...], "after": {"03_mesh": ["07_animation"]}}`) makes `run_script` say which steps are now out of date; `run_pipeline` re-runs them as one transaction.
-- Call `vsblender.progress()` in long loops. On a timeout or a cancel, the script stops at its next call. Use `render` for renders, not `bpy.ops.render.render` in a script.
+- Call `vsblender.progress()` in long loops. On a timeout or a cancel, the script stops at its next call. Use `render` for renders, not `bpy.ops.render.render` in a script, and the `save` tool for saving, not `bpy.ops.wm.save_mainfile`.
 
 ## 3D printing
 
@@ -101,9 +120,10 @@ Call `doctor` for each file's ingest status, and `session_info` for the file ope
   NOTES.md        overview. Hand-written text after the generated marker is kept.
   manifest.json   structure. Diff it to see what changed.
   roles.json      what each object is for
-  journal.jsonl   ingests, AI scripts (reason, script, changes, checkpoint), pipelines, exports, roles, restores
-  checkpoints/    compressed copies of the session from before AI scripts
-  references.json optional: reference meshes for preview overlays ({ref: "name"})
+  journal.jsonl   ingests, AI scripts (reason, script, changes, checkpoint), pipelines, saves, appends, exports, roles, restores
+  checkpoints/    compressed copies of the session from before AI scripts, within a disk budget
+  references.json reference meshes by name, with units and transform (import_reference writes it)
+  refs/           cached reference parts (import_reference)
   previews/       generated images, not the source of truth
 ```
 
@@ -118,10 +138,10 @@ Reviewed roles (`source` `ai` or `human`) survive a re-ingest, and a rename keep
 - Do not invent Blender 4.x API. `session_info` includes the gotchas for the running version, and `api` and `node_schema` answer from the running Blender. On Blender 5 the engine id is `BLENDER_EEVEE`, `Material.use_nodes` is gone, actions are slotted, and the compositor is `scene.compositing_node_group`.
 - Socket identifiers and displayed names differ (`Fac` versus `Factor`). Use the identifier.
 - Material keyframes address nodes by name. Keep a keyframed node's name when you rebuild a material.
-- Saving the `.blend` is the user's decision. Do not save it unless you were asked to. Checkpoints keep unsaved work safe in the meantime.
+- Objects marked `vsblender_stage` (the render template's floor, the print template's build plate) belong in the file but not in checks and exports. Objects marked `vsblender_reference`, or named `_REF ...`, are measuring references: keep them out of the file (`import_reference`).
 
 ## Clients
 
 The setup wizard writes this guide for the clients that were switched on. Cursor and Cline are off unless the user enabled them. Grok uses this file when it is `CLAUDE.md`, and `AGENTS.md` only when Claude Code was left off, so the guide is not injected twice.
 
-Setup also writes Claude Code permission rules: the read-only tools run without asking, and `.blend` files cannot be read or edited. `run_script` and `run_pipeline` ask each time unless the user ticked "run scripts without asking" in setup; `run_project_script` has its own tick for trusted folders.
+Setup also writes Claude Code permission rules: the read-only tools run without asking, and `.blend` files cannot be read or edited. `run_script` and `run_pipeline` ask each time unless the user ticked "run scripts without asking" in setup; `run_project_script` and `run_project_pipeline` have their own tick for trusted folders, and `save` its own tick.
