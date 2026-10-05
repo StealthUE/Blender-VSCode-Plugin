@@ -492,6 +492,17 @@ def typed(attr: str, name: str) -> str:
     return f"{COLLECTIONS.get(attr, attr.upper()[:2])}:{name}"
 
 
+_SINGULAR = {"meshes": "mesh", "node_groups": "node group", "grease_pencils": "grease pencil",
+             "grease_pencils_v3": "grease pencil", "hair_curves": "hair curves", "pointclouds": "point cloud",
+             "lightprobes": "light probe", "cache_files": "cache file", "movieclips": "movie clip",
+             "libraries": "library", "particles": "particle system", "fonts": "font"}
+
+
+def singular(attr: str) -> str:
+    """'meshes' -> 'mesh', 'objects' -> 'object': for messages."""
+    return _SINGULAR.get(attr, attr[:-1] if attr.endswith("s") else attr)
+
+
 def diff(before: dict, after: dict, depsgraph: dict | None = None) -> dict:
     """Categorised report: added, removed, recreated, renamed, and modified[category][name] = [aspects]."""
     keys_before = {k for k in before if k[0] != "_scene_values"}
@@ -524,18 +535,30 @@ def diff(before: dict, after: dict, depsgraph: dict | None = None) -> dict:
     # not hashed. Where they were, a modifier change would show up a second time as a mesh update.
     rebuilt = added | recreated
     hashed = {(k[0], name) for k, (name, aspects) in after.items() if k[0] != "_scene_values" and "geometry" in aspects}
+    names_before = {(k[0], before[k][0]) for k in keys_before}
+    names_after = {(k[0], after[k][0]) for k in keys_after}
+    temporary = set()
     for attr, names in (depsgraph or {}).items():
         for name in names:
+            if (attr, name) not in names_after:
+                # Built and removed again by the script (an import it measured and deleted), or removed:
+                # neither is an edit of something that is still there.
+                if (attr, name) not in names_before:
+                    temporary.add(typed(attr, name))
+                continue
             if (attr, name) in rebuilt or (attr, name) in hashed or name in modified.get(attr, {}):
                 continue
             modified.setdefault(attr, {})[name] = ["geometry (depsgraph)"]
-    return {
+    out = {
         "added": sorted(typed(a, n) for a, n in added),
         "removed": sorted(typed(a, n) for a, n in removed),
         "recreated": sorted(typed(a, n) for a, n in recreated),
         "renamed": sorted(renamed, key=lambda item: item["to"]),
         "modified": {attr: dict(sorted(items.items())) for attr, items in sorted(modified.items())},
     }
+    if temporary:
+        out["temporary"] = sorted(temporary)
+    return out
 
 
 def flat(report: dict) -> list:
@@ -571,7 +594,10 @@ def summary(report: dict, limit: int = 12) -> str:
         shown = ", ".join(f"{n} ({'/'.join(items[n][:3])})" for n in names[:limit])
         more = f" (+{len(names) - limit} more)" if len(names) > limit else ""
         parts.append(f"{attr} {shown}{more}")
-    return "; ".join(parts) or "no changes"
+    temporary = report.get("temporary") or []
+    if temporary and parts:
+        parts.append(f"temporary {', '.join(temporary[:limit])} (added and removed)")
+    return "; ".join(parts) or ("no changes" + (f" (temporary {', '.join(temporary[:limit])}: added and removed)" if temporary else ""))
 
 
 class DepsgraphRecorder:

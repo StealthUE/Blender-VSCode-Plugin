@@ -14,7 +14,7 @@ import re
 import bpy
 from mathutils import Vector
 
-from . import history, snapshot
+from . import history, marks, snapshot
 
 _ROOTS = ("bpy.context.", "bpy.data.", "C.", "D.")
 _GEOMETRY = {"MESH", "CURVE", "SURFACE", "META", "FONT", "CURVES", "POINTCLOUD", "VOLUME", "GREASEPENCIL", "GPENCIL"}
@@ -150,7 +150,19 @@ def _resolve_live(path: str):
     return parent, last, current
 
 
-def api(query: str, limit: int = 60) -> dict:
+def _inherited(cls) -> tuple:
+    """Property and function names a type inherits from Node or ID (location, width, select, users...),
+    which every node or datablock has and which bury the ones that matter."""
+    props, funcs, bases = set(), set(), []
+    for base in (bpy.types.Node, bpy.types.ID):
+        if cls is not base and issubclass(cls, base):
+            props |= {p.identifier for p in base.bl_rna.properties}
+            funcs |= {f.identifier for f in base.bl_rna.functions}
+            bases.append(base.__name__)
+    return props, funcs, bases
+
+
+def api(query: str, limit: int = 60, inherited: bool = False) -> dict:
     query = (query or "").strip()
     if not query:
         raise ValueError("query is required, e.g. ShaderNodeTexSky, ColorManagedViewSettings.look, scene.eevee, or a word")
@@ -170,16 +182,23 @@ def api(query: str, limit: int = 60) -> dict:
                 lines.append("Dynamic enums list more values on a live instance: pass a path such as scene.view_settings.look.")
             return {"text": "\n".join(lines)}
         lines = [f"{rna.identifier}" + (f" ({rna.base.identifier})" if rna.base else "") + (f": {rna.description}" if rna.description else "")]
+        if issubclass(cls, bpy.types.Node):
+            lines.append(f"Sockets are made when a node is created: node_schema(\"{rna.identifier}\") lists them.")
+        skip_props, skip_funcs, bases = (set(), set(), []) if inherited else _inherited(cls)
+        hidden = 0
         for prop in rna.properties:
             if prop.identifier == "rna_type":
                 continue
+            if prop.identifier in skip_props:
+                hidden += 1
+                continue
             lines.append("  " + _prop_line(prop))
-        funcs = [f.identifier for f in rna.functions]
+        funcs = [f.identifier for f in rna.functions if f.identifier not in skip_funcs]
         if funcs:
             lines.append("functions: " + ", ".join(funcs))
-        if issubclass(cls, bpy.types.Node):
-            lines.append(f"Sockets are made when a node is created: node_schema(\"{rna.identifier}\") lists them.")
-        return {"text": "\n".join(lines[: limit + 2])}
+        if hidden:
+            lines.insert(1, f"({hidden} properties every {' / '.join(bases)} has are left out; inherited: true lists them)")
+        return {"text": "\n".join(lines[: limit + 3])}
     # 2. A live path.
     try:
         parent, last, value = _resolve_live(query)
@@ -330,7 +349,7 @@ def find_datablock(target: str):
         attr = _PREFIX_ATTR[target[:2]]
         found = getattr(bpy.data, attr).get(target[3:])
         if found is None:
-            raise KeyError(f"no {attr[:-1]} named {target[3:]!r}")
+            raise KeyError(f"no {snapshot.singular(attr)} named {target[3:]!r}")
         return attr, found
     for attr in ("objects", "materials", "collections", "node_groups", "worlds", "meshes", "lights", "cameras",
                  "images", "actions", "texts", "scenes"):
@@ -361,18 +380,44 @@ def _r(v, n=4):
     return [round(float(x), n) + 0.0 for x in v]
 
 
-def describe(target: str, root: str, ingest_mod) -> dict:
+def describe(target: str, root: str, ingest_mod, frame=None) -> dict:
+    """One datablock in full. frame: describe it as it is at that frame (the user's frame is restored)."""
+    if frame is None:
+        return _describe(target, root, ingest_mod)
+    scene = bpy.context.scene
+    saved = scene.frame_current
+    scene.frame_set(int(frame))
+    try:
+        out = _describe(target, root, ingest_mod)
+    finally:
+        scene.frame_set(saved)
+    return out
+
+
+def _describe(target: str, root: str, ingest_mod) -> dict:
+    from . import checks
+
     attr, idb = find_datablock(target)
     scene = bpy.context.scene
     deps = bpy.context.evaluated_depsgraph_get()
     out = {"id": snapshot.typed(attr, idb.name)}
     if attr == "objects":
         info = ingest_mod.object_info(idb, deps, scene, bpy.context.view_layer)
+        info["frame"] = scene.frame_current
         role = _roles(root).get(idb.name)
         if role:
             info["role"] = {k: role.get(k) for k in ("role", "source", "confidence") if k in role}
         info["descendants"] = [c.name for c in getattr(idb, "children_recursive", [])][:80]
-        low, high = _world_box(idb, deps)
+        keyed = checks.keyed_visibility(idb)
+        if keyed:
+            shows = f", visible from frame {keyed['visible_from']}" if keyed["visible_from"] is not None else ""
+            info["keyed_visibility"] = (f"{'hidden' if keyed['hidden_now'] else 'shown'} at frame {keyed['frame']} by keys on "
+                                        f"{', '.join(keyed['channels'])}{shows}")
+        if info.get("evaluated") is False:
+            low, high = (Vector(info["bbox"][0]), Vector(info["bbox"][1]))
+            info["note"] = "hidden in the viewport, so not evaluated: bounds are from its own mesh, without modifiers"
+        else:
+            low, high = _world_box(idb, deps)
         info["world_bbox"] = [_r(low), _r(high)]
         info["world_center"] = _r((low + high) / 2)
         if idb.material_slots:
@@ -510,6 +555,15 @@ def _term(term: str, ob, ctx: _Ctx):
             script = str(ob.get("ai_built_by") or ob.get("ai_modified_by") or ob.get("ai_regenerate_with") or "")
             return bool(script) and (fnmatch.fnmatchcase(script, value) or fnmatch.fnmatchcase(os.path.basename(script), value)
                                      or value.lower() in script.lower())
+        if key == "part":
+            try:
+                part = json.loads(ob.get("ai_spec") or "{}").get("part") if isinstance(ob.get("ai_spec"), str) else None
+            except ValueError:
+                part = None
+            return bool(part) and fnmatch.fnmatchcase(str(part), value)
+        if key == "from":
+            source = str(ob.get("ai_appended_from") or "")
+            return bool(source) and (fnmatch.fnmatchcase(source, value) or value.lower() in source.lower())
         if key in ("children_of", "under"):
             p = ob.parent
             while p is not None:
@@ -570,7 +624,8 @@ def _term(term: str, ob, ctx: _Ctx):
         "active": lambda: bpy.context.view_layer.objects.active == ob,
         "derived": lambda: "ai_derived_from" in ob.keys(),
         "built": lambda: "ai_built_by" in ob.keys(),
-        "reference": lambda: "vsblender_reference" in ob.keys(),
+        "reference": lambda: marks.is_reference(ob),
+        "stage": lambda: marks.is_stage(ob),
         "linked": lambda: ob.library is not None,
     }
     if low in flags:

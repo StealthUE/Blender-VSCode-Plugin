@@ -24,24 +24,58 @@ CONTENT = ("objects", "meshes", "materials", "lights", "cameras", "collections",
 _OLD_SCENE = "_vsblender_restore_old"
 _sha_cache: dict = {}
 # A headless Blender never sets bpy.data.is_dirty (no undo pushes), so edits made through the
-# bridge are counted here too. Reset when a file loads.
-_session = {"edited": False, "copying": False}
+# bridge are counted here too, with how many runs changed the scene since the last save and when the
+# first of them was. Reset when a file loads or is saved.
+_session = {"edited": False, "copying": False, "runs": 0, "first": None, "saved_at": None}
 
 
 def writing_copy() -> bool:
     return bool(_session["copying"])
 
 
-def mark_edited() -> None:
+def mark_edited(run: bool = True) -> None:
+    """A change through the bridge. run: count it as one run since the last save (scripts,
+    pipelines, restores, appends)."""
     _session["edited"] = True
+    if run:
+        _session["runs"] += 1
+        if _session["first"] is None:
+            _session["first"] = datetime.datetime.now().astimezone()
 
 
-def reset_edited() -> None:
-    _session["edited"] = False
+def reset_edited(saved: bool = False) -> None:
+    _session.update(edited=False, runs=0, first=None)
+    if saved:
+        _session["saved_at"] = datetime.datetime.now().astimezone()
 
 
 def has_unsaved_edits() -> bool:
     return bool(bpy.data.is_dirty) or _session["edited"]
+
+
+def unsaved() -> dict:
+    """What the file on disk does not have yet: runs through the bridge since the last save, and
+    whether Blender itself has unsaved changes (edits by hand count there)."""
+    first = _session["first"]
+    minutes = int((datetime.datetime.now().astimezone() - first).total_seconds() // 60) if first else None
+    out = {"dirty": bool(bpy.data.is_dirty) or bool(_session["edited"]), "runs": int(_session["runs"]),
+           "first": first.isoformat(timespec="seconds") if first else None, "minutes": minutes,
+           "saved_at": _session["saved_at"].isoformat(timespec="seconds") if _session["saved_at"] else None,
+           "file": bpy.data.filepath or None}
+    out["text"] = unsaved_text(out)
+    return out
+
+
+def unsaved_text(state: dict) -> str:
+    if not state.get("file"):
+        return "the session has never been saved to a .blend"
+    if state.get("runs"):
+        when = "just now" if not state.get("minutes") else f"{state['minutes']} min ago"
+        return (f"{state['runs']} run(s) since the last save, the first {when}. The file on disk does not have them; "
+                "save when the user wants it (the save tool)")
+    if state.get("dirty"):
+        return "Blender has unsaved changes (made by hand, or by tools that do not count runs)"
+    return "none: the file on disk matches the session"
 
 
 def now_iso() -> str:
@@ -108,6 +142,53 @@ def _window_override():
         return None
 
 
+def save_main(path: str | None = None, compress: bool = True) -> str:
+    """Save the session to its own file (or save it as path, which then becomes the open file).
+
+    The thumbnail is drawn by Blender as usual; if that fails outside a 3D view, the save is retried
+    without one.
+    """
+    target = os.path.abspath(path or bpy.data.filepath)
+    if not target:
+        raise ValueError("the session has never been saved: pass path")
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    same = bool(bpy.data.filepath) and os.path.normcase(os.path.abspath(bpy.data.filepath)) == os.path.normcase(target)
+    kwargs = {"filepath": target, "check_existing": False, "compress": bool(compress), "relative_remap": True}
+
+    def run():
+        window = _window_override()
+        op = bpy.ops.wm.save_mainfile if same else bpy.ops.wm.save_as_mainfile
+        if window is not None:
+            with bpy.context.temp_override(window=window):
+                result = op(**kwargs)
+        else:
+            result = op(**kwargs)
+        if "FINISHED" not in result:
+            raise RuntimeError(f"Blender did not save {target} ({', '.join(result)})")
+
+    try:
+        run()
+    except RuntimeError as exc:
+        prefs = bpy.context.preferences
+        paths = getattr(prefs, "filepaths", None)
+        old = getattr(paths, "file_preview_type", None) if paths is not None else None
+        if old is None or old == "NONE":
+            raise
+        was_dirty = getattr(prefs, "is_dirty", None)
+        try:
+            paths.file_preview_type = "NONE"
+            run()
+        finally:
+            paths.file_preview_type = old
+            if was_dirty is not None:
+                try:
+                    prefs.is_dirty = was_dirty
+                except Exception:
+                    pass
+        print(f"vsblender: saved without a thumbnail ({exc})")
+    return target
+
+
 def save_copy(path: str, relative_remap: bool = True, compress: bool = False) -> None:
     """Write the session to path without changing the open file, its path or its dirty flag.
 
@@ -167,8 +248,11 @@ def _new_id(folder: str) -> str:
 
 
 def checkpoint(root: str, label: str = "", auto: bool = False, keep: int = 10, max_mb: float = 300.0,
-               script: str | None = None, reason: str | None = None, snap: dict | None = None) -> dict:
-    """Write a checkpoint. auto ones are pruned to `keep`; labelled ones stay until removed by hand."""
+               script: str | None = None, reason: str | None = None, snap: dict | None = None,
+               budget_mb: float | None = None) -> dict:
+    """Write a checkpoint. auto ones are pruned to `keep` and to `budget_mb` on disk (oldest first);
+    labelled ones stay until removed by hand. The entry says how big it is and what all checkpoints
+    of this file take."""
     folder = os.path.join(sidecar_dir(root), "checkpoints")
     if auto and bpy.data.filepath:
         try:
@@ -201,20 +285,46 @@ def checkpoint(root: str, label: str = "", auto: bool = False, keep: int = 10, m
         entry["script"] = script
     if reason:
         entry["reason"] = reason
+    refs = _reference_names()
+    if refs:
+        entry["references"] = refs[:20]
     entries = [e for e in list_checkpoints(root) if isinstance(e, dict)]
     entries.append(entry)
-    entries = _prune(root, entries, keep)
+    entries, dropped = _prune(root, entries, keep, budget_mb, cid)
     _write_index(root, entries)
-    return entry
+    out = dict(entry)
+    out["total_bytes"] = sum(int(e.get("bytes") or 0) for e in entries)
+    out["count"] = len(entries)
+    if dropped:
+        out["dropped"] = dropped
+    return out
 
 
-def _prune(root: str, entries: list, keep: int) -> list:
+def _reference_names() -> list:
+    try:
+        from . import marks
+        return marks.reference_objects()
+    except Exception:
+        return []
+
+
+def _prune(root: str, entries: list, keep: int, budget_mb: float | None = None, newest: str | None = None) -> tuple:
+    """Drop the oldest auto checkpoints over `keep`, then while all of them take more than budget_mb.
+    The checkpoint just written is never dropped. Returns (entries, dropped ids)."""
     autos = [e for e in entries if e.get("auto")]
     drop = autos[:-keep] if keep > 0 and len(autos) > keep else []
+    if budget_mb and budget_mb > 0:
+        left = [e for e in autos if e not in drop]
+        total = sum(int(e.get("bytes") or 0) for e in left)
+        for e in list(left):
+            if total <= budget_mb * 1e6 or e.get("id") == newest:
+                break
+            drop.append(e)
+            total -= int(e.get("bytes") or 0)
     for entry in drop:
         _remove_file(root, entry)
     gone = {e["id"] for e in drop}
-    return [e for e in entries if e.get("id") not in gone]
+    return [e for e in entries if e.get("id") not in gone], sorted(gone)
 
 
 def _remove_file(root: str, entry: dict) -> None:
@@ -394,6 +504,38 @@ def notes_log(root: str, line: str) -> bool:
     with open(path, "w", encoding="utf-8", newline="\n") as handle:
         handle.write(text)
     return True
+
+
+_INTENT = "## Intent & constraints"
+
+
+def write_intent(root: str, text: str, replace: bool = False) -> str:
+    """Add to (or rewrite) the hand-written Intent & constraints section of NOTES.md, which re-ingests
+    keep. Returns the section. The same as the notes tool, for scripts (vsblender.intent)."""
+    path = os.path.join(sidecar_dir(root), "NOTES.md")
+    if not os.path.isfile(path):
+        raise FileNotFoundError("NOTES.md does not exist yet: ingest the file first")
+    with open(path, encoding="utf-8") as handle:
+        notes = handle.read()
+    body = str(text).strip()
+    start = notes.find(_INTENT)
+    if start < 0:
+        log = notes.find("## Change log")
+        section = f"{_INTENT}\n\n{body}\n\n"
+        notes = notes[:log] + section + notes[log:] if log >= 0 else notes.rstrip() + "\n\n" + section
+        merged = body
+    else:
+        after = start + len(_INTENT)
+        nxt = notes.find("\n## ", after)
+        end = len(notes) if nxt < 0 else nxt + 1
+        current = re.sub(r"<!--\s*Hand-written by people[\s\S]*?-->\s*", "", notes[after:end]).strip()
+        merged = body if replace or not current else f"{current}\n\n{body}"
+        notes = f"{notes[:after]}\n\n{merged}\n\n{notes[end:].lstrip(chr(10))}"
+    with open(path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(notes)
+    journal(root, {"time": now_iso(), "event": "intent", "actor": "ai", "mode": "replace" if replace else "append",
+                   "text": body[:2000]})
+    return merged
 
 
 def log_line(actor: str, what: str, reason: str | None, report: dict | None, checkpoint_id: str | None) -> str:

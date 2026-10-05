@@ -42,8 +42,12 @@ VIEWS = {
 GEOMETRY = {"MESH", "CURVE", "SURFACE", "META", "FONT", "CURVES", "POINTCLOUD", "VOLUME", "GPENCIL", "GREASEPENCIL"}
 MAX_PIXELS = 16_000_000
 MAX_SIDE = 8192
-TEMP_PREFIXES = ("_vsblender_preview", "_vsblender_overlay", "_vsblender_check", "_vsblender_ball", "_vsblender_geo")
-OVERLAY_STYLES = ("wire", "xray", "silhouette")
+TEMP_PREFIXES = ("_vsblender_preview", "_vsblender_overlay", "_vsblender_check", "_vsblender_ball", "_vsblender_geo",
+                 "_vsblender_ref")
+# wire, xray and silhouette are drawn from a second pass over the image; solid and cavity put the
+# geometry into the preview itself (temporary copies), shaded and hidden behind what is in front of it.
+OVERLAY_STYLES = ("wire", "xray", "silhouette", "solid", "cavity")
+IN_SCENE_STYLES = ("solid", "cavity")
 MAX_OVERLAYS = 6
 
 
@@ -107,6 +111,26 @@ def bounds(objects) -> tuple:
     if not found:
         return Vector((0.0, 0.0, 0.0)), Vector((0.0, 0.0, 0.0))
     return low, high
+
+
+def _vertex_bounds(objects):
+    """World bounds from the mesh vertices themselves, for temporary objects nothing has evaluated."""
+    import numpy as np
+
+    lows, highs = [], []
+    for ob in objects:
+        count = len(ob.data.vertices)
+        if not count:
+            continue
+        co = np.empty(count * 3, dtype=np.float32)
+        ob.data.vertices.foreach_get("co", co)
+        m = np.array(ob.matrix_world, dtype=np.float64)
+        world = co.reshape(-1, 3).astype(np.float64) @ m[:3, :3].T + m[:3, 3]
+        lows.append(world.min(axis=0))
+        highs.append(world.max(axis=0))
+    if not lows:
+        return None
+    return Vector(np.min(lows, axis=0).tolist()), Vector(np.max(highs, axis=0).tolist())
 
 
 def subject_bounds(objects):
@@ -503,25 +527,51 @@ def _overlay_entries(params: dict, root: str | None) -> list:
     if len(entries) > MAX_OVERLAYS:
         raise ValueError(f"at most {MAX_OVERLAYS} overlays")
     out = []
-    refs = None
+    roots = [r for r in params.get("reference_roots") or [] if isinstance(r, str)]
     for entry in entries:
         if not isinstance(entry, dict):
             raise ValueError("each overlay is an object such as {\"objects\": \"_REF *\", \"style\": \"wire\"}")
         entry = dict(entry)
         if entry.get("ref"):
-            if refs is None:
-                refs = _reference_set(root)
-            ref = refs.get(str(entry["ref"]))
-            if ref is None:
-                raise KeyError(f"no reference named {entry['ref']} in references.json. Known: {', '.join(refs) or 'none'}")
-            entry = {**ref, **{k: v for k, v in entry.items() if k != "ref"}}
+            entry = {**reference_overlay(str(entry["ref"]), root, entry.get("part")),
+                     **{k: v for k, v in entry.items() if k not in ("ref", "part")}}
         style = str(entry.get("style") or "wire")
         if style not in OVERLAY_STYLES:
             raise ValueError(f"overlay style must be one of {', '.join(OVERLAY_STYLES)}")
         entry["style"] = style
-        if not entry.get("objects") and not entry.get("file"):
+        entry["_roots"] = roots
+        if not entry.get("objects") and not entry.get("file") and not entry.get("files"):
             raise ValueError("an overlay needs objects (a name, list or find selector), file, or ref")
         out.append(entry)
+    return out
+
+
+def reference_overlay(name: str, root: str | None, part=None) -> dict:
+    """An overlay entry for a references.json name: its light overlay file, or one part ('peg/Chevron',
+    or part=) at full resolution."""
+    from . import measure
+
+    entry, inner = measure.reference_entry(name, root or "")
+    wanted = inner or part
+    parts = entry.get("parts") or {}
+    out = {k: v for k, v in entry.items() if k not in ("parts", "source", "imported", "split", "axes", "tris", "notes")}
+    if wanted and parts:
+        import fnmatch
+
+        patterns = [wanted] if isinstance(wanted, str) else list(wanted)
+        names = [n for n in parts if any(fnmatch.fnmatchcase(n, p) or n == p for p in patterns)]
+        if not names:
+            raise KeyError(f"reference {name!r} has no part matching {patterns}. Parts: {', '.join(list(parts)[:60])}")
+        out.pop("file", None)
+        out["files"] = [parts[n] for n in names]
+        out["label"] = f"{name.split('/')[0]}/{names[0]}" + (f" (+{len(names) - 1})" if len(names) > 1 else "")
+    else:
+        out["label"] = name
+        if wanted:  # a single-file reference: the part is an OBJ material or group, or a 3MF item
+            out["part"] = wanted
+    out.setdefault("transform", {})
+    if entry.get("units") and not out["transform"].get("units"):
+        out["transform"] = dict(out["transform"], units=entry["units"])
     return out
 
 
@@ -544,24 +594,28 @@ def _reference_set(root: str | None) -> dict:
     return out
 
 
-def _resolve_file(path: str, root: str | None) -> str:
+def _resolve_file(path: str, root: str | None, roots=None) -> str:
     full = path if os.path.isabs(path) else os.path.join(root or os.getcwd(), path)
     full = os.path.abspath(full)
-    if root and not _under(full, root):
-        raise ValueError(f"overlay file must be inside the workspace: {path}")
+    if root and not _under(full, root) and not any(_under(full, r) for r in roots or []):
+        raise ValueError(f"overlay file must be inside the workspace or a referenceRoots folder: {path}")
     if not os.path.isfile(full):
         raise FileNotFoundError(path)
     return full
 
 
 def _file_mesh(entry: dict, root: str | None, temps: _Temps, name: str):
-    """An external file as a temporary object, in scene units. Files are millimetres unless transform.units says so."""
+    """An external file (or several: a reference's parts) as a temporary object, in scene units. Files
+    are millimetres unless transform.units says so."""
     from . import meshdata, units as units_mod
 
-    path = _resolve_file(str(entry["file"]), root)
+    files = entry.get("files") or [entry["file"]]
     transform = entry.get("transform") or {}
     file_units = str(transform.get("units") or entry.get("units") or "mm")
-    arrays = meshdata.read_mesh_file(path, plane=str(transform.get("plane") or "xy"))
+    plane = str(transform.get("plane") or "xy")
+    parts = [meshdata.read_mesh_file(_resolve_file(str(f), root, entry.get("_roots")), plane=plane, part=entry.get("part"))
+             for f in files]
+    arrays = parts[0] if len(parts) == 1 else meshdata.concat(parts)
     factor = units_mod.file_to_bu(file_units)
     scale = transform.get("scale", 1.0)
     scale = Vector(scale) if isinstance(scale, (list, tuple)) else Vector((float(scale),) * 3)
@@ -615,7 +669,7 @@ def _overlay_pass(entry: dict, index: int, src, cam, cam_data, width: int, heigh
     except Exception:
         depsgraph = None
     prefix = f"_vsblender_overlay_{index}"
-    if entry.get("file"):
+    if entry.get("file") or entry.get("files"):
         objects = [_file_mesh(entry, root, temps, prefix)]
     else:
         objects = _object_copies(entry, root, depsgraph, temps, prefix)
@@ -671,6 +725,50 @@ def _overlay_pass(entry: dict, index: int, src, cam, cam_data, width: int, heigh
     return path
 
 
+def _overlay_label(entry: dict) -> str:
+    return str(entry.get("label") or entry.get("file") or entry.get("objects") or "overlay")
+
+
+def _overlay_material(entry: dict, index: int, temps: _Temps):
+    """A flat material in the overlay's colour, for solid overlays in any shading."""
+    colour = sheet.parse_color(entry.get("color"), default=(0.85, 0.55, 0.25))
+    mat = temps.add(bpy.data.materials.new(f"_vsblender_overlay_mat_{index}"))
+    mat.diffuse_color = (*colour, 1.0)
+    try:
+        bsdf = mat.node_tree.nodes.get("Principled BSDF") if mat.node_tree else None
+        if bsdf is not None:
+            bsdf.inputs["Base Color"].default_value = (*colour, 1.0)
+            bsdf.inputs["Roughness"].default_value = 0.6
+    except Exception:
+        pass
+    return mat
+
+
+def _in_scene_overlays(entries: list, private, root: str | None, temps: _Temps) -> list:
+    """Solid and cavity overlays: temporary copies of the geometry in the preview scene, in the overlay's
+    colour, so they are shaded and hidden behind nearer geometry like everything else."""
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except Exception:
+        depsgraph = None
+    objects = []
+    for index, entry in enumerate(entries):
+        prefix = f"_vsblender_overlay_s{index}"
+        made = [_file_mesh(entry, root, temps, prefix)] if (entry.get("file") or entry.get("files")) else \
+            _object_copies(entry, root, depsgraph, temps, prefix)
+        mat = _overlay_material(entry, index, temps)
+        for ob in made:
+            ob.data.materials.clear()
+            ob.data.materials.append(mat)
+            ob.color = (*mat.diffuse_color[:3], 1.0)
+            try:
+                private.objects.link(ob)
+            except RuntimeError:
+                pass
+            objects.append(ob)
+    return objects
+
+
 def _apply_overlays(out: str, entries: list, src, cam, cam_data, width: int, height: int, root: str | None,
                     temps: _Temps) -> list:
     base = sheet.load(out)
@@ -690,8 +788,7 @@ def _apply_overlays(out: str, entries: list, src, cam, cam_data, width: int, hei
         opacity = float(opacity) if opacity is not None else (0.35 if style == "xray" else 1.0)
         base = sheet.overlay(base, layer, sheet.parse_color(entry.get("color")), style=style, opacity=opacity,
                              width=int(entry.get("width_px") or 2))
-        what = entry.get("file") or entry.get("objects")
-        notes.append(f"{style} {what}")
+        notes.append(f"{style} {_overlay_label(entry)}")
     sheet.save(out, base)
     return notes
 
@@ -744,7 +841,10 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
 
     objects: render exactly these objects (isolated, no scene lights), e.g. temporary check meshes.
     """
-    view = str(params.get("view") or "iso")
+    camera_name = params.get("camera") or None
+    if camera_name is not None and not isinstance(camera_name, str):
+        raise ValueError("camera must be the name of a camera object")
+    view = "camera" if camera_name else str(params.get("view") or "iso")
     material_name = params.get("material")
     shading = str(params.get("shading") or ("material" if material_name else "solid"))
     if view != "camera" and view not in VIEWS:
@@ -767,6 +867,24 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
     crop = _parse_crop(params.get("crop"))
     region = _region_box(params["region"]) if params.get("region") else None
     overlays = _overlay_entries(params, root)
+    in_scene = [e for e in overlays if e["style"] in IN_SCENE_STYLES]
+    overlays = [e for e in overlays if e["style"] not in IN_SCENE_STYLES]
+    # ref: look at a registered reference itself, shaded, without importing it into the file.
+    refs = params.get("ref")
+    ref_entries = []
+    if refs:
+        names = [refs] if isinstance(refs, str) else list(refs)
+        palette = ["#c9c3b8", "#e0884a", "#5fb0e8", "#8fd36a", "#e5c84a", "#c78ae6"]
+        for i, name in enumerate(names[:MAX_OVERLAYS]):
+            entry = reference_overlay(str(name), root)
+            entry.update(style="solid", color=palette[i % len(palette)],
+                         _roots=[r for r in params.get("reference_roots") or [] if isinstance(r, str)])
+            ref_entries.append(entry)
+        if params.get("with_scene"):
+            in_scene += ref_entries
+            ref_entries = []
+    if in_scene and any(e["style"] == "cavity" for e in in_scene):
+        params = dict(params, cavity=True)
     frame = params.get("frame")
     width, height = _resolution(params, src, view)
     saved_frame = src.frame_current
@@ -777,14 +895,30 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
     scene = cam = cam_data = private = None
     fixed_box = None
     explicit = objects is not None
+    ref_view = bool(ref_entries)
     try:
         if material_name:
             objects, fixed_box = _material_ball(str(material_name), temps)
             explicit = True
+        elif ref_view:
+            objects = []
+            for index, entry in enumerate(ref_entries):
+                made = _file_mesh(entry, root, temps, f"_vsblender_ref_{index}")
+                mat = _overlay_material(entry, 100 + index, temps)
+                made.data.materials.append(mat)
+                made.color = (*mat.diffuse_color[:3], 1.0)
+                objects.append(made)
+            explicit = True
+            # From the vertices: objects outside the user's view layer are never evaluated, so their
+            # bound boxes can be empty.
+            fixed_box = _vertex_bounds(objects)
         isolate = explicit or (bool(params.get("isolate")) and bool(target_name))
         if not explicit:
             objects = _collect(src, target_name)
         scene, private = _new_preview_scene(src, objects if isolate else None, with_lights=not explicit)
+        if in_scene:
+            _in_scene_overlays(in_scene, private, root, temps)
+            applied.append("solid overlay")
         if frame is not None:
             scene.frame_set(int(frame))
         try:
@@ -796,8 +930,11 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
                 private.objects.link(objects[0])
             except RuntimeError:
                 pass
-        if view == "camera" and not explicit:
-            src_cam = src.camera
+        if view == "camera" and (not explicit or ref_view):
+            src_cam = bpy.data.objects.get(camera_name) if camera_name else src.camera
+            if camera_name and (src_cam is None or src_cam.type != "CAMERA"):
+                cams = [o.name for o in bpy.data.objects if o.type == "CAMERA"]
+                raise KeyError(f"no camera object named {camera_name!r}. Cameras: {', '.join(cams) or 'none'}")
             if src_cam is None:
                 raise RuntimeError("this file has no camera; use view iso or front")
             if src_cam.type == "CAMERA":
@@ -971,10 +1108,15 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
             "applied": applied,
             "framing": framing_note,
         }
+        overlay_notes = [f"{e['style']} {_overlay_label(e)}" for e in in_scene] + overlay_notes
         if overlay_notes:
             result["overlays"] = overlay_notes
         if material_name:
             result["material"] = str(material_name)
+        if ref_view:
+            result["reference"] = [_overlay_label(e) for e in ref_entries]
+        if camera_name:
+            result["camera"] = camera_name
         return result, warnings
     finally:
         _cleanup(scene, cam, cam_data, private)

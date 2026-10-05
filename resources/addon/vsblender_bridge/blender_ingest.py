@@ -66,7 +66,7 @@ def _load_snapshot():
 
 _snapshot = _load_snapshot()
 
-INGEST_VERSION = 2
+INGEST_VERSION = 3
 GEOM_TYPES = {"MESH", "CURVE", "SURFACE", "META", "FONT", "CURVES", "POINTCLOUD", "VOLUME", "GREASEPENCIL", "GPENCIL"}
 GENERIC_TOKENS = {"cube", "plane", "sphere", "ico", "icosphere", "cylinder", "cone", "torus", "circle", "grid", "mesh",
                   "object", "obj", "geo", "geometry", "empty", "default", "untitled", "new", "copy", "final", "low",
@@ -168,13 +168,41 @@ def series_base(name):
     return re.sub(r"[\s._-]*\d+$", "", name)
 
 
+def series_label(name):
+    """The number that ends a series member's name ('AG Chevron 7' -> '7'), or the name."""
+    match = re.search(r"(\d+)$", name)
+    return match.group(1) if match else name
+
+
+def natural_key(name):
+    """Sort 'Rock 2' before 'Rock 10'."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+_ROLE_PROP = re.compile(r"(^|[_.\s])(role|purpose|description|desc|notes?|intent)$", re.I)
+
+
+def root_props(o):
+    """Custom properties of a root object worth showing in the tree: what a script recorded about the
+    whole build (ag_dial = 'locks at frames ...'), not roles (already shown) or VSBlender's stamps."""
+    out = {}
+    for k, v in (o.get("custom_props") or {}).items():
+        if _ROLE_PROP.search(k) or k.startswith(("ai_", "vsblender_", "_")):
+            continue
+        text = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+        out[k] = text if len(text) <= 240 else text[:237] + "..."
+        if len(out) >= 6:
+            break
+    return out
+
+
 def custom_props(idb):
     out = {}
     for k in sorted(idb.keys()):
         if k.startswith("_") or k in ("cycles", "cycles_visibility"):
             continue
-        # Provenance stamps and specs are reported on their own (built_by, spec).
-        if k.startswith(("ai_built_", "ai_modified_")) or k == "ai_spec":
+        # Provenance stamps and specs are reported on their own (built_by, spec, appended_from).
+        if k.startswith(("ai_built_", "ai_modified_", "ai_appended_")) or k == "ai_spec":
             continue
         v = jsonable(idb[k])
         if isinstance(v, str) and len(v) > 2000:
@@ -428,6 +456,96 @@ def anim_channels(idb):
     return out or None
 
 
+def _fcurves_of(idb):
+    ad = getattr(idb, "animation_data", None) if idb is not None else None
+    if not ad or ad.action is None:
+        return []
+    if getattr(ad, "action_slot", None) is not None:
+        try:
+            from bpy_extras import anim_utils
+            cb = anim_utils.action_get_channelbag_for_slot(ad.action, ad.action_slot)
+            return list(cb.fcurves) if cb else []
+        except Exception:
+            pass
+    return list(safe(lambda: ad.action.fcurves, []) or [])
+
+
+_HIDE_WORDS = {"hide_render": ("hidden in renders", "shown in renders"),
+               "hide_viewport": ("hidden in the viewport", "shown in the viewport")}
+
+
+def _beat_value(data_path, value):
+    # + 0.0 turns -0.0 into 0.0, so a turn starts at 0°, not -0°.
+    if "rotation_euler" in data_path or data_path.endswith(("angle", "rotation")):
+        return f"{math.degrees(value) + 0.0:.4g}°"
+    return f"{value + 0.0:.4g}"
+
+
+def animation_beats(scene):
+    """When things happen: each channel's changes in time order across the scene.
+
+    A beat is a run of keys whose values keep changing: 'f145-154 AG Chevron Light 1 Emission Strength
+    0 -> 9 -> 5.5'. Holds (equal neighbouring keys) end a run. A constant key changes the value at the
+    next key, so a step lands on that frame. Returns (frame, line) pairs sorted by frame.
+    """
+    sources = []
+    seen = set()
+
+    def add(label, idb):
+        if idb is None or idb.as_pointer() in seen:
+            return
+        seen.add(idb.as_pointer())
+        sources.append((label, idb))
+
+    for ob in scene.objects:
+        add(f"**{ob.name}**", ob)
+        if ob.data is not None:
+            add(f"**{ob.name}**", ob.data)
+            add(f"**{ob.name}**", getattr(ob.data, "shape_keys", None))
+    for coll, prefix in ((bpy.data.materials, "MA:"), (bpy.data.worlds, "WO:")):
+        for idb in coll:
+            add(f"**{prefix}{idb.name}**", idb)
+            add(f"**{prefix}{idb.name}**", getattr(idb, "node_tree", None))
+    add(f"**scene {scene.name}**", scene)
+    beats = []
+    shown = {}  # (frame, label, shown?) -> where: renders and viewport keyed together read as one beat
+    for label, idb in sources:
+        for fc in _fcurves_of(idb):
+            keys = [(float(k.co[0]), float(k.co[1]), k.interpolation) for k in fc.keyframe_points]
+            channel = channel_label(idb, fc.data_path, fc.array_index)
+            channel = channel.split(" › ", 1)[-1] if " › " in channel else channel
+            base_path = fc.data_path.split(".")[-1]
+            i = 0
+            while i < len(keys) - 1:
+                if abs(keys[i + 1][1] - keys[i][1]) <= 1e-9:
+                    i += 1
+                    continue
+                j = i + 1
+                while j < len(keys) - 1 and abs(keys[j + 1][1] - keys[j][1]) > 1e-9:
+                    j += 1
+                run = keys[i:j + 1]
+                f0 = run[1][0] if run[0][2] == "CONSTANT" else run[0][0]
+                f1 = run[-1][0]
+                span = f"f{f0:g}" if f0 == f1 else f"f{f0:g}-{f1:g}"
+                if base_path in _HIDE_WORDS and len(run) == 2:
+                    where = "renders" if base_path == "hide_render" else "the viewport"
+                    shown.setdefault((f0, span, label, not run[-1][1]), []).append(where)
+                else:
+                    stepped = all(k[2] == "CONSTANT" for k in run[:-1])
+                    values = [_beat_value(fc.data_path, k[1]) for k in run]
+                    if len(values) <= 4:
+                        change = " -> ".join(values)
+                    else:
+                        change = f"{values[0]} -> {values[-1]} ({len(values)} keys{', stepped' if stepped else ''})"
+                    beats.append((f0, f"{span} {label} {channel} {change}"))
+                i = j
+    for (f0, span, label, visible), places in shown.items():
+        places = sorted(set(places))
+        beats.append((f0, f"{span} {label} {'shown' if visible else 'hidden'} in {' and '.join(places)}"))
+    beats.sort(key=lambda b: (b[0], b[1]))
+    return beats
+
+
 # ----------------------------------------------------------------------------- manifest
 def modifier_info(md):
     d = {"name": md.name, "type": md.type, "enabled": [md.show_viewport, md.show_render],
@@ -480,9 +598,23 @@ def object_info(ob, deps, scene, vl):
         o["rotation_deg"] = [rnd(math.degrees(a), 3) for a in ob.rotation_euler]
 
     if ob.type in GEOM_TYPES:
-        pts = [eo.matrix_world @ Vector(c) for c in eo.bound_box]
+        if ob.hide_viewport and ob.type == "MESH" and len(ob.data.vertices):
+            # Hidden in the viewport (often by keys): the depsgraph does not evaluate it, so its evaluated
+            # bounds are empty. Its own mesh, placed by its own and its parents' transforms, instead.
+            m = ob.matrix_basis.copy()
+            child = ob
+            while child.parent is not None:
+                m = child.parent.matrix_basis @ child.matrix_parent_inverse @ m
+                child = child.parent
+            pts = [m @ Vector(c) for c in ob.bound_box] if any(any(c) for c in ob.bound_box) else \
+                [m @ v.co for v in ob.data.vertices[:200000]]
+            o["evaluated"] = False
+            size = [max(p[i] for p in pts) - min(p[i] for p in pts) for i in range(3)]
+            o["dimensions"] = vec(size)
+        else:
+            pts = [eo.matrix_world @ Vector(c) for c in eo.bound_box]
+            o["dimensions"] = vec(eo.dimensions)
         o["bbox"] = [vec([min(p[i] for p in pts) for i in range(3)]), vec([max(p[i] for p in pts) for i in range(3)])]
-        o["dimensions"] = vec(eo.dimensions)
 
     if ob.type == "MESH":
         o["mesh"] = mesh_info(ob, eo)
@@ -522,6 +654,8 @@ def object_info(ob, deps, scene, vl):
              if k in ("ai_built_by", "ai_built_sha", "ai_built_at", "ai_built_reason", "ai_modified_by", "ai_modified_at")}
     if built:
         o["built_by"] = built
+    if ob.get("ai_appended_from"):
+        o["appended_from"] = {"file": str(ob["ai_appended_from"]), "object": str(ob.get("ai_appended_object") or ob.name)}
     if isinstance(ob.get("ai_spec"), str):
         try:
             o["spec"] = json.loads(ob["ai_spec"])
@@ -652,8 +786,10 @@ def build_manifest(blend_path, sha):
     size_mb = rnd(os.path.getsize(blend_path) / 1e6, 2) if blend_path and os.path.exists(blend_path) else 0.0
     man = {
         "ingest_version": INGEST_VERSION,
+        # bpy.data.version is (major, minor, file subversion): 5.2.45 is not a Blender release.
         "file": {"name": os.path.basename(blend_path) if blend_path else "untitled.blend", "size_mb": size_mb,
-                 "saved_with": ".".join(map(str, bpy.data.version)), "ingested_with": bpy.app.version_string,
+                 "saved_with": f"{bpy.data.version[0]}.{bpy.data.version[1]}", "file_subversion": bpy.data.version[2],
+                 "ingested_with": bpy.app.version_string,
                  "other_scenes": sorted(s.name for s in bpy.data.scenes if s != scene)},
         "scene": {"name": scene.name, "engine": r.engine,
                   "resolution": [r.resolution_x, r.resolution_y, r.resolution_percentage],
@@ -683,6 +819,7 @@ def build_manifest(blend_path, sha):
                   "faces_after_modifiers": sum(m.get("evaluated", m)["faces"] for m in meshes),
                   "materials": len(bpy.data.materials), "images": len(images)},
     }
+    man["beats"] = [text for _frame, text in safe(lambda: animation_beats(scene), []) or []][:400]
     man["issues"] = build_issues(man)
     return man
 
@@ -1178,6 +1315,30 @@ def detect_renames(old_objects, new_objects):
     return renames
 
 
+_VISIBILITY = {"viewport": ("hidden in the viewport", "shown in the viewport"),
+               "render": ("hidden in renders", "shown in renders"),
+               "view_layer": ("hidden in the view layer", "unhidden in the view layer"),
+               "in_view_layer": ("added to the view layer", "excluded from the view layer")}
+
+
+def visibility_words(old, new):
+    """{'viewport': False, 'render': True, ...} -> {...} as words: 'hidden in renders, shown in the viewport'."""
+    parts = []
+    for key, (on, off) in _VISIBILITY.items():
+        if old.get(key) == new.get(key):
+            continue
+        parts.append(on if bool(new.get(key)) else off)
+    return ", ".join(parts) or "changed"
+
+
+def dict_change_words(old, new):
+    """Which keys of a dict were added, removed or changed: 'ag_dial changed, ag_role added'."""
+    parts = [f"{k} added" for k in sorted(set(new) - set(old))]
+    parts += [f"{k} removed" for k in sorted(set(old) - set(new))]
+    parts += [f"{k} changed" for k in sorted(set(old) & set(new)) if old[k] != new[k]]
+    return ", ".join(parts[:8]) + (f" (+{len(parts) - 8} more)" if len(parts) > 8 else "") or "changed"
+
+
 def diff_manifests(old, new):
     out = []
 
@@ -1197,7 +1358,13 @@ def diff_manifests(old, new):
         a, b = oo[n_old], no[n]
         for k in ("parent", "location", "rotation_deg", "rotation_quat", "scale", "materials", "hidden", "data",
                   "custom_props", "light", "camera"):
-            if a.get(k) != b.get(k):
+            if a.get(k) == b.get(k):
+                continue
+            if k == "hidden":
+                add(n, f"visibility: {visibility_words(a.get(k) or {}, b.get(k) or {})}")
+            elif k == "custom_props":
+                add(n, f"custom properties: {dict_change_words(a.get(k) or {}, b.get(k) or {})}")
+            else:
                 add(n, f"{k}: {a.get(k)} -> {b.get(k)}")
         if a.get("modifiers") != b.get("modifiers"):
             add(n, f"modifiers changed: {[m['type'] for m in a.get('modifiers', [])]} -> {[m['type'] for m in b.get('modifiers', [])]}")
@@ -1229,7 +1396,8 @@ def diff_manifests(old, new):
 def notes_generated(man, roles, state, previews):
     f, s, st = man["file"], man["scene"], man["stats"]
     sha = (state.get("sha256") or "unsaved")[:12]
-    L = [f"**File** `{f['name']}` - {f['size_mb']} MB - saved with Blender {f['saved_with']} - "
+    sub = f" (file subversion {f['file_subversion']})" if f.get("file_subversion") is not None else ""
+    L = [f"**File** `{f['name']}` - {f['size_mb']} MB - saved with Blender {f['saved_with']}{sub} - "
          f"sha256 `{sha}` - ingested {state['ingested_at']} with Blender {f['ingested_with']}",
          ""]
     if state.get("source") == "live":
@@ -1262,18 +1430,24 @@ def notes_generated(man, roles, state, previews):
         size = f" {o['mesh']['verts']:,}v/{o['mesh']['faces']:,}f" if o.get("mesh") else ""
         role = r["role"] if len(r["role"]) <= 170 else r["role"][:167] + "..."
         tag = "[a]" if r["source"] == "annotation" else ("[r]" if r["source"] in ("ai", "human") else "[?]")
-        return f"{'  ' * depth}- **{n}** {o['type']}{size} - {role} `{tag}`"
+        text = f"{'  ' * depth}- **{n}** {o['type']}{size} - {role} `{tag}`"
+        # A root holds what its scripts recorded about the whole (a dial schedule, a build note).
+        props = root_props(o) if o["parent"] is None and kids.get(n) else {}
+        if props:
+            text += "\n" + "\n".join(f"{'  ' * (depth + 1)}- `{k}`: {v}" for k, v in props.items())
+        return text
 
     def emit(names, depth):
         by_series = defaultdict(list)
-        for n in sorted(names):
+        for n in sorted(names, key=natural_key):
             by_series[series_base(n)].append(n)
-        for base, members in sorted(by_series.items(), key=lambda kv: kv[1][0]):
+        for base, members in sorted(by_series.items(), key=lambda kv: natural_key(kv[1][0])):
             leafs = [m for m in members if not kids.get(m)]
             if len(leafs) >= 4:
                 o0 = objs[leafs[0]]
+                role = series_role([roles[m]["role"] for m in leafs], [series_label(m) for m in leafs])
                 L.append(f"{'  ' * depth}- **{leafs[0]} ... {leafs[-1]}** ({len(leafs)} x {o0['type']}) - "
-                         f"{series_role([roles[m]['role'] for m in leafs])[:160]}")
+                         f"{role if len(role) <= 360 else role[:357] + '...'}")
                 members = [m for m in members if m not in leafs]
             for m in members:
                 L.append(line(m, depth))
@@ -1332,17 +1506,27 @@ def notes_generated(man, roles, state, previews):
                 order.append(key)
             groups[key].append((n, a))
         for key in order:
-            members = groups[key]
+            members = sorted(groups[key], key=lambda item: natural_key(item[0]))
             if len(members) >= 3:
                 frames = [c["frames"] for _n, a in members for ch in a.values() for c in ch.get("channels", [])]
                 f0 = min(fr[0] for fr in frames) if frames else 0
                 f1 = max(fr[1] for fr in frames) if frames else 0
                 labels = ", ".join(list(key[1])[:4]) + (f", +{len(key[1]) - 4} more" if len(key[1]) > 4 else "")
-                L.append(f"- **{members[0][0]} ... {members[-1][0]}** ({len(members)}, the same channels, keys between "
-                         f"f{f0:g} and f{f1:g}): {labels}")
+                numbers = [series_label(n) for n, _a in members]
+                which = number_list([float(x) for x in numbers]) if all(x.isdigit() for x in numbers) else ""
+                L.append(f"- **{members[0][0]} ... {members[-1][0]}** ({len(members)}{': ' + which if which else ''}; the same "
+                         f"channels, keys between f{f0:g} and f{f1:g}, see Animation beats): {labels}")
             else:
                 for n, a in members:
                     L.append(f"- **{n}**: {'; '.join(anim_parts(a))}")
+
+    beats = man.get("beats") or []
+    if beats:
+        L += ["", "## Animation beats", "",
+              "What changes when, in time order (`timeline` lists every key; `timeline` op evaluate gives values at frames).", ""]
+        L += [f"- {b}" for b in beats[:80]]
+        if len(beats) > 80:
+            L.append(f"- ... {len(beats) - 80} more: call `timeline` with frames {{start, end}}")
 
     built = defaultdict(list)
     for n, o in objs.items():
@@ -1358,9 +1542,7 @@ def notes_generated(man, roles, state, previews):
     specs = [(n, o["spec"]) for n, o in objs.items() if o.get("spec")]
     if specs:
         L += ["", "## Parameters", "", "What objects were built from (vsblender.spec, geo to_object). Intent as data.", ""]
-        for n, spec in sorted(specs):
-            text = ", ".join(f"{k}={json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v}" for k, v in spec.items())
-            L.append(f"- **{n}**: {text[:300]}{'...' if len(text) > 300 else ''}")
+        L += parameter_lines(specs)
 
     if man["issues"]:
         L += ["", "## Before you modify", ""]
@@ -1401,6 +1583,64 @@ def _structure(summary):
     return _VALUE_PAIR.sub("", summary).replace("[]", "")
 
 
+def geo_summary(desc):
+    """A geo build description, short. Descriptions of solids made by builder functions are mostly
+    '<lambda>' and say nothing, so they become counts of what was done: '1 difference, 2 unions, 4
+    joins, 2 polar arrays (x9)'."""
+    text = str(desc)
+    if "<lambda>" not in text and "builder" not in text and len(text) <= 160:
+        return text
+    counts = []
+    for label, pattern in (("difference", r"\) - \("), ("union", r"\) \+ \("), ("intersection", r"\) & \("),
+                           ("join", r"\bjoin\("), ("transform", r"\.transform\("), ("mirror", r"\.mirror\("),
+                           ("bevel", r"\.bevel\(")):
+        n = len(re.findall(pattern, text))
+        if n:
+            counts.append(f"{n} {label}{'s' if n > 1 else ''}")
+    polar = re.findall(r"\.polar\((\d+)", text)
+    if polar:
+        counts.append(f"{len(polar)} polar array{'s' if len(polar) > 1 else ''} (x{', x'.join(dict.fromkeys(polar))})")
+    builders = len(re.findall(r"<lambda>|solid\(builder\)", text))
+    if builders:
+        counts.insert(0, f"{builders} builder function{'s' if builders > 1 else ''}")
+    return "built from " + ", ".join(counts) if counts else "geo build"
+
+
+def _spec_value(v):
+    return v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+
+
+def parameter_lines(specs):
+    """One line per object, or one per numbered series: each key with its values in member order,
+    as a range when they step evenly, '-' where a member has no value (lock_order=7,1,2,3,-,-,4,5,6)."""
+    lines = []
+    groups = defaultdict(list)
+    for n, spec in sorted(specs, key=lambda item: natural_key(item[0])):
+        groups[series_base(n)].append((n, dict(spec)))
+    for _base, members in groups.items():
+        for _n, spec in members:
+            if "geo" in spec:
+                spec["geo"] = geo_summary(spec["geo"])
+        if len(members) >= 3:
+            keys = list(dict.fromkeys(k for _n, s in members for k in s))
+            parts = []
+            for k in keys:
+                values = [s.get(k) for _n, s in members]
+                if all(v is None or (isinstance(v, (int, float)) and not isinstance(v, bool)) for v in values):
+                    parts.append(f"{k}={number_list([None if v is None else float(v) for v in values])}")
+                elif len({json.dumps(v, sort_keys=True) for v in values}) == 1:
+                    parts.append(f"{k}={_spec_value(values[0])}")
+                else:
+                    parts.append(f"{k}=" + ",".join("-" if v is None else _spec_value(v) for v in values))
+            text = ", ".join(parts)
+            lines.append(f"- **{members[0][0]} ... {members[-1][0]}** ({len(members)}): {text[:400]}{'...' if len(text) > 400 else ''}")
+            continue
+        for n, spec in members:
+            text = ", ".join(f"{k}={_spec_value(v)}" for k, v in spec.items())
+            lines.append(f"- **{n}**: {text[:300]}{'...' if len(text) > 300 else ''}")
+    return lines
+
+
 def collapse_names(names):
     """'SG Chevron 0 ... SG Chevron 8 (9)' for numbered series, plain names otherwise."""
     groups = defaultdict(list)
@@ -1415,30 +1655,69 @@ def collapse_names(names):
     return ", ".join(parts)
 
 
-def series_role(roles):
-    """What a collapsed series has in common: the shared role, with the numbers that vary shown as
-    ranges ('lock order 1-6'), or the shared start of the roles."""
-    distinct = list(dict.fromkeys(r for r in roles if r))
-    if not distinct:
+def number_list(values):
+    """A column of numbers, in member order: '1-7' or '0-320 step 40' only when they step evenly,
+    otherwise listed ('7,13,14,17'); None (a member without it) is '-'."""
+    shown = ["-" if v is None else f"{v:g}" for v in values]
+    nums = [v for v in values if v is not None]
+    if not nums:
+        return "-"
+    if len(set(shown)) == 1:
+        return shown[0]
+    if len(nums) == len(values) and len(nums) >= 3:
+        step = nums[1] - nums[0]
+        if step and all(abs((b - a) - step) < 1e-9 for a, b in zip(nums, nums[1:])):
+            return f"{nums[0]:g}-{nums[-1]:g}" if abs(step) == 1 else f"{nums[0]:g}-{nums[-1]:g} step {step:g}"
+    return ",".join(shown)
+
+
+def _fill(template, rows):
+    """A number template ('Chevron # at # deg') filled with each number column of rows."""
+    columns = list(zip(*rows)) if rows else []
+    out = template
+    for col in columns:
+        out = out.replace("#", number_list(list(col)), 1)
+    return out
+
+
+def _numbers(text):
+    return [float(x) for x in _NUMBERS.findall(text)]
+
+
+def series_role(roles, labels=None):
+    """What a collapsed series has in common.
+
+    One shared template: the numbers that vary as a range when they step evenly ('symbol 1-7'), or
+    listed ('glyph 7,13,14,17,21,29,31'). Several templates: their common start, then each variant
+    with the members it applies to ('locks symbol 1,2,3 of a 7-symbol dial [1,2,3]; unused [4,5]').
+    labels: a short name per member (its series number), in the same order as roles.
+    """
+    pairs = [(labels[i] if labels else str(i), r) for i, r in enumerate(roles) if r]
+    if not pairs:
         return ""
+    distinct = list(dict.fromkeys(r for _l, r in pairs))
     if len(distinct) == 1:
         return distinct[0]
-    templates = {_NUMBERS.sub("#", r) for r in distinct}
-    if len(templates) == 1:
-        template = templates.pop()
-        columns = list(zip(*[[float(x) for x in _NUMBERS.findall(r)] for r in distinct]))
-        out = template
-        for col in columns:
-            lo, hi = min(col), max(col)
-            text = f"{lo:g}" if lo == hi else f"{lo:g}-{hi:g}"
-            out = out.replace("#", text, 1)
-        return out
-    prefix = os.path.commonprefix(distinct)
-    cut = max(prefix.rfind(" "), prefix.rfind(";"), prefix.rfind(","))
-    prefix = prefix[:cut].rstrip(" ;,.-") if cut > 0 else ""
-    if len(prefix) >= 12:
-        return f"{prefix} ... ({len(distinct)} different roles)"
-    return f"{len(distinct)} different roles, e.g. {distinct[-1]}"
+    masked = [_NUMBERS.sub("#", r) for _l, r in pairs]
+    if len(set(masked)) == 1:
+        return _fill(masked[0], [_numbers(r) for _l, r in pairs])
+    # The common start of the masked roles, cut back to a word or clause boundary.
+    prefix = os.path.commonprefix(masked)
+    cut = max(prefix.rfind(" "), prefix.rfind(";"), prefix.rfind(","), prefix.rfind(":"))
+    prefix = prefix[:cut + 1] if cut > 0 else ""
+    head_count = prefix.count("#")
+    head = _fill(prefix, [_numbers(r)[:head_count] for _l, r in pairs]).strip() if prefix.strip() else ""
+    variants = {}
+    for (label, role), mask in zip(pairs, masked):
+        rest_mask = mask[len(prefix):].strip(" ;,")
+        variants.setdefault(rest_mask, []).append((label, _numbers(role)[head_count:]))
+    if len(variants) > 4 or not head:
+        return f"{len(distinct)} different roles, e.g. {distinct[-1]}"
+    parts = []
+    for rest, members in variants.items():
+        text = _fill(rest, [nums for _l, nums in members])
+        parts.append(f"{text} [{', '.join(l for l, _n in members)}]")
+    return f"{head} " + "; ".join(parts)
 
 
 DEFAULT_TAIL = """
@@ -1491,6 +1770,38 @@ def parse_args(argv=None):
 
 def sidecar_for(blend):
     return os.path.join(os.path.dirname(blend), ".blender-ai", os.path.splitext(os.path.basename(blend))[0])
+
+
+_EXPLAINS = ("script", "pipeline", "restore", "append", "save", "role")
+
+
+def journal_since(path, since):
+    """Journal entries written after `since` (an ISO time) that change the scene or save it: the AI's
+    runs and saves. A file saved after them changed because of them, not by an unknown hand."""
+    if not since or not os.path.exists(path):
+        return []
+    try:
+        start = datetime.datetime.fromisoformat(since)
+    except ValueError:
+        return []
+    out = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+                when = datetime.datetime.fromisoformat(str(e.get("time")))
+            except (ValueError, TypeError):
+                continue
+            if e.get("event") not in _EXPLAINS or e.get("rolled_back"):
+                continue
+            # Times have whole seconds: a run in the same second as the ingest came after it.
+            try:
+                later = when >= start
+            except TypeError:  # one of them without a time zone
+                later = when.replace(tzinfo=None) >= start.replace(tzinfo=None)
+            if later:
+                out.append(e)
+    return out
 
 
 def live_ingest(out, render_view, actor="ai", reason="", force=False, previews=True, preview_size=512):
@@ -1597,21 +1908,35 @@ def ingest(args, out=None, render_view=None, source="disk"):
         why = f" {args.reason}." if args.reason else ""
         summary = "; ".join(f"{c['subject']}: {c['change']}" for c in changes[:8])
         more = f"; +{len(changes) - 8} more (journal.jsonl)" if len(changes) > 8 else ""
+        # A save after the AI's runs: the journal (and the lines above) already say what changed and why.
+        explained = journal_since(p("journal.jsonl"), (old_state or {}).get("ingested_at")) if source == "disk" else []
+        runs = [e for e in explained if e.get("event") != "save"]
+        saves = [e for e in explained if e.get("event") == "save"]
         if source == "live":
             log_line = (f"- {stamp} [{who}]{why} live ingest, {len(changes)} change(s) since the last ingest: {summary}{more}"
                         if changes else f"- {stamp} [{who}]{why} live ingest, no structural changes.")
+        elif changes and runs:
+            event = "saved"
+            if who in ("external", "ingest"):
+                who = str((saves[-1] if saves else runs[-1]).get("actor") or "ai")
+            reason = args.reason or (saves[-1].get("reason") if saves else "") or ""
+            why = f": {reason.rstrip('.')}" if reason else ""
+            log_line = (f"- {stamp} [{who}] saved{why}. {len(changes)} change(s), from {len(runs)} run(s) logged above since the "
+                        f"last ingest (and any edits by hand) (sha {prev} -> {sha[:8]}).")
         else:
             log_line = (f"- {stamp} [{who}]{why} {len(changes)} change(s) detected (sha {prev} -> {sha[:8]}): {summary}{more}"
                         if changes else f"- {stamp} [{who}]{why} file re-saved, no structural changes (sha {prev} -> {sha[:8]}).")
     write_notes(p("NOTES.md"), man, roles, state, previews, log_line)
 
+    record = {"time": state["ingested_at"], "event": event,
+              "actor": (who if event == "saved" else args.actor) if changes is not None else "ingest", "source": source,
+              "reason": args.reason or None, "sha256": sha,
+              "previous_sha256": old_state.get("sha256") if old_state else None,
+              "changes": [f"{c['subject']}: {c['change']}" for c in changes or []]}
+    if event == "saved":
+        record["explained_by"] = [e.get("script") or e.get("pipeline") or e.get("event") for e in runs]
     with open(p("journal.jsonl"), "a", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps({"time": state["ingested_at"], "event": event,
-                            "actor": args.actor if changes is not None else "ingest", "source": source,
-                            "reason": args.reason or None, "sha256": sha,
-                            "previous_sha256": old_state.get("sha256") if old_state else None,
-                            "changes": [f"{c['subject']}: {c['change']}" for c in changes or []]},
-                           ensure_ascii=False) + "\n")
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
     write_json(p("state.json"), state)
     return {"status": event, "out": out, "source": source, "objects": len(man["objects"]),
             "changes": len(changes or []), "issues": len(man["issues"]),

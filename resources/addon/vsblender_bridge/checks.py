@@ -39,6 +39,7 @@ LEVELS = {
     "uvs": (None, "warn", "warn", None),
     "shading": (None, "info", "info", None),
     "unit_suspect": ("warn", "warn", "warn", "warn"),
+    "hidden_by_keys": ("info", "info", "info", "info"),
     "too_big": (None, None, None, "error"),
     "no_bed_contact": (None, None, None, "error"),
     "small_contact": (None, None, None, "warn"),
@@ -65,11 +66,13 @@ def default_purpose() -> str:
 
 
 def default_targets(root: str) -> list:
+    from . import marks
+
     out = []
     for ob in bpy.context.scene.objects:
         if ob.type not in GEOMETRY_TYPES or ob.name.startswith("_vsblender"):
             continue
-        if "vsblender_reference" in ob.keys() or ob.hide_render or ob.hide_get():
+        if marks.left_out(ob) or ob.hide_render or ob.hide_get():
             continue
         if ob.display_type in {"WIRE", "BOUNDS"} and ob.hide_render is False and any(
                 m.type == "BOOLEAN" and m.object == ob for o in bpy.context.scene.objects for m in o.modifiers):
@@ -130,7 +133,60 @@ def _size_text(size, unit: str) -> str:
     return " x ".join(_fmt(v, 3) for v in size) + f" {unit}"
 
 
+def keyed_visibility(ob) -> dict | None:
+    """When an object's visibility is keyed: whether it is hidden now, and the frames it shows from.
+    {'hidden_now': True, 'channels': ['hide_viewport'], 'visible_from': 90} or None."""
+    from . import helpers
+
+    curves = [fc for fc in helpers.fcurves(ob) if fc.data_path in ("hide_viewport", "hide_render")]
+    if not curves:
+        return None
+    scene = bpy.context.scene
+    now = scene.frame_current
+    hidden_now = any(fc.evaluate(now) >= 0.5 for fc in curves)
+    shows = []
+    for fc in curves:
+        for kp in fc.keyframe_points:
+            if kp.co[1] < 0.5:
+                shows.append(int(round(kp.co[0])))
+    return {"hidden_now": hidden_now, "channels": sorted({fc.data_path for fc in curves}),
+            "visible_from": min(shows) if shows else None, "frame": now}
+
+
+def rest_matrix(ob):
+    """World matrix from the object's own (keyed) transform and its parents', without the depsgraph."""
+    matrix = ob.matrix_basis.copy()
+    child = ob
+    while child.parent is not None:
+        matrix = child.parent.matrix_basis @ child.matrix_parent_inverse @ matrix
+        child = child.parent
+    return matrix
+
+
+def rest_arrays(ob):
+    """The object's own mesh (no modifiers) placed by its parent chain, for an object the depsgraph
+    does not evaluate (hidden in the viewport): its evaluated copy has no geometry and a zero matrix."""
+    if ob.type != "MESH" or ob.data is None:
+        return None
+    arrays = meshdata._mesh_arrays(ob.data)
+    arrays.name = ob.name
+    return arrays.transformed(rest_matrix(ob))
+
+
 def check_model(params: dict, root: str) -> tuple:
+    frame = params.get("frame")
+    if frame is None:
+        return _check_model(params, root)
+    scene = bpy.context.scene
+    saved = scene.frame_current
+    scene.frame_set(int(frame))
+    try:
+        return _check_model(params, root)
+    finally:
+        scene.frame_set(saved)
+
+
+def _check_model(params: dict, root: str) -> tuple:
     purpose = str(params.get("purpose") or default_purpose()).lower()
     if purpose not in PURPOSES:
         raise ValueError(f"purpose must be one of {', '.join(PURPOSES)}")
@@ -179,7 +235,22 @@ def _check_object(ob, deps, purpose: str, printer: dict, to_mm: float, max_tris:
                   warnings: list):
     report = _Report(ob.name, purpose)
     started = time.time()
-    arrays = meshdata.object_arrays(ob, deps, warnings=warnings)
+    keyed = keyed_visibility(ob)
+    rest = False
+    if ob.hide_viewport or (keyed and keyed["hidden_now"] and "hide_viewport" in keyed["channels"]):
+        # Not evaluated while hidden: check its own mesh where its keys and parents put it.
+        arrays = rest_arrays(ob)
+        rest = arrays is not None
+        if arrays is None:
+            arrays = meshdata.object_arrays(ob, deps, warnings=warnings)
+    else:
+        arrays = meshdata.object_arrays(ob, deps, warnings=warnings)
+    if keyed and keyed["hidden_now"]:
+        shows = f" (visible from frame {keyed['visible_from']})" if keyed["visible_from"] is not None else ""
+        report.add("hidden_by_keys", f"hidden at frame {keyed['frame']} by keys on {', '.join(keyed['channels'])}{shows}; "
+                   f"checked its {'mesh without modifiers' if rest else 'mesh'} instead (frame= checks another frame)", level="info")
+    elif rest:
+        report.add("hidden_by_keys", "hidden in the viewport, so it is not evaluated: checked its mesh without modifiers", level="info")
     _timed(report, "mesh", started)
     t = len(arrays.tris)
     if not t:
@@ -272,7 +343,7 @@ def _check_object(ob, deps, purpose: str, printer: dict, to_mm: float, max_tris:
             report.add("self_intersection", f"skipped above {cap:,} triangles (deep=true raises the limit)", level="info")
 
     # -- object level
-    m = ob.matrix_world
+    m = rest_matrix(ob) if rest else ob.matrix_world
     scale = m.to_scale()
     if m.to_3x3().determinant() < 0:
         report.add("negative_scale", "negative scale (mirrored): exporters that ignore it flip the normals; apply the scale")

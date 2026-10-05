@@ -24,16 +24,18 @@ import numpy as np
 
 
 class MeshArrays:
-    """verts (V, 3) float64, tris (T, 3) int64. Optional per-triangle face (source polygon) and material."""
+    """verts (V, 3) float64, tris (T, 3) int64. Optional per-triangle face (source polygon) and material.
+    groups: names for the material indices (an OBJ's usemtl materials, or its g/o groups)."""
 
-    __slots__ = ("verts", "tris", "face", "material", "name")
+    __slots__ = ("verts", "tris", "face", "material", "name", "groups")
 
-    def __init__(self, verts, tris, face=None, material=None, name: str = ""):
+    def __init__(self, verts, tris, face=None, material=None, name: str = "", groups=None):
         self.verts = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
         self.tris = np.asarray(tris, dtype=np.int64).reshape(-1, 3)
         self.face = None if face is None else np.asarray(face, dtype=np.int64)
         self.material = None if material is None else np.asarray(material, dtype=np.int64)
         self.name = name
+        self.groups = list(groups) if groups else None
 
     def __len__(self) -> int:
         return len(self.tris)
@@ -41,7 +43,31 @@ class MeshArrays:
     def copy(self) -> "MeshArrays":
         return MeshArrays(self.verts.copy(), self.tris.copy(),
                           None if self.face is None else self.face.copy(),
-                          None if self.material is None else self.material.copy(), self.name)
+                          None if self.material is None else self.material.copy(), self.name, self.groups)
+
+    def select(self, mask) -> "MeshArrays":
+        """The triangles where mask is true, with only the vertices they use."""
+        mask = np.asarray(mask, dtype=bool)
+        tris = self.tris[mask]
+        used, inverse = np.unique(tris, return_inverse=True)
+        return MeshArrays(self.verts[used], inverse.reshape(-1, 3), None if self.face is None else self.face[mask],
+                          None if self.material is None else self.material[mask], self.name, self.groups)
+
+    def part(self, patterns) -> "MeshArrays":
+        """The triangles of the named groups (globs allowed): an OBJ material or group, a 3MF item."""
+        import fnmatch
+
+        if not self.groups or self.material is None:
+            raise ValueError(f"{self.name or 'this mesh'} has no named parts (an OBJ with usemtl or g lines has)")
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        wanted = [i for i, g in enumerate(self.groups) if any(fnmatch.fnmatchcase(g, p) or g == p for p in patterns)]
+        if not wanted:
+            raise KeyError(f"no part matches {patterns}. Parts: {', '.join(self.groups[:60])}"
+                           + (" ..." if len(self.groups) > 60 else ""))
+        out = self.select(np.isin(self.material, wanted))
+        out.name = ", ".join(self.groups[i] for i in wanted[:4]) + (" ..." if len(wanted) > 4 else "")
+        return out
 
     def bounds(self) -> tuple:
         if not len(self.verts):
@@ -54,13 +80,14 @@ class MeshArrays:
         m = np.asarray([list(row) for row in matrix], dtype=np.float64)
         verts = self.verts @ m[:3, :3].T + m[:3, 3]
         tris = self.tris[:, ::-1].copy() if np.linalg.det(m[:3, :3]) < 0 else self.tris
-        return MeshArrays(verts, tris, self.face, self.material, self.name)
+        return MeshArrays(verts, tris, self.face, self.material, self.name, self.groups)
 
     def scaled(self, factor: float) -> "MeshArrays":
-        return MeshArrays(self.verts * float(factor), self.tris, self.face, self.material, self.name)
+        return MeshArrays(self.verts * float(factor), self.tris, self.face, self.material, self.name, self.groups)
 
     def moved(self, offset) -> "MeshArrays":
-        return MeshArrays(self.verts + np.asarray(offset, dtype=np.float64), self.tris, self.face, self.material, self.name)
+        return MeshArrays(self.verts + np.asarray(offset, dtype=np.float64), self.tris, self.face, self.material,
+                          self.name, self.groups)
 
 
 def concat(parts) -> MeshArrays:
@@ -379,24 +406,109 @@ def read_stl(path: str, weld_tol: float | None = 1e-6) -> MeshArrays:
     return arrays
 
 
+_SLASH = re.compile(rb"/\S*")
+
+
+def _obj_vertices(lines: list) -> np.ndarray:
+    """'v x y z [w | r g b]' bodies to (N, 3)."""
+    if not lines:
+        return np.zeros((0, 3))
+    flat = np.array(b" ".join(lines).split(), dtype=np.float64)
+    if len(flat) == 3 * len(lines):
+        return flat.reshape(-1, 3)
+    return np.array([[float(x) for x in line.split()[:3]] for line in lines], dtype=np.float64)
+
+
+def _obj_faces(lines: list, nverts: int):
+    """'f a/b/c ...' bodies to (triangles, polygon index per triangle), fan-triangulated, 0-based.
+    Relative (negative) indices count back from the vertices read so far."""
+    if not lines:
+        return np.zeros((0, 3), dtype=np.int64), np.zeros(0, dtype=np.int64)
+    # A 0 between polygons marks where each ends: OBJ indices are never 0.
+    flat = np.array(_SLASH.sub(b"", b" 0 ".join(lines)).split(), dtype=np.int64)
+    ends = np.flatnonzero(flat == 0)
+    starts = np.concatenate([[0], ends + 1])
+    stops = np.concatenate([ends, [len(flat)]])
+    counts = stops - starts
+    idx = flat.copy()
+    neg = idx < 0
+    if neg.any():
+        idx[neg] += nverts + 1
+    idx -= 1
+    keep = counts >= 3
+    starts, counts = starts[keep], counts[keep]
+    poly = np.flatnonzero(keep)
+    ntri = counts - 2
+    owner = np.repeat(np.arange(len(starts)), ntri)
+    local = np.arange(int(ntri.sum())) - np.repeat(np.cumsum(ntri) - ntri, ntri)
+    first = starts[owner]
+    tris = np.stack([idx[first], idx[first + local + 1], idx[first + local + 2]], axis=1)
+    return tris, poly[owner]
+
+
 def read_obj(path: str) -> MeshArrays:
-    """Vertices and faces of an OBJ (polygons fan-triangulated). Materials, UVs and normals are ignored."""
-    verts, tris = [], []
-    with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if line.startswith("v "):
-                parts = line.split()
-                verts.append((float(parts[1]), float(parts[2]), float(parts[3])))
-            elif line.startswith("f "):
-                idx = []
-                for token in line.split()[1:]:
-                    i = int(token.split("/")[0])
-                    idx.append(i - 1 if i > 0 else len(verts) + i)
-                for k in range(1, len(idx) - 1):
-                    tris.append((idx[0], idx[k], idx[k + 1]))
-    if not tris:
+    """Vertices and faces of an OBJ, vectorised (a 500 MB file in seconds). Polygons are
+    fan-triangulated. Each triangle keeps its usemtl material, or its g/o group when the file has no
+    materials: arrays.material indexes arrays.groups, and arrays.part("Chevron") selects one."""
+    verts_parts, tri_parts, poly_group = [], [], []
+    nverts = 0
+    npoly = 0
+    names = {"mtl": [], "grp": []}
+    runs = {"mtl": [], "grp": []}  # (first polygon, name index)
+
+    def group_index(kind, name):
+        table = names[kind]
+        if name not in table:
+            table.append(name)
+        return table.index(name)
+
+    with open(path, "rb") as handle:
+        rest = b""
+        while True:
+            chunk = handle.read(1 << 26)
+            data = rest + chunk
+            if chunk:
+                cut = data.rfind(b"\n")
+                if cut < 0:
+                    rest = data
+                    continue
+                rest, data = data[cut + 1:], data[:cut]
+            vlines, flines = [], []
+            for line in data.split(b"\n"):
+                head = line[:2]
+                if head == b"v ":
+                    vlines.append(line[2:])
+                elif head == b"f ":
+                    flines.append(line[2:].strip())
+                elif line.startswith(b"usemtl "):
+                    runs["mtl"].append((npoly + len(flines), group_index("mtl", line[7:].strip().decode("utf-8", "replace"))))
+                elif head in (b"g ", b"o "):
+                    runs["grp"].append((npoly + len(flines), group_index("grp", line[2:].strip().decode("utf-8", "replace"))))
+            verts = _obj_vertices(vlines)
+            nverts += len(verts)
+            verts_parts.append(verts)
+            tris, poly = _obj_faces(flines, nverts)
+            tri_parts.append(tris)
+            poly_group.append(poly + npoly)
+            npoly += len(flines)
+            if not chunk:
+                break
+    tris = np.vstack(tri_parts) if tri_parts else np.zeros((0, 3), dtype=np.int64)
+    if not len(tris):
         raise ValueError(f"{path} has no faces")
-    return MeshArrays(verts, tris, name=os.path.splitext(os.path.basename(path))[0])
+    poly = np.concatenate(poly_group)
+    kind = "mtl" if names["mtl"] else "grp"
+    groups = names[kind] or None
+    material = None
+    if groups:
+        starts = np.array([r[0] for r in runs[kind]], dtype=np.int64)
+        ids = np.array([r[1] for r in runs[kind]], dtype=np.int64)
+        where = np.searchsorted(starts, poly, side="right") - 1
+        material = np.where(where >= 0, ids[np.clip(where, 0, None)], 0)
+    verts = np.vstack(verts_parts)
+    if len(tris) and (tris.min() < 0 or tris.max() >= len(verts)):
+        raise ValueError(f"{path}: a face uses a vertex the file does not define")
+    return MeshArrays(verts, tris, material=material, name=os.path.splitext(os.path.basename(path))[0], groups=groups)
 
 
 _UNIT_MM = {"micron": 0.001, "millimeter": 1.0, "centimeter": 10.0, "inch": 25.4, "foot": 304.8, "meter": 1000.0}
@@ -501,8 +613,27 @@ def read_svg_mesh(path: str, plane: str = "xy") -> MeshArrays:
     return MeshArrays(verts, tris, name=os.path.splitext(os.path.basename(path))[0])
 
 
-def read_mesh_file(path: str, plane: str = "xy") -> MeshArrays:
-    """STL, OBJ, 3MF (all build items) or SVG (flat outline in plane) as one mesh, in the file's units."""
+_FILE_CACHE: dict = {}
+_CACHE_VERTS = 12_000_000
+
+
+def read_mesh_file(path: str, plane: str = "xy", part=None) -> MeshArrays:
+    """STL, OBJ, 3MF (all build items) or SVG (flat outline in plane) as one mesh, in the file's units.
+    part: a group name or glob (an OBJ material or group, a 3MF item) to keep only that part. Parsed
+    files are cached by path, size and modification time, so measuring a big reference again is quick."""
+    stat = os.stat(path)
+    key = (os.path.normcase(os.path.abspath(path)), stat.st_size, stat.st_mtime_ns, plane)
+    arrays = _FILE_CACHE.get(key)
+    if arrays is None:
+        arrays = _read_mesh_file(path, plane)
+        _FILE_CACHE[key] = arrays
+        # Keep the cache to a few large files.
+        while sum(len(a.verts) for a in _FILE_CACHE.values()) > _CACHE_VERTS and len(_FILE_CACHE) > 1:
+            _FILE_CACHE.pop(next(iter(_FILE_CACHE)))
+    return arrays.part(part) if part else arrays
+
+
+def _read_mesh_file(path: str, plane: str = "xy") -> MeshArrays:
     ext = os.path.splitext(path)[1].lower()
     if ext == ".stl":
         return read_stl(path)
@@ -510,7 +641,9 @@ def read_mesh_file(path: str, plane: str = "xy") -> MeshArrays:
         return read_obj(path)
     if ext == ".3mf":
         items = read_3mf(path)
-        out = concat([a for _n, a in items])
+        out = concat([a.scaled(1.0) for _n, a in items])
+        out.material = np.concatenate([np.full(len(a.tris), i, dtype=np.int64) for i, (_n, a) in enumerate(items)])
+        out.groups = [n for n, _a in items]
         out.name = os.path.splitext(os.path.basename(path))[0]
         return out
     if ext == ".svg":

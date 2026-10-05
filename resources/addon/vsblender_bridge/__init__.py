@@ -33,14 +33,14 @@ from . import units as units_mod
 bl_info = {
     "name": "VSBlender Bridge",
     "author": "Massive Dynamic Engineering",
-    "version": (0, 3, 0),
+    "version": (0, 4, 0),
     "blender": (3, 2, 0),
     "location": "View3D > Sidebar > VSBlender",
     "description": "Local bridge for the VSBlender VS Code extension",
     "category": "Development",
 }
 
-ADDON_VERSION = "0.3.0"
+ADDON_VERSION = "0.4.0"
 # Answered on the socket thread. Everything else runs on Blender's main thread.
 _NO_MAIN_THREAD = {"ping", "cancel"}
 # How long a connection waits for the main thread. The caller's own timeout is usually shorter.
@@ -182,6 +182,10 @@ def session_info() -> dict:
         info["mode"] = bpy.context.mode
     except Exception:
         info["mode"] = None
+    try:
+        info["unsaved"] = history.unsaved()
+    except Exception:
+        pass
     try:
         info["sidecar"] = history.sidecar_status(root)
     except Exception as exc:
@@ -507,7 +511,7 @@ def _rollback(root: str, cp_id: str | None, label: str) -> tuple:
     except Exception as exc:
         return None, f"Rolling back to {cp_id} failed ({exc}). The partial changes are kept; restore_checkpoint {cp_id} undoes them."
     _undo_push(f"VSBlender: rolled back {label}")
-    history.mark_edited()
+    history.mark_edited(run=False)
     return cp_id, f"Rolled back to checkpoint {cp_id}: the session is as it was before the script. " \
                   "Python state the script set up (handlers, timers, driver_namespace) is not rolled back."
 
@@ -541,11 +545,12 @@ def run_script(params: dict):
         try:
             checkpoint_entry = history.checkpoint(root, auto=True, keep=int(cp_opts.get("keep", 10)),
                                                   max_mb=float(cp_opts.get("max_mb", 300)), script=rel_script,
-                                                  reason=reason or None, snap=before)
+                                                  reason=reason or None, snap=before,
+                                                  budget_mb=float(cp_opts.get("budget_mb") or 0) or None)
         except Exception as exc:
             checkpoint_entry = {"skipped": f"checkpoint failed: {exc}"}
     context = {"printer": params.get("printer") if isinstance(params.get("printer"), dict) else None,
-               "script": rel_script}
+               "script": rel_script, "reference_roots": params.get("reference_roots") or []}
     run = _execute(script, code, root, lib_paths, rel_script, function, args, context)
     report = snapshot.diff(before, snapshot.take(), run.updates)
     lost = _lost_animation(report, anim_before, animated_ids())
@@ -568,7 +573,7 @@ def run_script(params: dict):
     if changed:
         if not rolled_back:
             _undo_push(f"VSBlender: {os.path.basename(script)}")
-        history.mark_edited()
+        history.mark_edited(run=not rolled_back)
         entry = {
             "time": history.now_iso(), "event": "script", "actor": str(params.get("actor") or "ai"),
             "script": rel_script, "script_sha256": script_sha, "reason": reason or None, "ok": not run.failure,
@@ -623,6 +628,7 @@ def run_script(params: dict):
         "checkpoint": cp_id,
         "ms": ms,
     }
+    out.update(_checkpoint_report(checkpoint_entry, cp_id, cp_opts, read_only, changed, warnings))
     if stamped:
         out["provenance"] = f"{len(stamped)} object(s) stamped with this script (ai_built_by / ai_modified_by)"
     if directives["rerun_after"]:
@@ -633,8 +639,61 @@ def run_script(params: dict):
         except Exception:
             stale = []
         if stale:
-            out["out_of_date"] = stale
+            ran = _ran_scripts(root)
+            out["out_of_date"] = [s for s in stale if s in ran]
+            never = [s for s in stale if s not in ran]
+            if never:
+                out["not_run_yet"] = never
+    if params.get("save") and (changed or history.has_unsaved_edits()):
+        out["saved"] = save_file({"reason": reason or f"after {rel_script}", "actor": params.get("actor") or "ai",
+                                  "allow_references": bool(params.get("allow_references"))})
+    out["unsaved"] = history.unsaved()
     return out, warnings, changed
+
+
+def _checkpoint_report(entry, cp_id, cp_opts: dict, read_only: bool, changed: list, warnings: list) -> dict:
+    """Why there is no checkpoint, or how big it is and what all checkpoints of the file take."""
+    out = {}
+    if cp_id and isinstance(entry, dict):
+        out["checkpoint_bytes"] = int(entry.get("bytes") or 0)
+        out["checkpoints_total_bytes"] = int(entry.get("total_bytes") or 0)
+        out["checkpoints_count"] = int(entry.get("count") or 0)
+        if entry.get("dropped"):
+            out["checkpoints_dropped"] = entry["dropped"]
+        if entry.get("references"):
+            refs = entry["references"]
+            warnings.append(f"{len(refs)} reference object(s) are in the scene ({', '.join(refs[:4])}"
+                            f"{' ...' if len(refs) > 4 else ''}), so every checkpoint copies them "
+                            f"(this one is {out['checkpoint_bytes'] / 1e6:.1f} MB). Draw references with preview overlays "
+                            "(style solid) or measure them from import_reference files instead of keeping them in the scene.")
+    elif read_only:
+        out["checkpoint_note"] = "none: the script is marked read-only"
+    elif not cp_opts.get("auto", True):
+        out["checkpoint_note"] = "none: checkpoints are off for this run (checkpoint: false, or off in the workspace config)"
+    elif isinstance(entry, dict) and entry.get("skipped"):
+        out["checkpoint_note"] = f"none: {entry['skipped']}"
+    elif not changed:
+        out["checkpoint_note"] = "none: the script changed nothing, so its checkpoint was dropped"
+    return out
+
+
+def _ran_scripts(root: str) -> set:
+    """Script names the journal says have run (scripts and pipeline steps), for out-of-date hints."""
+    stems = set()
+    try:
+        with open(os.path.join(history.sidecar_dir(root), "journal.jsonl"), encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get("script"):
+                    stems.add(os.path.splitext(os.path.basename(str(entry["script"])))[0])
+                for step in entry.get("steps") or []:
+                    stems.add(str(step))
+    except OSError:
+        pass
+    return stems
 
 
 # ----------------------------------------------------------------------------- pipelines
@@ -773,7 +832,8 @@ def run_pipeline(params: dict):
         try:
             checkpoint_entry = history.checkpoint(root, auto=True, keep=int(cp_opts.get("keep", 10)),
                                                   max_mb=float(cp_opts.get("max_mb", 300)), script=rel_pipe,
-                                                  reason=reason or None, snap=before)
+                                                  reason=reason or None, snap=before,
+                                                  budget_mb=float(cp_opts.get("budget_mb") or 0) or None)
         except Exception as exc:
             checkpoint_entry = {"skipped": f"checkpoint failed: {exc}"}
     cp_id = checkpoint_entry.get("id") if isinstance(checkpoint_entry, dict) else None
@@ -790,7 +850,7 @@ def run_pipeline(params: dict):
         source, code = _load_script(script)
         sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
         run = _execute(script, code, root, lib_paths, f"{rel_pipe} step {index + 1}/{len(plan)}: {name}", None, None,
-                       {"printer": printer, "script": rel_script})
+                       {"printer": printer, "script": rel_script, "reference_roots": params.get("reference_roots") or []})
         for attr, names in run.updates.items():
             updates.setdefault(attr, {}).update(names)
         step_after = snapshot.take()
@@ -826,7 +886,7 @@ def run_pipeline(params: dict):
     if changed:
         if not rolled_back:
             _undo_push(f"VSBlender: {os.path.basename(pipe['folder'])} pipeline {plan[0]}..{plan[-1]}")
-        history.mark_edited()
+        history.mark_edited(run=not rolled_back)
         journal_entry = {"time": history.now_iso(), "event": "pipeline", "actor": str(params.get("actor") or "ai"),
                          "pipeline": rel_pipe, "steps": [r["step"] for r in ran], "reason": reason or None,
                          "ok": not failure, "changes": report, "changed": changed, "checkpoint": cp_id,
@@ -849,8 +909,14 @@ def run_pipeline(params: dict):
             parts.append("changed before the error: " + snapshot.summary(report, 20))
             parts.append(note or (f"atomic: false, so the partial changes are kept. Checkpoint from before the pipeline: {cp_id}." if cp_id else ""))
         raise ScriptError("\n".join(p for p in parts if p), changed, report)
-    return {"pipeline": rel_pipe, "steps": ran, "changes": report, "checkpoint": cp_id,
-            "ms": int((time.time() - started) * 1000)}, warnings, changed
+    out = {"pipeline": rel_pipe, "steps": ran, "changes": report, "checkpoint": cp_id,
+           "ms": int((time.time() - started) * 1000)}
+    out.update(_checkpoint_report(checkpoint_entry, cp_id, cp_opts, False, changed, warnings))
+    if params.get("save") and (changed or history.has_unsaved_edits()):
+        out["saved"] = save_file({"reason": reason or f"after pipeline {rel_pipe}", "actor": params.get("actor") or "ai",
+                                  "allow_references": bool(params.get("allow_references"))})
+    out["unsaved"] = history.unsaved()
+    return out, warnings, changed
 
 
 # ----------------------------------------------------------------------------- checkpoints, ingest, history
@@ -881,6 +947,180 @@ def restore_checkpoint(params: dict) -> dict:
 
 def list_checkpoints(_params: dict) -> dict:
     return {"checkpoints": history.list_checkpoints(workspace_root())}
+
+
+def _transaction(root: str, label: str, event: str, params: dict, fn) -> tuple:
+    """A change made by the bridge itself (not a script): checkpoint first, one undo step, a journal
+    entry and a change-log line, like run_script. fn() returns (result, warnings)."""
+    reason = str(params.get("reason") or "").strip()
+    cp_opts = params.get("checkpoint") if isinstance(params.get("checkpoint"), dict) else {}
+    anim_before = animated_ids()
+    before = snapshot.take()
+    entry_cp = None
+    if cp_opts.get("auto", True):
+        try:
+            entry_cp = history.checkpoint(root, auto=True, keep=int(cp_opts.get("keep", 10)),
+                                          max_mb=float(cp_opts.get("max_mb", 300)), script=label, reason=reason or None,
+                                          snap=before, budget_mb=float(cp_opts.get("budget_mb") or 0) or None)
+        except Exception as exc:
+            entry_cp = {"skipped": f"checkpoint failed: {exc}"}
+    cp_id = entry_cp.get("id") if isinstance(entry_cp, dict) else None
+    try:
+        result, warnings = fn()
+    except Exception:
+        if cp_id and snapshot.flat(snapshot.diff(before, snapshot.take())):
+            history.rollback(root, cp_id)
+        raise
+    report = snapshot.diff(before, snapshot.take())
+    lost = _lost_animation(report, anim_before, animated_ids())
+    if lost:
+        report["lost_animation"] = lost
+    changed = snapshot.flat(report)
+    if not changed and cp_id:
+        history.discard_checkpoint(root, cp_id)
+        cp_id = None
+    if changed:
+        _undo_push(f"VSBlender: {label}")
+        history.mark_edited()
+        actor = str(params.get("actor") or "ai")
+        entry = {"time": history.now_iso(), "event": event, "actor": actor, "reason": reason or None, "changes": report,
+                 "changed": changed, "checkpoint": cp_id, "detail": _jsonable(result)}
+        try:
+            history.journal(root, entry)
+            history.notes_log(root, history.log_line(actor, label, reason or None, report, cp_id))
+        except Exception as exc:
+            warnings.append(f"journal not written: {exc}")
+    out = dict(result)
+    out.update({"changes": report, "checkpoint": cp_id})
+    out.update(_checkpoint_report(entry_cp, cp_id, cp_opts, False, changed, warnings))
+    out["unsaved"] = history.unsaved()
+    return out, warnings, changed
+
+
+def append_objects(params: dict):
+    """Copy objects from another workspace .blend into this one (append, not link), with what they
+    need (meshes, materials, parents). Each copy records where it came from (ai_appended_from,
+    ai_appended_object), so describe and find (from:) can say. Children come along when the source
+    has a sidecar manifest that lists them."""
+    import fnmatch
+
+    root = workspace_root()
+    raw = params.get("from")
+    if not isinstance(raw, str) or not raw:
+        raise ValueError("from (a workspace .blend) is required")
+    src = os.path.abspath(raw if os.path.isabs(raw) else os.path.join(root, raw))
+    if not _under(src, root) or not src.lower().endswith(".blend") or not os.path.isfile(src):
+        raise ValueError(f"from must be a .blend inside the workspace: {raw}")
+    if bpy.data.filepath and os.path.normcase(os.path.abspath(bpy.data.filepath)) == os.path.normcase(src):
+        raise ValueError("from is the open file; duplicate objects in a script instead")
+    patterns = params.get("objects")
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    if not patterns:
+        raise ValueError("objects is required: names or globs such as [\"SG DHD*\"]")
+    rel_src = history.rel(root, src)
+    manifest = history.load_json(os.path.join(os.path.dirname(src), ".blender-ai",
+                                              os.path.splitext(os.path.basename(src))[0], "manifest.json")) or {}
+    known = manifest.get("objects") or {}
+
+    def work():
+        warnings = []
+        with bpy.data.libraries.load(src, link=False) as (data_from, data_to):
+            available = list(data_from.objects)
+            wanted = [n for n in available if any(fnmatch.fnmatchcase(n, p) or n == p for p in patterns)]
+            if not wanted:
+                raise KeyError(f"no object in {rel_src} matches {patterns}. Objects: {', '.join(available[:30])}"
+                               + (" ..." if len(available) > 30 else ""))
+            if params.get("with_children", True) is not False and known:
+                stack = list(wanted)
+                while stack:
+                    for child in (known.get(stack.pop()) or {}).get("children") or []:
+                        if child in available and child not in wanted:
+                            wanted.append(child)
+                            stack.append(child)
+            elif params.get("with_children", True) is not False:
+                warnings.append(f"{rel_src} has no sidecar manifest, so only the named objects came (children are "
+                                "added when the source has been ingested)")
+            before = set(bpy.data.objects)
+            data_to.objects = list(wanted)
+        name = str(params.get("collection") or f"Appended {os.path.splitext(os.path.basename(src))[0]}")
+        coll = bpy.data.collections.get(name)
+        if coll is None:
+            coll = bpy.data.collections.new(name)
+            bpy.context.scene.collection.children.link(coll)
+        new = [ob for ob in bpy.data.objects if ob not in before]
+        originals = {}
+        for ob, source_name in zip(data_to.objects, wanted):
+            if ob is not None:
+                originals[ob.name] = source_name
+        renamed = []
+        for ob in new:
+            if not ob.users_collection:
+                coll.objects.link(ob)
+            ob["ai_appended_from"] = rel_src
+            source_name = originals.get(ob.name, re.sub(r"\.\d{3}$", "", ob.name))
+            ob["ai_appended_object"] = source_name
+            if ob.name != source_name:
+                renamed.append(f"{source_name} -> {ob.name}")
+        if renamed:
+            warnings.append("names already taken here, so Blender renamed: " + ", ".join(renamed[:12]))
+        return {"appended": sorted(ob.name for ob in new), "from": rel_src, "collection": coll.name}, warnings
+
+    return _transaction(root, f"appended from `{rel_src}`", "append", params, work)
+
+
+def save_file(params: dict) -> dict:
+    """Save the open .blend: the user's file, so only when they asked for it. Journaled with the reason.
+
+    Refuses while measuring references are in the scene (they make the file and every checkpoint
+    heavier), unless allow_references. path saves as another workspace .blend, which then becomes the
+    open file; an existing other file needs overwrite.
+    """
+    from . import marks
+
+    root = workspace_root()
+    raw = params.get("path")
+    current = bpy.data.filepath
+    target = None
+    if isinstance(raw, str) and raw.strip():
+        target = os.path.abspath(raw if os.path.isabs(raw) else os.path.join(root, raw))
+        if not _under(target, root):
+            raise ValueError(f"path must be inside the workspace: {raw}")
+        if not target.lower().endswith(".blend"):
+            raise ValueError("path must end in .blend")
+        same = bool(current) and os.path.normcase(os.path.abspath(current)) == os.path.normcase(target)
+        if os.path.exists(target) and not same and not params.get("overwrite"):
+            raise FileExistsError(f"{history.rel(root, target)} exists: pass overwrite: true to replace it, or another path")
+    elif not current:
+        raise ValueError("the session has never been saved: pass path (a workspace .blend)")
+    refs = marks.reference_objects()
+    if refs and not params.get("allow_references"):
+        raise ValueError(f"not saved: {len(refs)} reference object(s) are in the scene ({', '.join(refs[:6])}"
+                         f"{' ...' if len(refs) > 6 else ''}). Remove them first (a reference belongs in a preview overlay "
+                         "or an import_reference file, not in the .blend), or pass allow_references: true to keep them in the file.")
+    state = history.unsaved()
+    _purge_leftovers()
+    compress = params.get("compress", True) is not False
+    saved = history.save_main(target, compress=compress)
+    history.reset_edited(saved=True)
+    rel = history.rel(root, saved)
+    reason = str(params.get("reason") or "").strip()
+    actor = str(params.get("actor") or "ai")
+    size = os.path.getsize(saved)
+    entry = {"time": history.now_iso(), "event": "save", "actor": actor, "reason": reason or None, "file": rel,
+             "runs": state["runs"], "bytes": size, "compress": compress}
+    if target and current and os.path.normcase(os.path.abspath(current)) != os.path.normcase(saved):
+        entry["saved_as_from"] = history.rel(root, current)
+    if refs:
+        entry["references_kept"] = refs[:20]
+    try:
+        history.journal(root, entry)
+        runs = f" {state['runs']} run(s) since the last save are in the file now." if state["runs"] else ""
+        history.notes_log(root, history.log_line(actor, f"saved `{rel}`", reason or None, None, None).rstrip() + runs)
+    except Exception:
+        pass
+    return {"saved": rel, "file": saved, "bytes": size, "compress": compress, "runs": state["runs"],
+            "first": state["first"], **({"references_kept": refs} if refs else {})}
 
 
 def save_copy(params: dict) -> dict:
@@ -1007,6 +1247,10 @@ def dispatch(req: dict) -> dict:
             result = list_checkpoints(params)
         elif method == "save_copy":
             result = save_copy(params)
+        elif method == "save_file":
+            result = save_file(params)
+        elif method == "append_objects":
+            result, warnings, changed = append_objects(params)
         elif method == "ingest_live":
             result = ingest_live(params)
         elif method == "manifest":
@@ -1016,11 +1260,13 @@ def dispatch(req: dict) -> dict:
         elif method == "compose":
             result = compose(params)
         elif method == "api":
-            result = inspect_tools.api(str(params.get("query") or ""), int(params.get("limit") or 60))
+            result = inspect_tools.api(str(params.get("query") or ""), int(params.get("limit") or 60),
+                                       bool(params.get("inherited")))
         elif method == "node_schema":
             result = inspect_tools.node_schema(str(params.get("bl_idname") or ""), params.get("props") or None)
         elif method == "describe":
-            result = inspect_tools.describe(str(params.get("target") or ""), workspace_root(), blender_ingest)
+            result = inspect_tools.describe(str(params.get("target") or ""), workspace_root(), blender_ingest,
+                                            params.get("frame"))
         elif method == "find":
             result = inspect_tools.find(str(params.get("selector") or ""), workspace_root(), int(params.get("limit") or 100))
         elif method == "spatial":
@@ -1267,7 +1513,7 @@ def _load_post(_dummy):
 def _save_post(*_args):
     # Saved: the edits made through the bridge are in the file now. A copy (checkpoint) does not count.
     if not history.writing_copy():
-        history.reset_edited()
+        history.reset_edited(saved=True)
 
 
 def _purge_once():

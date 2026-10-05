@@ -2,7 +2,8 @@
 
     sock(node, "Fac")                    socket by identifier, then by displayed name
     build(tree, {...}, links=[...])      create or patch nodes by name, link them, lay them out
-    set_keys(mat, "Principled BSDF/Emission Strength", [(1, 0), (24, 8)])
+    set_keys(mat, "Principled BSDF/Emission Strength", [(1, 0), (24, 8)], replace=True)
+    clear_keys(obj) / clear_keys(mat, "Principled BSDF/Emission Strength")
     scale_keys(obj, "rotation_euler", lambda v: v * 2, index=2)
     bbox_world(obj) / raycast_down(x, y)
     progress(0.4, "raycasting")          reported to the AI client; raises Cancelled when it cancels
@@ -17,6 +18,9 @@ Modelling (see vsblender.geo for solids and mesh builders):
     units() / mm(20) / m(1.5) / to_mm(x)  what a Blender unit is, and real sizes in Blender units
     printer()                            the 3D-printer profile (millimetres)
     read_stl / read_obj / read_3mf / read_mesh_file, svg_loops(path)
+    part("dhd", keys_per_ring=18)        a reusable builder from parts/dhd.py, recorded on the objects
+    intent("...")                        NOTES.md's Intent & constraints (kept across re-ingests)
+    is_main()                            True in the script run_script runs, False when imported
 """
 from __future__ import annotations
 
@@ -48,7 +52,7 @@ _progress = {"fraction": None, "message": "", "updated": 0.0, "cancel": False, "
 _root = {"path": ""}
 # What the current run_script call knows: the printer profile (purpose "print"), the script, and
 # warnings helpers raise along the way (reported with the run, not printed).
-_run = {"printer": None, "script": "", "warnings": []}
+_run = {"printer": None, "script": "", "warnings": [], "reference_roots": []}
 
 # Submodules scripts import as vsblender.<name>. Loaded on first use, so a plain `import vsblender`
 # stays cheap.
@@ -60,7 +64,8 @@ def _begin(label: str, root: str, context: dict | None = None) -> None:
                      started=time.time(), label=label)
     _root["path"] = root
     context = context or {}
-    _run.update(printer=context.get("printer"), script=context.get("script") or label, warnings=[])
+    _run.update(printer=context.get("printer"), script=context.get("script") or label, warnings=[],
+                reference_roots=list(context.get("reference_roots") or []))
 
 
 def _end() -> list:
@@ -296,7 +301,7 @@ def _datablock(name: str):
             if code == prefix:
                 found = getattr(bpy.data, attr).get(rest)
                 if found is None:
-                    raise KeyError(f"no {attr[:-1]} named {rest!r}")
+                    raise KeyError(f"no {snapshot.singular(attr)} named {rest!r}")
                 return found
     for _code, attr in _ID_KINDS:
         found = getattr(bpy.data, attr).get(name)
@@ -378,8 +383,12 @@ def _is_rna_path(idb, path: str) -> bool:
 
 
 def fcurves(idb) -> list:
-    """The fcurves animating a datablock, through its action slot on Blender 4.4 and newer."""
-    owner = _owner(idb)
+    """The fcurves animating a datablock, through its action slot on Blender 4.4 and newer.
+    Materials, worlds and lights: their node tree's."""
+    return _own_fcurves(_owner(idb))
+
+
+def _own_fcurves(owner) -> list:
     ad = getattr(owner, "animation_data", None)
     if ad is None or ad.action is None:
         return []
@@ -427,10 +436,65 @@ def _rsplit_attr(path: str):
     return "", "", path
 
 
-def set_keys(target, path: str, keys, index: int | None = None, interpolation: str | None = None) -> list:
-    """Insert keys [(frame, value), ...]. Handles layered actions and slots. Returns the fcurves keyed."""
+def _remove_fcurve(owner, fc) -> None:
+    ad = owner.animation_data
+    slot = getattr(ad, "action_slot", None)
+    if slot is not None:
+        try:
+            from bpy_extras import anim_utils
+            bag = anim_utils.action_get_channelbag_for_slot(ad.action, slot)
+            if bag is not None:
+                bag.fcurves.remove(fc)
+                return
+        except Exception:
+            pass
+    ad.action.fcurves.remove(fc)
+
+
+def clear_keys(target, path: str | None = None, index: int | None = None) -> int:
+    """Remove keyframes so a script can rebuild them from scratch: one channel (path, optionally one
+    array index), or with path=None all of target's animation (its action is removed when nothing
+    else uses it). Materials and worlds: their node tree's keys. Returns the number of keys removed."""
+    if path is not None:
+        owner, data_path, path_index = resolve(target, path)
+        index = path_index if index is None else index
+        removed = 0
+        for fc in list(fcurves(owner)):
+            if fc.data_path == data_path and (index is None or fc.array_index == index):
+                removed += len(fc.keyframe_points)
+                _remove_fcurve(owner, fc)
+        return removed
+    idb = _datablock(target) if isinstance(target, str) else target
+    if idb is None:
+        raise KeyError(f"no object, material, world, light, camera or node group named {target!r}")
+    removed = 0
+    actions = {}
+    owners = [idb] if _owner(idb) is idb else [idb, _owner(idb)]
+    for owner in owners:
+        ad = getattr(owner, "animation_data", None)
+        if ad is None:
+            continue
+        removed += sum(len(fc.keyframe_points) for fc in _own_fcurves(owner))
+        if ad.action is not None:
+            actions[ad.action.name] = ad.action
+        owner.animation_data_clear()
+    # By name, so an action shared by the object and its tree is removed once (see the gotcha).
+    for action in actions.values():
+        if action.users == 0:
+            bpy.data.actions.remove(action)
+    return removed
+
+
+def set_keys(target, path: str, keys, index: int | None = None, interpolation: str | None = None,
+             replace: bool = False) -> list:
+    """Insert keys [(frame, value), ...]. Handles layered actions and slots. Returns the fcurves keyed.
+    replace=True clears the channel first, so a re-run leaves exactly these keys."""
     owner, data_path, path_index = resolve(target, path)
     index = path_index if index is None else index
+    if replace:
+        for fc in list(fcurves(owner)):
+            if fc.data_path == data_path and (index is None or fc.array_index == index):
+                _remove_fcurve(owner, fc)
     touched = []
     for frame, value in keys:
         _assign(owner, data_path, index, value)
@@ -566,6 +630,11 @@ def printer() -> dict:
     return dict(_run.get("printer") or DEFAULT_PRINTER)
 
 
+def reference_roots() -> list:
+    """Folders outside the workspace that reference files may come from ("referenceRoots")."""
+    return list(_run.get("reference_roots") or [])
+
+
 def modifier(obj, kind: str, name: str | None = None, **props):
     """Get or create a modifier by name and set its properties, so a re-run updates it instead of
     adding another. modifier(ob, "BEVEL", width=0.002, segments=3); modifier(ob, "SUBSURF", levels=2)."""
@@ -616,6 +685,92 @@ def apply_modifiers(obj, keep: tuple = ()) -> None:
         m.show_viewport = True
 
 
+def part_folders() -> list:
+    """Where parts live: parts/ next to the running script and in each folder above it, up to the
+    workspace root (nearest first)."""
+    root = _root["path"] or os.getcwd()
+    script = _run.get("script") or ""
+    here = os.path.dirname(os.path.join(root, script)) if script else root
+    folders = []
+    current = os.path.abspath(here)
+    while True:
+        for candidate in (os.path.join(current, "parts"), os.path.join(current, "scripts", "parts")):
+            if os.path.isdir(candidate) and candidate not in folders:
+                folders.append(candidate)
+        if os.path.normcase(current) == os.path.normcase(os.path.abspath(root)):
+            break
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    return folders
+
+
+def part(name: str, **params):
+    """Build a reusable part: parts/<name>.py defines build(**params) returning a Solid (or a dict of
+    name -> Solid) and optionally PARAMS (the defaults) and DESCRIPTION. Folders: parts/ next to the
+    running script and above it, up to the workspace root. The result records the part and its
+    parameters, so to_object stamps them on the object (ai_spec part, part_params) and NOTES lists them.
+
+        dhd = vsblender.part("dhd", keys_per_ring=18, glyph_set="pegasus")
+        dhd.to_object("PDHD Base", materials=["PDHD Stone"])
+    """
+    import importlib.util
+
+    folders = part_folders()
+    path = next((os.path.join(f, f"{name}.py") for f in folders if os.path.isfile(os.path.join(f, f"{name}.py"))), None)
+    if path is None:
+        known = sorted({os.path.splitext(n)[0] for f in folders for n in os.listdir(f) if n.endswith(".py") and not n.startswith("_")})
+        raise KeyError(f"no part {name!r}: looked for {name}.py in {', '.join(folders) or 'parts/ (none found)'}"
+                       + (f". Parts: {', '.join(known)}" if known else ""))
+    spec_ = importlib.util.spec_from_file_location(f"vsblender_part_{name}", path)
+    module = importlib.util.module_from_spec(spec_)
+    folder = os.path.dirname(path)
+    added = folder not in sys.path
+    if added:  # a part may import its own helpers from parts/
+        sys.path.insert(0, folder)
+    try:
+        spec_.loader.exec_module(module)
+        build_fn = getattr(module, "build", None)
+        if not callable(build_fn):
+            raise AttributeError(f"{path} has no build(**params) function")
+        merged = dict(getattr(module, "PARAMS", {}) or {})
+        unknown = [k for k in params if merged and k not in merged]
+        if unknown:
+            warn(f"part {name}: {', '.join(unknown)} not in its PARAMS ({', '.join(merged)})")
+        merged.update(params)
+        result = build_fn(**merged)
+    finally:
+        if added:
+            try:
+                sys.path.remove(folder)
+            except ValueError:
+                pass
+    rel = os.path.relpath(path, _root["path"]).replace(os.sep, "/") if _root["path"] else path
+    meta = {"part": name, "params": {k: v for k, v in merged.items() if isinstance(v, (int, float, str, bool, list, tuple))},
+            "file": rel}
+    items = result.values() if isinstance(result, dict) else [result]
+    for item in items:
+        if hasattr(item, "meta"):
+            item.meta.update(meta)
+    return result
+
+
+def intent(text: str, replace: bool = False) -> str:
+    """Write what the next session must know into NOTES.md's Intent & constraints section (kept across
+    re-ingests, always in context_pack): where sizes live, conventions, what to re-run, what is keyed."""
+    from . import history
+
+    return history.write_intent(_root["path"], text, replace=replace)
+
+
+def is_main() -> bool:
+    """True in the script run_script is running, False when another script imports it: keep build
+    code in functions and the run code under `if vsblender.is_main():` (or `if __name__ == "__main__":`),
+    and other projects can import the builders without running them."""
+    return sys._getframe(1).f_globals.get("__name__") == "__main__"
+
+
 def spec(obj, **params) -> dict:
     """Record the parameters an object was built from (intent as data), e.g.
     spec(ring, glyphs=39, pitch_deg=9.231, track_r=(2.542, 2.845)). Shown by describe and in NOTES.md.
@@ -647,6 +802,7 @@ from .geom2d import svg_loops  # noqa: E402
 
 __all__ += [
     "warn", "printer", "modifier", "apply_modifiers", "spec", "units", "mm", "m", "to_mm", "units_label",
+    "clear_keys", "intent", "is_main", "part", "part_folders", "reference_roots",
     "material", "ref_image", "place_on_ground", "place_on_bed", "center_on_origin", "center_on_bed", "set_origin",
     "orient_flat", "stats", "read_stl", "read_obj", "read_3mf", "read_mesh_file", "svg_loops", "geo",
 ]
