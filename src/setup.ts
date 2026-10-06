@@ -299,6 +299,7 @@ export async function showSetup(
         : "Claude Code runs VSBlender's read-only tools without asking; run_script still asks each time.");
     }
     if (clients.vscode) next.push("VS Code: start the vsblender server from .vscode/mcp.json (or the MCP Servers view) if it does not start by itself.");
+    if (clients.grok) next.push("Grok: the server is in .grok/config.toml. If a session has no vsblender tools, turn it on in /mcps. The guide tells the model to stop and ask you, not to build the part in another program.");
     next.push("Launch Blender below, or open Blender yourself: the add-on starts the bridge on its own once it is enabled.");
     void current.webview.postMessage({ type: "done", report: `${report.text}\n\nNext:\n- ${next.join("\n- ")}`, configured: true });
   }, undefined, context.subscriptions);

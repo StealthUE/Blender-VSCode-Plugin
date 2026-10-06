@@ -32,7 +32,7 @@ export const ALL_GUIDE_RELS = [
 export function renderGuide(template: string, list: string, port: number): string {
   // {{BLEND_TABLE}} is the placeholder of the first guide template.
   const body = template.replace("{{BLEND_LIST}}", list).replace("{{BLEND_TABLE}}", list).replace(/\{\{PORT\}\}/g, String(port));
-  return `${GUIDE_STAMP}-v5 -->\n${body}`;
+  return `${GUIDE_STAMP}-v6 -->\n${body}`;
 }
 
 /**

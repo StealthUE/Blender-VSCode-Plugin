@@ -11,8 +11,10 @@ export function syncRuntime(extensionRoot: string, storageDir: string, version: 
   const target = path.join(storageDir, "runtime");
   const stamp = path.join(target, "version.txt");
   const server = path.join(extensionRoot, "out", "mcp.js");
-  // The build time is in the stamp too, so a recompiled development build is copied again.
-  const wanted = `${version} ${Math.round(fs.statSync(server).mtimeMs)}`;
+  const guide = path.join(extensionRoot, "resources", "blender-guide.md");
+  // The build time is in the stamp too, so a recompiled server or an edited guide is copied again.
+  const guideMtime = fs.existsSync(guide) ? Math.round(fs.statSync(guide).mtimeMs) : 0;
+  const wanted = `${version} ${Math.round(fs.statSync(server).mtimeMs)} ${guideMtime}`;
   const current = fs.existsSync(stamp) ? fs.readFileSync(stamp, "utf8").trim() : "";
   if (current === wanted) return target;
   for (const dir of ["out", "resources"]) {
