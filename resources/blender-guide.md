@@ -2,7 +2,23 @@
 
 This workspace is driven through the **vsblender** MCP server and the sidecar files under `.blender-ai/`. The `.blend` file is a binary. Do not read it, search it, or edit it. If you are changing the VSBlender extension source itself, that guidance is about the `.blend` files only.
 
-The bridge listens on `127.0.0.1:{{PORT}}`. Most tools need Blender open with the VSBlender add-on running; if a tool cannot connect, call `doctor`, then `launch_blender`. Read-only tools (`describe`, `find`, `spatial`, `measure`, `timeline`, `check_model`, `preview`, `export_model`) also work with Blender closed: they read the saved file in a background Blender and say `source: saved file`.
+## When the tools are not connected
+
+The tools in the table below (`doctor`, `ingest`, `run_script`, `session_info`, and the rest) are in this session only when the vsblender MCP server is connected. A `.grok/config.toml` or `.mcp.json` entry means it is configured. It does not mean this session can call it.
+
+If `search_tool` does not list those tools, stop. Tell the user the vsblender server is configured and not connected, and ask them to turn it on (`/mcps`, enable **vsblender**) and send the request again. Do not search again. Do not try another way. Wait.
+
+Do not work around a missing server:
+
+- Do not launch `blender.exe`, including `--background`, and do not save a `.blend` from a process you started. A second Blender does not update the window the user has open.
+- Do not open a socket to the bridge port and send JSON.
+- Do not load the extension's `mcp.js` or `tools.js` yourself.
+- Do not create or edit FreeCAD (`.FCStd`), OpenSCAD, STEP, Fusion, or any other CAD project. A CAD file that is already there is a reference: once the tools are connected, `import_reference` reads it. It is not the model you build.
+- Do not write a substitute model in any other format.
+
+The only model is the `.blend`. With the tools connected, the files you may write are the scripts next to that file (`<blend folder>/scripts/`), the `.blender-ai` sidecar, and an export the user asked for (`export_model`). Nothing else.
+
+The bridge listens on `127.0.0.1:{{PORT}}`. Most tools need Blender open with the VSBlender add-on running. If a tool cannot connect, call `doctor`, then `launch_blender`. Do not start Blender yourself. Read-only tools (`describe`, `find`, `spatial`, `measure`, `timeline`, `check_model`, `preview`, `export_model`) also work with Blender closed: the tool reads the saved file in a background Blender and says `source: saved file`. That background process is the tool's, and it does not save over a file a window already has open.
 
 ## Blend files
 
@@ -143,6 +159,8 @@ Reviewed roles (`source` `ai` or `human`) survive a re-ingest, and a rename keep
 - Socket identifiers and displayed names differ (`Fac` versus `Factor`). Use the identifier.
 - Material keyframes address nodes by name. Keep a keyframed node's name when you rebuild a material.
 - Objects marked `vsblender_stage` (the render template's floor, the print template's build plate) belong in the file but not in checks and exports. Objects marked `vsblender_reference`, or named `_REF ...`, are measuring references: keep them out of the file (`import_reference`).
+- After `mesh.transform` or a scale change, `dimensions` and `bound_box` stay stale until `bpy.context.view_layer.update()`. Read sizes with `vsblender.stats`, or update the view layer first. A check that runs too early will scale the mesh again.
+- Changing `scale_length` does not reframe the view. Set `view_distance` in the new Blender units. `view3d_override()` is the first 3D view; frame every workspace by walking `window.screen.areas`.
 
 ## Clients
 
