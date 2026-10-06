@@ -42,7 +42,7 @@ part.to_object("Bracket", materials=[vsblender.material("PLA Grey", color="#8a8d
 |---|---|---|
 | Claude Code | on | `.mcp.json`, `CLAUDE.md`, and `.claude/settings.json` permission rules. Read-only VSBlender tools are allowed, and reading or editing `.blend` files is denied. The script tools go into `.claude/settings.local.json`, and only when you tick them. |
 | VS Code / Copilot | on | `.vscode/mcp.json`, `.github/copilot-instructions.md` |
-| Grok | on | `.grok/config.toml`. Grok also reads `CLAUDE.md` and Claude's permission files, so neither is written a second time. |
+| Grok | on | `.grok/config.toml`. Grok also reads `CLAUDE.md` and Claude's permission files, so neither is written a second time. If that session has no vsblender tools, the guide tells it to stop and ask for the server to be turned on in `/mcps`. |
 | Cursor | off | `.cursor/mcp.json`, `.cursorrules` |
 | Cline | off | `.cline/mcp.json` with `alwaysAllow` for the read-only tools, `.clinerules` |
 
@@ -99,7 +99,7 @@ Ingest shells out to the `blender_ingest.py` shipped inside the add-on (`resourc
 
 Render jobs, exports with Blender's exporters, new files, checkpoint previews, manifest builds and the read-only tools used while Blender is closed run in a separate headless Blender through `resources/job.py`, working on a copy of the session or on the saved file. The user's Blender stays usable while they run. On Windows, the first headless Blender started while another Blender is running can take about 20 s to start. Later ones start in about 1 s.
 
-The MCP server runs from a copy of `out/` and `resources/` in the extension's global storage. Client configs point there, so they keep working after the extension updates, even in a client started without VS Code. `launch_blender` loads the add-on shipped with the extension when the one installed in Blender is older.
+The MCP server runs from a copy of `out/` and `resources/` in the extension's global storage. Client configs point there, so they keep working after the extension updates, even in a client started without VS Code. That copy is refreshed when the server is rebuilt or when `resources/blender-guide.md` changes. `launch_blender` loads the add-on shipped with the extension when the one installed in Blender is older.
 
 ## `.blender-ai/config.json`
 
