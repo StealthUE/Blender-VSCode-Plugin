@@ -6,6 +6,7 @@
     components(welded)                            shell label per triangle
     volume_area(welded)                           signed volume and area
     read_stl / read_obj / read_3mf / read_mesh_file(path)
+    read_3mf leaves a slicer's negative, modifier and support meshes out of the solid
     write_stl / write_obj / write_3mf
 
 Nothing here changes the scene. bpy is only needed for object_arrays, to_mesh and from_bmesh.
@@ -13,6 +14,7 @@ Nothing here changes the scene. bpy is only needed for object_arrays, to_mesh an
 from __future__ import annotations
 
 import io
+import json
 import math
 import os
 import re
@@ -532,14 +534,281 @@ def _matrix_3mf(text: str | None) -> np.ndarray:
     return m
 
 
-def read_3mf(path: str) -> list:
-    """Every build item of a 3MF as [(name, MeshArrays in mm)]. Components and item transforms are applied."""
+class ThreeMF(list):
+    """(name, MeshArrays in mm) for each returned mesh. project describes slicer volumes and the machine the file was sliced for."""
+
+    def __init__(self, items, project: dict):
+        super().__init__(items)
+        self.project = project
+
+
+def _is_model_volume(kind: str) -> bool:
+    """ModelPart / normal_part are the solid. Negative, modifier and support meshes are subtracted or ignored at slice time."""
+    token = re.sub(r"[^a-z]", "", (kind or "").lower())
+    return token in ("", "model", "modelpart", "normalpart")
+
+
+def _zip_text(archive, *candidates: str) -> str | None:
+    names = {n.lower(): n for n in archive.namelist()}
+    for cand in candidates:
+        actual = names.get(cand.lower())
+        if actual:
+            return archive.read(actual).decode("utf-8", "replace")
+    return None
+
+
+def _meta_children(el) -> dict:
+    out = {}
+    for child in el:
+        if _local(child.tag) != "metadata":
+            continue
+        key = child.get("key")
+        if key:
+            out[key] = child.get("value") or ""
+    return out
+
+
+def _slic3r_volumes(text: str) -> dict:
+    """object id -> [{first, last, name, type}]. first/last are inclusive triangle indexes, in file order."""
+    root = ET.fromstring(text)
+    by_object = {}
+    for obj in root.iter():
+        if _local(obj.tag) != "object":
+            continue
+        oid = obj.get("id")
+        if not oid:
+            continue
+        vols = []
+        for vol in obj:
+            if _local(vol.tag) != "volume":
+                continue
+            meta = _meta_children(vol)
+            try:
+                first = int(vol.get("firstid") or 0)
+                last = int(vol.get("lastid") or -1)
+            except ValueError:
+                continue
+            vols.append({"first": first, "last": last, "name": meta.get("name") or "", "type": meta.get("volume_type") or "ModelPart"})
+        if vols:
+            by_object[str(oid)] = vols
+    return by_object
+
+
+def _bambu_roles(text: str) -> dict:
+    """object or part id -> {name, type} for Bambu Studio / OrcaSlicer model_settings.config."""
+    root = ET.fromstring(text)
+    roles = {}
+    for obj in root.iter():
+        if _local(obj.tag) != "object":
+            continue
+        oid = obj.get("id")
+        parts = [child for child in obj if _local(child.tag) == "part"]
+        for part in parts:
+            meta = _meta_children(part)
+            role = {"name": meta.get("name") or "", "type": part.get("subtype") or "normal_part"}
+            pid = part.get("id")
+            if pid:
+                roles[str(pid)] = role
+            if oid and len(parts) == 1:
+                roles.setdefault(str(oid), role)
+    return roles
+
+
+def _ini(text: str) -> dict:
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;" or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip().strip('"')
+    return out
+
+
+def _first_token(value: str) -> str:
+    return re.split(r"[;,]", value or "", maxsplit=1)[0].strip()
+
+
+def _float_token(value) -> float | None:
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    try:
+        return float(_first_token(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _bed_size(shape) -> list | None:
+    """Prusa bed_shape '0x0,250x0,250x210,0x210' or a list of those points. Returns [width, depth] in mm."""
+    if isinstance(shape, (list, tuple)):
+        parts = [str(p) for p in shape]
+    elif isinstance(shape, str):
+        parts = [p.strip() for p in shape.split(",")]
+    else:
+        return None
+    pts = []
+    for part in parts:
+        token = part.lower().replace("×", "x")
+        if "x" not in token:
+            continue
+        a, b = token.split("x", 1)
+        try:
+            pts.append((float(a), float(b)))
+        except ValueError:
+            continue
+    if len(pts) < 2:
+        return None
+    width = max(p[0] for p in pts) - min(p[0] for p in pts)
+    depth = max(p[1] for p in pts) - min(p[1] for p in pts)
+    if width <= 0 or depth <= 0:
+        return None
+    return [width, depth]
+
+
+def _printer_from_ini(text: str) -> dict:
+    cfg = _ini(text)
+    bed = _bed_size(cfg.get("bed_shape", ""))
+    height = _float_token(cfg.get("max_print_height"))
+    volume = [bed[0], bed[1], height] if bed and height and height > 0 else None
+    model = cfg.get("printer_model") or ""
+    name = cfg.get("printer_settings_id") or model
+    return {
+        "model": model,
+        "name": name,
+        "nozzle": _float_token(cfg.get("nozzle_diameter")),
+        "layer_height": _float_token(cfg.get("layer_height")),
+        "material": _first_token(cfg.get("filament_type", "")).upper() or None,
+        "density": _float_token(cfg.get("filament_density")),
+        "bed": bed,
+        "build_volume": volume,
+    }
+
+
+def _printer_from_json(text: str) -> dict:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    bed = _bed_size(data.get("printable_area") or data.get("bed_shape") or "")
+    height = _float_token(data.get("printable_height") or data.get("max_print_height"))
+    volume = [bed[0], bed[1], height] if bed and height and height > 0 else None
+    model = str(data.get("printer_model") or "")
+    name = str(data.get("printer_settings_id") or model)
+    material = data.get("filament_type") or ""
+    return {
+        "model": model,
+        "name": name,
+        "nozzle": _float_token(data.get("nozzle_diameter")),
+        "layer_height": _float_token(data.get("layer_height")),
+        "material": _first_token(material if isinstance(material, str) else str(material[0] if material else "")).upper() or None,
+        "density": _float_token(data.get("filament_density")),
+        "bed": bed,
+        "build_volume": volume,
+    }
+
+
+def _merge_printer(*parts: dict) -> dict | None:
+    out = {"model": "", "name": "", "nozzle": None, "layer_height": None, "material": None, "density": None, "bed": None, "build_volume": None}
+    for part in parts:
+        for key, value in part.items():
+            if value not in (None, "", []):
+                out[key] = value
+    if not (out["model"] or out["name"] or out["build_volume"] or out["bed"]):
+        return None
+    return out
+
+
+def _split_volumes(mesh: MeshArrays, vols: list, object_name: str, warnings: list) -> list:
+    """Cut one mesh on slicer triangle ranges. The volume matrix is not applied: slicers bake it into the vertices."""
+    n = len(mesh.tris)
+    assigned = np.zeros(n, dtype=bool)
+    pieces = []
+    for vol in vols:
+        first, last = int(vol["first"]), int(vol["last"])
+        if last < first or first >= n or last < 0:
+            warnings.append(f"{object_name}: volume '{vol.get('name') or vol.get('type')}' range {first}..{last} is outside the {n} triangles")
+            continue
+        first = max(0, first)
+        last = min(n - 1, last)
+        if assigned[first:last + 1].any():
+            warnings.append(f"{object_name}: volume ranges overlap near triangle {first}")
+        mask = np.zeros(n, dtype=bool)
+        mask[first:last + 1] = ~assigned[first:last + 1]
+        assigned[first:last + 1] = True
+        if not mask.any():
+            continue
+        kind = vol.get("type") or "ModelPart"
+        pieces.append({"name": vol.get("name") or object_name, "type": kind, "model": _is_model_volume(kind),
+                       "arrays": mesh.select(mask)})
+    if n and not assigned.all():
+        mask = ~assigned
+        pieces.append({"name": object_name, "type": "ModelPart", "model": True, "arrays": mesh.select(mask)})
+        warnings.append(f"{object_name}: {int(mask.sum())} triangles were not listed in a slicer volume and stayed with the part")
+    return pieces
+
+
+def _object_pieces(entry: dict, oid, volume_table: dict, bambu_roles: dict, warnings: list) -> list:
+    mesh = entry["mesh"]
+    vols = volume_table.get(str(oid))
+    role = bambu_roles.get(str(oid))
+    if vols is None and role and not _is_model_volume(role.get("type") or ""):
+        last = len(mesh.tris) - 1
+        if last >= 0:
+            vols = [{"first": 0, "last": last, "name": role.get("name") or entry["name"], "type": role["type"]}]
+    if not vols:
+        return [{"name": entry["name"], "type": "ModelPart", "model": True, "arrays": mesh}]
+    return _split_volumes(mesh, vols, entry["name"], warnings)
+
+
+def read_3mf(path: str, volumes: str = "model") -> list:
+    """Every build item of a 3MF as [(name, MeshArrays in mm)]. Components and the build-item transform are applied.
+
+    volumes:
+      model (default): the solid only. A Prusa/SuperSlicer negative, modifier or support volume, and a
+        Bambu/Orca negative part, are left out and listed on the result's project.
+      negative: those left-out meshes, one item each.
+      all: every slicer volume as its own item.
+      raw: the mesh as stored, negatives included. project still names them.
+    The triangle ranges in Metadata/*_model.config are indexes into that object's triangles, in file
+    order. The volume matrix there is already baked into the vertices, so it is not applied again.
+    """
+    if volumes not in ("model", "all", "raw", "negative"):
+        raise ValueError("volumes must be model, all, raw or negative")
+    warnings: list = []
     with zipfile.ZipFile(path) as archive:
         model_names = [n for n in archive.namelist() if n.lower().endswith(".model")]
         if not model_names:
             raise ValueError(f"{path} has no 3D model part")
         main = next((n for n in model_names if n.lower().endswith("3d/3dmodel.model")), model_names[0])
         roots = {n: ET.fromstring(archive.read(n)) for n in model_names}
+        volume_table: dict = {}
+        for cand in ("Metadata/Slic3r_PE_model.config", "Metadata/Prusa_Slicer_model.config", "Metadata/SuperSlicer_model.config"):
+            text = _zip_text(archive, cand)
+            if not text:
+                continue
+            try:
+                volume_table.update(_slic3r_volumes(text))
+            except ET.ParseError:
+                warnings.append(f"{cand} could not be read; volumes were not split")
+        bambu_roles: dict = {}
+        bambu = _zip_text(archive, "Metadata/model_settings.config")
+        if bambu:
+            try:
+                bambu_roles = _bambu_roles(bambu)
+            except ET.ParseError:
+                warnings.append("Metadata/model_settings.config could not be read")
+        printers = []
+        for cand in ("Metadata/Slic3r_PE.config", "Metadata/Prusa_Slicer.config", "Metadata/SuperSlicer.config"):
+            text = _zip_text(archive, cand)
+            if text:
+                printers.append(_printer_from_ini(text))
+        project_json = _zip_text(archive, "Metadata/project_settings.config")
+        if project_json and project_json.lstrip().startswith("{"):
+            printers.append(_printer_from_json(project_json))
     root = roots[main]
     factor = _UNIT_MM.get(root.get("unit", "millimeter"), 1.0)
     objects = {}
@@ -568,29 +837,83 @@ def read_3mf(path: str) -> list:
             objects.setdefault(oid, entry)
             objects[key] = entry
 
-    def flatten(oid, matrix, depth=0):
+    used_ids: set = set()
+
+    def flatten(oid, matrix, depth=0, whole=False):
         entry = objects.get(oid)
         if entry is None or depth > 16:
             return []
         out = []
         if entry["mesh"] is not None:
-            out.append(entry["mesh"].transformed(matrix))
+            if str(oid) in volume_table or str(oid) in bambu_roles:
+                used_ids.add(str(oid))
+            if whole:
+                out.append({"name": entry["name"], "type": "ModelPart", "model": True,
+                            "arrays": entry["mesh"].transformed(matrix), "object": entry["name"]})
+            else:
+                for piece in _object_pieces(entry, oid, volume_table, bambu_roles, warnings):
+                    arrays = piece["arrays"].transformed(matrix)
+                    out.append({**piece, "arrays": arrays, "object": entry["name"]})
         for child, m in entry["components"]:
-            out += flatten(child, matrix @ m, depth + 1)
+            out += flatten(child, matrix @ m, depth + 1, whole)
         return out
 
-    items = []
+    items_raw = []
+    records = []
     build = next((c for c in root if _local(c.tag) == "build"), None)
     for item in (build if build is not None else []):
         if _local(item.tag) != "item":
             continue
         oid = item.get("objectid")
-        parts = flatten(oid, _matrix_3mf(item.get("transform")))
-        if parts:
-            arrays = concat(parts).scaled(factor)
-            arrays.name = objects.get(oid, {}).get("name", oid)
-            items.append((arrays.name, arrays))
+        obj_name = objects.get(oid, {}).get("name", oid)
+        matrix = _matrix_3mf(item.get("transform"))
+        split = flatten(oid, matrix, whole=False)
+        for piece in split:
+            records.append({"object": obj_name, "name": piece["name"], "type": piece["type"],
+                            "triangles": int(len(piece["arrays"])), "model": bool(piece["model"])})
+        # raw keeps file order, negatives included. The other modes use the split pieces.
+        pieces = flatten(oid, matrix, whole=True) if volumes == "raw" else split
+        for piece in pieces:
+            piece["arrays"] = piece["arrays"].scaled(factor)
+        items_raw.append((obj_name, pieces))
+    if volume_table:
+        missed = [i for i in volume_table if i not in used_ids]
+        if volume_table and not used_ids:
+            warnings.append("slicer volume ranges did not match a 3MF object id; the meshes were read whole")
+        elif missed:
+            warnings.append(f"slicer volumes for object id {', '.join(missed[:6])} did not match a mesh")
+    project = {"printer": _merge_printer(*printers), "volumes": records, "warnings": warnings}
+
+    def chosen(pieces):
+        if volumes == "raw" or volumes == "all":
+            return pieces
+        want_model = volumes == "model"
+        return [p for p in pieces if bool(p["model"]) == want_model]
+
+    items = ThreeMF([], project)
+    for obj_name, pieces in items_raw:
+        pick = chosen(pieces)
+        if volumes in ("all", "negative"):
+            for piece in pick:
+                label = piece["name"] or obj_name
+                if label != obj_name:
+                    label = f"{obj_name} / {label}"
+                if not piece["model"]:
+                    label = f"{label} [{piece['type']}]"
+                arrays = piece["arrays"]
+                arrays.name = label
+                items.append((label, arrays))
+            continue
+        if not pick:
+            continue
+        arrays = concat([p["arrays"] for p in pick]).scaled(1.0)
+        arrays.name = obj_name
+        items.append((obj_name, arrays))
     if not items:
+        dropped = [r for r in records if not r["model"]]
+        if dropped and volumes == "model":
+            names = ", ".join(f"{r['name'] or r['type']} ({r['triangles']} tris)" for r in dropped[:8])
+            raise ValueError(f"{path} has no model solid; slicer volumes left out: {names}")
         raise ValueError(f"{path} has no build items with geometry")
     return items
 

@@ -35,14 +35,14 @@ from . import units as units_mod
 bl_info = {
     "name": "VSBlender Bridge",
     "author": "Massive Dynamic Engineering",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (3, 2, 0),
     "location": "View3D > Sidebar > VSBlender",
     "description": "Local bridge for the VSBlender VS Code extension",
     "category": "Development",
 }
 
-ADDON_VERSION = "0.6.0"
+ADDON_VERSION = "0.7.0"
 # Answered on the socket thread. Everything else runs on Blender's main thread.
 _NO_MAIN_THREAD = {"ping", "cancel"}
 # How long a connection waits for the main thread. The caller's own timeout is usually shorter.
@@ -197,6 +197,84 @@ def _autosave_note(root: str) -> dict | None:
         note["text"] = ("this file is a Blender autosave. Save with path set to the project .blend inside the workspace "
                         "and overwrite: true.")
     return note
+
+
+def _remember_window() -> None:
+    """Cache the open file for ping. Ping runs off the main thread and must not touch bpy."""
+    try:
+        state = history.unsaved()
+        _state["window"] = {
+            "file": bpy.data.filepath or "",
+            "workspace": workspace_root(),
+            "dirty": bool(state.get("dirty")),
+            "unsaved_runs": int(state.get("runs") or 0),
+            "background": bool(bpy.app.background),
+        }
+    except Exception:
+        return
+
+
+def _window_tick():
+    _remember_window()
+    return 1.0
+
+
+def _quit_block() -> str:
+    """Why this window must stay open. Empty when the file on disk matches the session."""
+    state = history.unsaved()
+    if not (bpy.data.filepath or ""):
+        return "this Blender has never been saved. The chat that has it open has to call finish with a path."
+    if state.get("dirty") or int(state.get("runs") or 0) > 0:
+        runs = int(state.get("runs") or 0)
+        extra = f" ({runs} run(s) since the last save)" if runs else ""
+        return f"the open file has unsaved work{extra}. The chat that has it open has to call finish, which saves it."
+    return ""
+
+
+def _quit_blender_soon():
+    try:
+        bpy.ops.wm.quit_blender()
+    except Exception:
+        traceback.print_exc()
+    return None
+
+
+def quit_if_saved(params: dict) -> dict:
+    """Quit this Blender only when the open file is saved. The reply is sent before the quit."""
+    reason = _quit_block()
+    if reason:
+        return {"quit": False, "reason": reason, "file": bpy.data.filepath or ""}
+    if params.get("dry_run"):
+        return {"quit": True, "dry_run": True, "file": bpy.data.filepath or ""}
+    _state["quit_after_reply"] = True
+    return {"quit": True, "file": bpy.data.filepath or ""}
+
+
+def finish(params: dict) -> dict:
+    """Save the open file at the end of a chat and leave Blender open.
+
+    Another folder can then close this window or open a second one. A file that already matches
+    the session is left as it is.
+    """
+    state = history.unsaved()
+    current = bpy.data.filepath or ""
+    if current and not state.get("dirty") and not int(state.get("runs") or 0):
+        _remember_window()
+        rel = history.rel(workspace_root(), current)
+        return {"finished": True, "already": True, "saved": rel, "file": current,
+                "text": f"already saved: {rel}. Another chat can close this window or open another one."}
+    saved = save_file({
+        "reason": str(params.get("reason") or "chat finished").strip() or "chat finished",
+        "actor": str(params.get("actor") or "ai"),
+        "allow_references": params.get("allow_references"),
+        "compress": params.get("compress", True),
+        **({"path": params["path"]} if params.get("path") else {}),
+        **({"overwrite": True} if params.get("overwrite") else {}),
+    })
+    _remember_window()
+    saved["finished"] = True
+    saved["text"] = f"saved {saved.get('saved')}. Another chat can close this window or open another one."
+    return saved
 
 
 def session_info() -> dict:
@@ -1632,6 +1710,13 @@ def dispatch(req: dict) -> dict:
             # No bpy here: ping runs on the socket thread so it answers while Blender is busy.
             result = {"product": "vsblender", "version": ADDON_VERSION, "port": _state["port"], "busy": _state["busy"],
                       "progress": helpers.progress_state()}
+            window = _state.get("window")
+            if isinstance(window, dict):
+                result["file"] = window.get("file") or ""
+                result["workspace"] = window.get("workspace") or ""
+                result["dirty"] = bool(window.get("dirty"))
+                result["unsaved_runs"] = int(window.get("unsaved_runs") or 0)
+                result["background"] = bool(window.get("background"))
         elif method == "cancel":
             result = {"cancelled": helpers.request_cancel(), "busy": _state["busy"]}
         elif method == "session_info":
@@ -1657,6 +1742,10 @@ def dispatch(req: dict) -> dict:
             result = save_copy(params)
         elif method == "save_file":
             result = save_file(params)
+        elif method == "finish":
+            result = finish(params)
+        elif method == "quit_if_saved":
+            result = quit_if_saved(params)
         elif method == "append_objects":
             result, warnings, changed = append_objects(params)
         elif method == "ingest_live":
@@ -1753,6 +1842,10 @@ def _handle_conn(conn: socket.socket, direct: bool) -> None:
                 holder["resp"] = {"id": req.get("id"), "ok": False, "error": str(exc)}
             finally:
                 _state["busy"] = ""
+                try:
+                    _remember_window()
+                except Exception:
+                    pass
             done.set()
 
         _state["queue"].put(job)
@@ -1760,6 +1853,10 @@ def _handle_conn(conn: socket.socket, direct: bool) -> None:
             _send(conn, {"id": req.get("id"), "ok": False, "error": f"Blender did not answer within {_MAIN_THREAD_WAIT}s"})
             return
         _send(conn, holder.get("resp") or {"ok": False, "error": "empty response"})
+        if _state.get("quit_after_reply"):
+            _state["quit_after_reply"] = False
+            if not bpy.app.timers.is_registered(_quit_blender_soon):
+                bpy.app.timers.register(_quit_blender_soon, first_interval=0.3)
     except Exception as exc:
         try:
             _send(conn, {"ok": False, "error": str(exc)})
@@ -1914,6 +2011,7 @@ def _load_post(_dummy):
     # A preview interrupted by a crash can be saved into the file; clear it when the file loads.
     _purge_leftovers()
     history.reset_edited()
+    _remember_window()
     ensure_server()
 
 
@@ -1922,6 +2020,7 @@ def _save_post(*_args):
     # Saved: the edits made through the bridge are in the file now. A copy (checkpoint) does not count.
     if not history.writing_copy():
         history.reset_edited(saved=True)
+        _remember_window()
 
 
 def _purge_once():
@@ -1993,7 +2092,11 @@ def register():
         # Preferences), so the cleanup waits for the first timer tick.
         if not bpy.app.background and not bpy.app.timers.is_registered(_purge_once):
             bpy.app.timers.register(_purge_once, first_interval=0.1)
+        if not bpy.app.timers.is_registered(_window_tick):
+            bpy.app.timers.register(_window_tick, first_interval=0.2, persistent=True)
     helpers.install_modules()
+    # The first ping has to name the file. During Preferences enable, bpy.data may refuse; the timer retries.
+    _remember_window()
     ensure_server()
 
 
@@ -2003,6 +2106,8 @@ def unregister():
         bpy.app.handlers.load_post.remove(_load_post)
     if _save_post in bpy.app.handlers.save_post:
         bpy.app.handlers.save_post.remove(_save_post)
+    if bpy.app.timers.is_registered(_window_tick):
+        bpy.app.timers.unregister(_window_tick)
     for cls in reversed(_CLASSES):
         try:
             bpy.utils.unregister_class(cls)

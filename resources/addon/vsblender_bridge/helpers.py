@@ -17,7 +17,8 @@ Modelling (see vsblender.geo for solids and mesh builders):
     place_on_ground(objs), center_on_origin(objs), set_origin(obj, "base"), orient_flat(obj), stats(obj)
     units() / mm(20) / m(1.5) / to_mm(x)  what a Blender unit is, and real sizes in Blender units
     printer()                            the 3D-printer profile (millimetres)
-    read_stl / read_obj / read_3mf / read_mesh_file, svg_loops(path)
+    read_stl / read_obj / read_3mf(path, volumes="model") / read_mesh_file, svg_loops(path)
+    read_3mf drops a slicer's negative, modifier and support meshes (volumes="all" keeps them)
     part("dhd", keys_per_ring=18)        a reusable builder from parts/dhd.py, recorded on the objects
     intent("...")                        NOTES.md's Intent & constraints (kept across re-ingests)
     is_main()                            True in the script run_script runs, False when imported

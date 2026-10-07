@@ -483,10 +483,56 @@ def _safe(name):
     return re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_") or "part"
 
 
+def _slicer_note(project):
+    """What a slicer 3MF kept out of the solid, and the machine the project was sliced for."""
+    if not project:
+        return ""
+    bits = []
+    dropped = [v for v in (project.get("volumes") or []) if not v.get("model")]
+    if dropped:
+        shown = [f"{v.get('name') or v.get('type')} ({v.get('triangles')} tris, {v.get('type')}) on {v.get('object')}"
+                 for v in dropped[:8]]
+        extra = f" and {len(dropped) - 8} more" if len(dropped) > 8 else ""
+        bits.append("left out slicer volumes that are not part of the solid: " + "; ".join(shown) + extra
+                    + ". A negative is subtracted by the slicer; it is not a hole in the mesh.")
+    printer = project.get("printer") or {}
+    if printer.get("name") or printer.get("model"):
+        volume = printer.get("build_volume")
+        size = "x".join(str(round(float(v), 2)) for v in volume) + " mm" if volume else "build volume not in the file"
+        nozzle = printer.get("nozzle")
+        layer = printer.get("layer_height")
+        bits.append(f"sliced for {printer.get('name') or printer.get('model')}: {size}"
+                    + (f", {nozzle} mm nozzle" if nozzle else "")
+                    + (f", {layer} mm layers" if layer else "")
+                    + (f", {printer.get('material')}" if printer.get("material") else ""))
+    for warning in (project.get("warnings") or [])[:4]:
+        bits.append(str(warning))
+    return " ".join(bits)
+
+
+def _import_3mf(path):
+    """read_3mf, not Blender's importer: a slicer project keeps its solid and reports cutter meshes."""
+    meshdata = load_module("meshdata")
+    items = meshdata.read_3mf(path, volumes="model")
+    project = getattr(items, "project", None)
+    obs = []
+    for name, arrays in items:
+        me = meshdata.to_mesh(arrays, (name or "3mf")[:60])
+        ob = bpy.data.objects.new(me.name, me)
+        ob.name = (name or me.name)[:63]
+        bpy.context.scene.collection.objects.link(ob)
+        obs.append(ob)
+    note = _slicer_note(project)
+    note = (note + " " if note else "") + "3MF is Z-up and the build-item transform is already applied, so axes is ignored."
+    return obs, note, project
+
+
 def _import_file(path, axes):
     """Blender's own importer for the file, in a background Blender. axes "blender": as File > Import
-    does (a Y-up OBJ stands up in Z); "native": the file's own coordinates."""
+    does (a Y-up OBJ stands up in Z); "native": the file's own coordinates. 3MF uses read_3mf."""
     ext = os.path.splitext(path)[1].lower()
+    if ext == ".3mf":
+        return _import_3mf(path)
     native = axes == "native"
     before = set(bpy.data.objects)
     note = ""
@@ -509,8 +555,8 @@ def _import_file(path, axes):
     elif ext == ".ply":
         bpy.ops.wm.ply_import(filepath=path)
     else:
-        raise ValueError(f"import_reference reads OBJ, FBX, glTF/GLB, STL and PLY, not {ext} (3MF: use measure/overlay with file)")
-    return [ob for ob in bpy.data.objects if ob not in before and ob.type == "MESH"], note
+        raise ValueError(f"import_reference reads OBJ, FBX, glTF/GLB, STL, PLY and 3MF, not {ext}")
+    return [ob for ob in bpy.data.objects if ob not in before and ob.type == "MESH"], note, None
 
 
 def import_reference(spec):
@@ -530,7 +576,7 @@ def import_reference(spec):
             os.remove(os.path.join(out_dir, name))
     started = time.time()
     emit("VSB_PROGRESS", {"done": 0, "total": 4, "stage": "importing"})
-    obs, note = _import_file(src, spec.get("axes") or "blender")
+    obs, note, project = _import_file(src, spec.get("axes") or "blender")
     if not obs:
         raise ValueError(f"{src} has no mesh objects")
     t_import = time.time() - started
@@ -599,10 +645,13 @@ def import_reference(spec):
     for ob in obs:
         bpy.data.objects.remove(ob, do_unlink=True)
     emit("VSB_PROGRESS", {"done": 4, "total": 4, "stage": "done"})
-    return {"status": "done", "parts": parts, "rows": rows, "overlay": overlay, "overlay_tris": int(overlay_tris),
-            "overlay_cell": cell, "tris": int(len(whole.tris)), "bounds": [lo.tolist(), hi.tolist()],
-            "seconds": {"import": round(t_import, 1), "total": round(time.time() - started, 1)}, "note": note,
-            "objects": len(obs)}
+    result = {"status": "done", "parts": parts, "rows": rows, "overlay": overlay, "overlay_tris": int(overlay_tris),
+              "overlay_cell": cell, "tris": int(len(whole.tris)), "bounds": [lo.tolist(), hi.tolist()],
+              "seconds": {"import": round(t_import, 1), "total": round(time.time() - started, 1)}, "note": note,
+              "objects": len(obs)}
+    if project:
+        result["slicer"] = project
+    return result
 
 
 def video_frames(spec):
