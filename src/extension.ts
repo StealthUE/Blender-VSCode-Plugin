@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
+import { clickPreviewPath, clickPreviewScript, existingPreview, renderClickPreview } from "./blendPreview";
 import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
 import { callBridge, probeBridge } from "./bridge";
 import { serverLaunch } from "./configWrite";
@@ -69,6 +70,112 @@ async function chooseBlend(folder: string, uri: vscode.Uri | undefined, placeHol
     { placeHolder }
   );
   return picked?.file;
+}
+
+/** The folder that contains this file, or the workspace the status bar is using. */
+function folderOf(file: string): string | undefined {
+  const folders = vscode.workspace.workspaceFolders ?? [];
+  const hit = folders.find((folder) => {
+    const rel = path.relative(folder.uri.fsPath, file);
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  });
+  return hit?.uri.fsPath ?? workspaceRoot();
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+/** A still of the .blend on disk. The open Blender window is left on its own file. */
+function previewHtml(webview: vscode.Webview, title: string, message: string, body: string, script = false): string {
+  const nonce = String(Math.random()).slice(2);
+  const click = script
+    ? `<script nonce="${nonce}">const vscode = acquireVsCodeApi(); document.getElementById("again")?.addEventListener("click", () => vscode.postMessage({ command: "refresh" }));</script>`
+    : "";
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${webview.cspSource}; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); margin: 16px; }
+  img { max-width: 100%; height: auto; }
+  button { margin-top: 8px; }
+  pre { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h2>${escapeHtml(title)}</h2>
+<p>${escapeHtml(message)}</p>
+${body}
+${click}
+</body>
+</html>`;
+}
+
+class BlendPreviewEditor implements vscode.CustomReadonlyEditorProvider {
+  private readonly tickets = new WeakMap<vscode.WebviewPanel, number>();
+
+  constructor(
+    private readonly context: vscode.ExtensionContext,
+    private readonly output: vscode.OutputChannel,
+  ) {}
+
+  openCustomDocument(uri: vscode.Uri): vscode.CustomDocument {
+    return { uri, dispose() { /* the preview holds no file handle */ } };
+  }
+
+  async resolveCustomEditor(document: vscode.CustomDocument, panel: vscode.WebviewPanel): Promise<void> {
+    panel.webview.options = { enableScripts: true };
+    const messages = panel.webview.onDidReceiveMessage((message: { command?: string }) => {
+      if (message?.command === "refresh") void this.paint(document.uri.fsPath, panel, true);
+    });
+    panel.onDidDispose(() => messages.dispose());
+    await this.paint(document.uri.fsPath, panel, false);
+  }
+
+  /** Show a current ingest still, or render one in a background Blender. */
+  private async paint(file: string, panel: vscode.WebviewPanel, force: boolean): Promise<void> {
+    const ticket = (this.tickets.get(panel) ?? 0) + 1;
+    this.tickets.set(panel, ticket);
+    const current = (): boolean => this.tickets.get(panel) === ticket;
+    const name = path.basename(file);
+    panel.webview.html = previewHtml(panel.webview, name, "Rendering a preview of the file on disk.", "");
+    let image = force ? undefined : existingPreview(file);
+    if (!image) {
+      const folder = folderOf(file);
+      const blender = folder ? readConfig(folder)?.blender : undefined;
+      if (!blender || !fs.existsSync(blender)) {
+        if (current()) {
+          panel.webview.html = previewHtml(panel.webview, name,
+            "Blender is not configured. Run VSBlender: Setup, then open this file again.", "");
+        }
+        return;
+      }
+      try {
+        image = await renderClickPreview(blender, file, clickPreviewScript(this.context.extensionPath), clickPreviewPath(file));
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.output.appendLine(`Preview ${file}: ${detail}`);
+        if (current()) {
+          panel.webview.html = previewHtml(panel.webview, name, "The preview could not be rendered.", `<pre>${escapeHtml(detail)}</pre>`);
+        }
+        return;
+      }
+    }
+    if (!current()) return;
+    const src = String(panel.webview.asWebviewUri(vscode.Uri.file(image)));
+    panel.webview.options = {
+      enableScripts: true,
+      localResourceRoots: [vscode.Uri.file(path.dirname(image))],
+    };
+    const body = `<img src="${escapeHtml(src)}" alt="Preview of ${escapeHtml(name)}">`
+      + `<p><button type="button" id="again">Render again</button></p>`;
+    panel.webview.html = previewHtml(panel.webview, name,
+      "This is the file on disk. Unsaved work in an open Blender is not in this picture.", body, true);
+  }
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -176,6 +283,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     if (outcome.ok) void vscode.window.showInformationMessage(outcome.text.split("\n")[0] ?? "Blender is up.");
     else void vscode.window.showErrorMessage(outcome.text.split("\n")[0] ?? "Could not launch Blender.");
     void refreshStatus();
+  }));
+  context.subscriptions.push(vscode.window.registerCustomEditorProvider("vsblender.blendPreview", new BlendPreviewEditor(context, output), {
+    webviewOptions: { retainContextWhenHidden: true },
+    supportsMultipleEditorsPerDocument: true,
+  }));
+  context.subscriptions.push(vscode.commands.registerCommand("vsblender.preview", async (uri?: vscode.Uri) => {
+    const folder = root();
+    if (!folder) return;
+    const file = await chooseBlend(folder, uri, "Blend file to preview");
+    if (!file) {
+      void vscode.window.showInformationMessage("There is no .blend file in this workspace to preview.");
+      return;
+    }
+    await vscode.commands.executeCommand("vscode.openWith", vscode.Uri.file(file), "vsblender.blendPreview");
   }));
   context.subscriptions.push(vscode.commands.registerCommand("vsblender.ingest", async (uri?: vscode.Uri) => {
     const folder = root();

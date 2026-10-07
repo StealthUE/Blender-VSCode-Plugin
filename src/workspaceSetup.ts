@@ -29,9 +29,9 @@ export interface ApplyInput {
   clients: ClientFlags;
   replaceLegacy: boolean;
   launch: ServerLaunch;
-  /** undefined: leave the run_script rule in .claude/settings.local.json as it is. */
+  /** undefined: leave the personal run_script rule in .claude/settings.local.json as it is. */
   allowScripts?: boolean;
-  /** Let Claude Code run run_project_script (trusted folders only) without asking. */
+  /** Personal copy of the run_project_script allow rule. The shared list already allows it. */
   allowTrustedScripts?: boolean;
   /** Let the AI save the .blend: the save tool without asking, and save: true on runs. */
   allowSave?: boolean;

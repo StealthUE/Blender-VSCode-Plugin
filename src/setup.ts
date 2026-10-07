@@ -1,7 +1,6 @@
 import * as fs from "fs";
-import * as path from "path";
 import * as vscode from "vscode";
-import { hasScriptRule, readText, serverLaunch } from "./configWrite";
+import { serverLaunch } from "./configWrite";
 import { installAddon, runDoctor } from "./doctor";
 import { findBlenders, findNode } from "./findBlender";
 import { PRINTER_PRESETS } from "./printers";
@@ -16,8 +15,6 @@ interface PanelState {
   port: number;
   clients: ClientFlags;
   replaceLegacy: boolean;
-  allowScripts: boolean;
-  allowTrustedScripts: boolean;
   allowSave: boolean;
   trustedScripts: string;
   printer: string;
@@ -56,8 +53,6 @@ async function collectState(workspace: string): Promise<PanelState> {
     port: saved?.port ?? clampPort(settings.get<number>("port"), DEFAULT_PORT),
     clients: configuredClients(workspace),
     replaceLegacy: saved?.replaceLegacy ?? settings.get<boolean>("replaceLegacy") !== false,
-    allowScripts: saved?.allowScripts ?? hasScriptRule(readText(path.join(workspace, ".claude", "settings.local.json"))),
-    allowTrustedScripts: saved?.allowTrustedScripts ?? false,
     allowSave: saved?.allowSave ?? false,
     trustedScripts: (saved?.trustedScripts ?? []).join(", "),
     printer: typeof saved?.printer === "string" ? saved.printer : saved?.printer && typeof saved.printer === "object" ? "custom" : "",
@@ -113,9 +108,7 @@ function html(state: PanelState): string {
   </fieldset>
   <fieldset>
     <legend>Approvals and git</legend>
-    <p class="muted">Claude Code runs the read-only VSBlender tools (session_info, context_pack, preview, ingest, describe, find, api and the like) without asking. Tools that change Blender still ask.</p>
-    <label><input type="checkbox" id="allowScripts" ${state.allowScripts ? "checked" : ""}> Also let Claude Code run scripts in Blender without asking (run_script runs any Python). Saved in .claude/settings.local.json, which is personal and not committed.</label>
-    <label><input type="checkbox" id="allowTrustedScripts" ${state.allowTrustedScripts ? "checked" : ""}> Let Claude Code run scripts from trusted folders without asking (run_project_script), while run_script still asks. Anything the AI can write into those folders then runs unasked; Claude Code still asks before it edits files.</label>
+    <p class="muted">Claude Code and Grok run a build without a prompt on each tool: scripts, pipelines, new files, append, open, replay, restore, roles, export, and render, plus the read-only tools. These ask each time: save (unless the tick below is on), finish, doctor_fix, a hidden Blender, import_reference, and reference. VS Code and Cursor keep approvals in their own settings.</p>
     <label><input type="checkbox" id="allowSave" ${state.allowSave ? "checked" : ""}> Let the AI save the .blend (the save tool runs without asking, and runs can pass save: true). Off: the save tool asks you each time. Checkpoints keep unsaved work safe either way.</label>
     <label>Trusted script folders (comma separated, workspace relative) <input type="text" id="trustedScripts" value="${escapeAttr(state.trustedScripts)}" placeholder="Models/scripts"></label>
     <label><input type="checkbox" id="ignoreClientConfig" ${state.ignoreClientConfig ? "checked" : ""}> Keep the MCP config files out of git. .mcp.json and the others hold paths for this machine; each person runs setup.</label>
@@ -152,8 +145,6 @@ function html(state: PanelState): string {
         port: Number(document.getElementById("port").value),
         clients: clients(),
         replaceLegacy: document.getElementById("replace").checked,
-        allowScripts: document.getElementById("allowScripts").checked,
-        allowTrustedScripts: document.getElementById("allowTrustedScripts").checked,
         allowSave: document.getElementById("allowSave").checked,
         trustedScripts: document.getElementById("trustedScripts").value,
         printer: document.getElementById("printer").value,
@@ -221,7 +212,7 @@ export async function showSetup(
 
   current.webview.onDidReceiveMessage(async (message: {
     type?: string; blender?: string; port?: number; clients?: unknown; replaceLegacy?: boolean;
-    allowScripts?: boolean; ignoreClientConfig?: boolean; allowTrustedScripts?: boolean; allowSave?: boolean; trustedScripts?: string; printer?: string;
+    ignoreClientConfig?: boolean; allowSave?: boolean; trustedScripts?: string; printer?: string;
   }) => {
     if (message.type === "launch") {
       await vscode.commands.executeCommand("vsblender.launch");
@@ -263,15 +254,13 @@ export async function showSetup(
     // The Blender path and port are saved in .blender-ai/config.json (git-ignored), not in
     // .vscode/settings.json, which is often committed and would carry this machine's paths.
     const saved = readConfig(workspace);
-    const allowScripts = message.allowScripts === true;
-    const allowTrustedScripts = message.allowTrustedScripts === true;
     const allowSave = message.allowSave === true;
     const trustedScripts = String(message.trustedScripts ?? "").split(",").map((item) => item.trim()).filter(Boolean);
     const printer = typeof message.printer === "string" && message.printer && message.printer !== "custom" ? message.printer : undefined;
     const ignoreClientConfig = message.ignoreClientConfig !== false;
     const applied = applyWorkspace({
-      workspace, extensionRoot, port, blender, clients, replaceLegacy, launch, allowScripts, ignoreClientConfig,
-      allowTrustedScripts, allowSave, trustedScripts,
+      workspace, extensionRoot, port, blender, clients, replaceLegacy, launch, ignoreClientConfig,
+      allowSave, trustedScripts,
       ...(printer ? { printer } : {}),
       ...(saved?.checkpoints ? { checkpoints: saved.checkpoints } : {}),
       ...(saved?.libPaths ? { libPaths: saved.libPaths } : {}),
@@ -294,9 +283,10 @@ export async function showSetup(
     const next: string[] = [];
     if (clients.claude) {
       next.push("Claude Code asks you to approve the vsblender server in .mcp.json the first time it starts in this folder.");
-      next.push(allowScripts
-        ? "Claude Code runs VSBlender's read-only tools and run_script without asking."
-        : "Claude Code runs VSBlender's read-only tools without asking; run_script still asks each time.");
+    }
+    if (clients.claude || clients.grok) {
+      next.push("Scripts, pipelines, new files, append, open, replay, restore, roles, export, and render run without asking. save, finish, doctor_fix, a hidden Blender, import_reference, and reference ask each time.");
+      if (allowSave) next.push("save runs without asking, and runs can pass save: true.");
     }
     if (clients.vscode) next.push("VS Code: start the vsblender server from .vscode/mcp.json (or the MCP Servers view) if it does not start by itself.");
     if (clients.grok) next.push("Grok: the server is in .grok/config.toml. If a session has no vsblender tools, turn it on in /mcps. The guide tells the model to stop and ask you, not to build the part in another program.");

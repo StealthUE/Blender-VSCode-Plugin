@@ -4,12 +4,14 @@ import { execFileText } from "./exec";
 import { compareVersions, findNode } from "./findBlender";
 import { callBridge, probeBridge } from "./bridge";
 import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
-import { describePrinter, resolvePrinter } from "./printers";
+import { printerForCall } from "./printerLookup";
+import { describePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
 import { applyWorkspace } from "./workspaceSetup";
 import { hasScriptRule, readText, serverLaunch } from "./configWrite";
 import { AUTO_APPROVE, claudeRule } from "./toolDefs";
 import { ADDON_VERSION, ClientFlags, WorkspaceContext } from "./types";
+import { decideWindow } from "./windows";
 
 export interface Check {
   id: string;
@@ -159,8 +161,9 @@ export async function runDoctor(
       + "Keep model scripts next to their .blend, in <blend folder>/scripts/ (shared code in <blend folder>/scripts/lib/).", true));
   }
   if (config?.printer !== undefined) {
-    const { profile, warnings } = resolvePrinter(config.printer);
-    checks.push(check("printer", !warnings.length, warnings.length ? warnings.join("; ") : describePrinter(profile), true));
+    const { profile, warnings } = await printerForCall(ctx);
+    const unknown = warnings.some((line) => line.startsWith("unknown printer"));
+    checks.push(check("printer", !unknown, warnings.length ? warnings.join("; ") : describePrinter(profile), true));
   }
 
   for (const file of clientFiles(ctx.clients, ctx.workspace)) {
@@ -173,12 +176,13 @@ export async function runDoctor(
   if (ctx.clients.claude || ctx.clients.grok) {
     const settings = readText(path.join(ctx.workspace, ".claude", "settings.json")) ?? "";
     const missing = AUTO_APPROVE.map(claudeRule).filter((rule) => !settings.includes(`"${rule}"`));
-    const scripts = hasScriptRule(readText(path.join(ctx.workspace, ".claude", "settings.local.json")))
-      ? "run_script runs without asking (settings.local.json)"
+    const scripts = settings.includes(`"${claudeRule("run_script")}"`)
+      || hasScriptRule(readText(path.join(ctx.workspace, ".claude", "settings.local.json")))
+      ? "scene tools, including run_script, run without asking"
       : "run_script asks each time";
     checks.push(check("claude permissions", !missing.length,
-      missing.length ? `${missing.length} read-only tool(s) still ask for approval (${missing.slice(0, 3).join(", ")}...). Run doctor_fix.`
-        : `read-only tools run without asking; ${scripts}`, true));
+      missing.length ? `${missing.length} tool(s) still ask for approval (${missing.slice(0, 3).join(", ")}...). Reload the window, or run doctor_fix.`
+        : `allowed tools run without asking; ${scripts}`, true));
   }
 
   const orphans = orphanSidecars(ctx.workspace);
@@ -204,7 +208,10 @@ export async function runDoctor(
     checks.push(check("bridge", false, `${bridge.detail}. Blender is not open with the add-on yet: use Launch Blender.`, true));
   } else {
     checks.push(check("bridge", bridge.ok, bridge.detail));
-    if (bridge.ok && !bridge.busy) {
+    const windowDecision = bridge.ok ? decideWindow(ctx.workspace, bridge.window ?? { unknown: true }) : undefined;
+    if (windowDecision && !windowDecision.use) {
+      checks.push(check("blender window", true, windowDecision.message ?? "another folder has this Blender open", true));
+    } else if (bridge.ok && !bridge.busy) {
       try {
         const info = await callBridge(ctx.port, "session_info", {}, 15000);
         const sidecar = info.result?.["sidecar"] as { status?: string; detail?: string } | undefined;

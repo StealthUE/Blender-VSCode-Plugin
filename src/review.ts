@@ -4,6 +4,7 @@ import * as https from "https";
 import * as path from "path";
 import { findCheckpoint, readCheckpoints, relativeTo, resolveInside, sidecarDir } from "./blendFiles";
 import { callBridge, probeBridge } from "./bridge";
+import { decideWindow } from "./windows";
 import { diffHeadless, ingestScript, manifestHeadless } from "./ingest";
 import * as jobs from "./jobs";
 import { isVideoArg, videoReference } from "./references";
@@ -117,7 +118,8 @@ export async function diff(ctx: WorkspaceContext, args: Record<string, unknown>,
     const fileB = await manifestFor(ctx, b, blend, temps);
     let changes: unknown[];
     const probe = await probeBridge(ctx.port);
-    if (probe.ok) {
+    const ours = probe.ok && decideWindow(ctx.workspace, probe.window ?? { unknown: true }).use;
+    if (ours) {
       const response = await callBridge(ctx.port, "diff_manifests", { a: fileA, b: fileB }, 60000);
       if (!response.ok) throw new Error(response.error || "diff failed");
       changes = Array.isArray(response.result?.["changes"]) ? response.result["changes"] as unknown[] : [];
@@ -156,6 +158,10 @@ async function livePreview(ctx: WorkspaceContext, params: Record<string, unknown
 
 async function sourceImage(ctx: WorkspaceContext, source: string, params: Record<string, unknown>, blend: string | undefined, extras: CallExtras): Promise<Source> {
   if (source === "live") {
+    const probe = await probeBridge(ctx.port);
+    if (probe.ok && !decideWindow(ctx.workspace, probe.window ?? { unknown: true }).use) {
+      throw new Error("the open Blender belongs to another folder, so live is that window. Compare a checkpoint or an image, or finish that chat first.");
+    }
     return { file: await livePreview(ctx, params), label: "live", temp: true };
   }
   if (IMAGE_FILE.test(source)) {
@@ -183,7 +189,7 @@ async function composeImages(ctx: WorkspaceContext, paths: string[], labels: str
   const spec = { paths, out, labels, diff: diffPanel, cell, max_bytes: PREVIEW_BYTES };
   const probe = await probeBridge(ctx.port);
   let result: Record<string, unknown>;
-  if (probe.ok) {
+  if (probe.ok && decideWindow(ctx.workspace, probe.window ?? { unknown: true }).use) {
     const response = await callBridge(ctx.port, "compose", spec, 120000);
     if (!response.ok) throw new Error(response.error || "compose failed");
     result = response.result ?? {};

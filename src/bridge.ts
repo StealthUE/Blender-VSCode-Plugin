@@ -1,4 +1,5 @@
 import * as net from "net";
+import { snapshotFromPing, WindowSnapshot } from "./windows";
 
 /** What run_script changed, by category. modified[category][name] lists the aspects that changed. */
 export interface ChangeReport {
@@ -87,6 +88,8 @@ export interface Probe {
   version?: string;
   busy?: string;
   progress?: ScriptProgress;
+  /** The file that window has open, when the add-on reported it. */
+  window?: WindowSnapshot;
 }
 
 export async function probeBridge(port: number): Promise<Probe> {
@@ -98,11 +101,13 @@ export async function probeBridge(port: number): Promise<Probe> {
       const progress = response.result["progress"] as ScriptProgress | undefined;
       const hasProgress = Boolean(progress && Object.keys(progress).length);
       const share = hasProgress && typeof progress?.fraction === "number" ? ` ${Math.round(progress.fraction * 100)}%` : "";
+      const window = snapshotFromPing(response.result) ?? { unknown: true };
       return {
         ok: true,
         state: "listening",
         detail: `listening on ${port}${busy ? ` (busy: ${busy}${share}${hasProgress && progress?.message ? `, ${progress.message}` : ""})` : ""}`,
         version,
+        window,
         ...(busy ? { busy } : {}),
         ...(hasProgress && progress ? { progress } : {}),
       };

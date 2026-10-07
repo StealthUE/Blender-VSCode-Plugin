@@ -37,6 +37,40 @@ export const PRINTER_PRESETS: Record<string, Omit<PrinterProfile, "preset" | "de
 
 export const DEFAULT_PRESET = "generic_220";
 
+/** Marketing names that mean a built-in preset. Checked in order; MK3 is not here, it is looked up. */
+const PRINTER_ALIASES: { test: RegExp; id: string }[] = [
+  { test: /\ba1\s*mini\b|\ba1mini\b/, id: "bambu_a1_mini" },
+  { test: /\bx1c\b|\bx1\s*carbon\b/, id: "bambu_x1c" },
+  { test: /\bp1s\b/, id: "bambu_p1s" },
+  { test: /\bp1p\b/, id: "bambu_p1p" },
+  { test: /\ba1\b/, id: "bambu_a1" },
+  { test: /\bmk4\b/, id: "prusa_mk4" },
+  { test: /\bcore\s*one\b|\bcoreone\b/, id: "prusa_core_one" },
+  { test: /\bmini\b/, id: "prusa_mini" },
+  { test: /\bender[\s-]*3\b/, id: "creality_ender3" },
+];
+
+/** Presets plus machines this workspace has already looked up. Values match PRINTER_PRESETS. */
+export type PrinterCatalog = Record<string, Omit<PrinterProfile, "preset" | "density">>;
+
+export function printerSlug(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "printer";
+}
+
+/** A preset id for this name: the id itself, its slug, a marketing alias, or a catalog entry. */
+export function canonicalPreset(name: string, extras?: PrinterCatalog): string | undefined {
+  const trimmed = name.trim();
+  if (!trimmed) return undefined;
+  if (PRINTER_PRESETS[trimmed] || extras?.[trimmed]) return trimmed;
+  const slug = printerSlug(trimmed);
+  if (PRINTER_PRESETS[slug] || extras?.[slug]) return slug;
+  const folded = trimmed.toLowerCase();
+  for (const alias of PRINTER_ALIASES) {
+    if (alias.test.test(folded) && (PRINTER_PRESETS[alias.id] || extras?.[alias.id])) return alias.id;
+  }
+  return undefined;
+}
+
 /** g/cm³, typical datasheet values. The slicer's own estimate is the one to trust. */
 export const MATERIAL_DENSITY: Record<string, number> = {
   PLA: 1.24,
@@ -72,19 +106,22 @@ export function normalizePrinterSetting(value: unknown): PrinterSetting | undefi
 
 /**
  * The profile a call uses: preset, then the workspace setting, then the per-call value (a preset
- * name or an object). Unknown preset names fall back to the default with a warning.
+ * name or an object). extras holds machines looked up earlier. An unknown name with no build
+ * volume falls back to the default with a warning. A full profile object is used as given.
  */
-export function resolvePrinter(setting?: unknown, override?: unknown): { profile: PrinterProfile; warnings: string[] } {
+export function resolvePrinter(setting?: unknown, override?: unknown, extras?: PrinterCatalog): { profile: PrinterProfile; warnings: string[] } {
   const warnings: string[] = [];
   const layers = [normalizePrinterSetting(setting), normalizePrinterSetting(override)].filter((item): item is PrinterSetting => item !== undefined);
   let preset = DEFAULT_PRESET;
   for (const layer of layers) {
     const name = typeof layer === "string" ? layer : layer.preset;
     if (!name) continue;
-    if (PRINTER_PRESETS[name]) preset = name;
+    const known = canonicalPreset(name, extras);
+    if (known) preset = known;
+    else if (typeof layer !== "string" && layer.buildVolume) preset = printerSlug(name);
     else warnings.push(`unknown printer preset "${name}"; using ${preset}. Presets: ${Object.keys(PRINTER_PRESETS).join(", ")}`);
   }
-  const base = PRINTER_PRESETS[preset] ?? PRINTER_PRESETS[DEFAULT_PRESET]!;
+  const base = extras?.[preset] ?? PRINTER_PRESETS[preset] ?? PRINTER_PRESETS[DEFAULT_PRESET]!;
   let profile: PrinterProfile = { ...base, preset, density: MATERIAL_DENSITY[base.material] ?? 1.24 };
   for (const layer of layers) {
     if (typeof layer === "string") continue;

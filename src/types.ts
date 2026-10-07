@@ -37,8 +37,9 @@ export interface ProjectConfig {
   clients: ClientFlags;
   replaceLegacy: boolean;
   /**
-   * Let Claude Code run run_script without asking. Written to .claude/settings.local.json, which is
-   * personal. undefined: setup never asked, so an existing rule is left as it is.
+   * Personal copy of the run_script allow rule in .claude/settings.local.json.
+   * The shared .claude/settings.json already allows the build tools. false removes only that
+   * personal copy. undefined: setup never asked, so an existing rule is left as it is.
    */
   allowScripts?: boolean;
   /** Add the client MCP files to .gitignore: they hold this machine's paths. */
@@ -50,7 +51,7 @@ export interface ProjectConfig {
   printer?: PrinterSetting;
   /** Workspace folders whose scripts run_project_script accepts. */
   trustedScripts?: string[];
-  /** Let Claude Code run run_project_script without asking (settings.local.json). */
+  /** Personal copy of the run_project_script allow rule. The shared list already allows it. */
   allowTrustedScripts?: boolean;
   /**
    * The user lets the AI save the open .blend: the save tool runs without asking, and the script
@@ -104,7 +105,7 @@ export interface CallExtras {
 
 export const DEFAULT_PORT = 47876;
 export const SERVER_NAME = "vsblender";
-export const ADDON_VERSION = "0.6.0";
+export const ADDON_VERSION = "0.7.0";
 export const GUIDE_STAMP = "<!-- vsblender-guide";
 export const DEFAULT_LIB_PATHS = ["scripts/lib"];
 

@@ -49,12 +49,12 @@ const solidProps = {
 };
 
 const purpose = { type: "string", description: "general (default; print_mm files default to print, game files to game), render, game, or print." };
-const printer = { description: "Printer for purpose print: a preset (bambu_p1s, bambu_x1c, bambu_a1, bambu_a1_mini, prusa_mk4, prusa_core_one, prusa_mini, creality_ender3, generic_220) or {preset, buildVolume, nozzle, layerHeight, minWall, maxOverhangDeg, material}. Default: .blender-ai/config.json \"printer\"." };
+const printer = { description: "Printer for purpose print: a preset (bambu_p1s, bambu_x1c, bambu_a1, bambu_a1_mini, prusa_mk4, prusa_core_one, prusa_mini, creality_ender3, generic_220), a name to look up (\"Prusa MK3S\"), or {preset, buildVolume, nozzle, layerHeight, minWall, maxOverhangDeg, material}. An unknown name is searched on the web and, when the workspace has no printer yet, saved into .blender-ai/config.json. Default: that config's \"printer\"." };
 
 export const TOOLS: ToolDef[] = [
   {
     name: "doctor",
-    description: "Read-only check of the Blender path and version, the add-on, client MCP config, whether the bridge is listening, the printer profile, and each .blend's ingest status (current, stale, new, live, diverged). Changes nothing; use doctor_fix to repair.",
+    description: "Check of the Blender path and version, the add-on, client MCP config, whether the bridge is listening, the printer profile, and each .blend's ingest status (current, stale, new, live, diverged). An unknown printer name is looked up and saved into config. Otherwise it changes nothing; use doctor_fix to repair.",
     inputSchema: obj({}),
   },
   {
@@ -71,17 +71,23 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "launch_blender",
-    description: "Open Blender with its window and the bridge started, or open a file in the Blender already listening. Never starts a second Blender while one holds the port, and never discards unsaved changes (it refuses instead).",
-    inputSchema: obj({ file: { type: "string", description: "Workspace .blend. Optional when only one exists." } }),
+    description: "Open Blender with its window and the bridge started, or open a file in the Blender that already has this folder's file. A window that has another folder's file is left alone. window \"close\" quits that window after its chat called finish (the file is saved) and then opens this folder. window \"new\" opens a second window on its own port and leaves the other one as it is. It never discards unsaved changes.",
+    inputSchema: obj({
+      file: { type: "string", description: "Workspace .blend. Optional when only one exists." },
+      window: { type: "string", description: "close: quit the other folder's saved Blender, then open this one. new: open a second window and leave the other one as it is." },
+    }),
   },
   {
     name: "launch_blender_background",
-    description: "Start a headless Blender (no window) with the bridge, and leave it running for later tools. Never starts a second Blender while one holds the port.",
-    inputSchema: obj({ file: { type: "string", description: "Workspace .blend. Optional when only one exists." } }),
+    description: "Start a headless Blender (no window) with the bridge, and leave it running for later tools. Same window rules as launch_blender: another folder's open file is left alone. window \"new\" starts a second headless Blender on its own port.",
+    inputSchema: obj({
+      file: { type: "string", description: "Workspace .blend. Optional when only one exists." },
+      window: { type: "string", description: "close or new. Same as launch_blender." },
+    }),
   },
   {
     name: "new_blend",
-    description: "Create a new .blend in the workspace from a template, in a background Blender (the open session is not touched). Never overwrites a file. Templates: empty (metres), render (metres; camera, three-light rig, floor), game (metres; check_model defaults to purpose game), print_mm (1 unit = 1 mm, build plate outline from the printer profile; checks and exports default to purpose print). open=true opens it in Blender (refused when the open file has unsaved changes).",
+    description: "Create a new .blend in the workspace from a template, then open it in a Blender window unless open is false. Never overwrites a file. Templates: empty (metres), render (metres; camera, three-light rig, floor), game (metres; check_model defaults to purpose game), print_mm (1 unit = 1 mm, build plate outline from the printer profile; checks and exports default to purpose print). The new file stays on disk when the open file has unsaved changes.",
     inputSchema: obj({
       path: { type: "string", description: "New workspace .blend, e.g. Models/lamp.blend." },
       template: { type: "string", description: "empty (default), render, game, print_mm." },
@@ -111,7 +117,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "run_script",
-    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`, `# vsblender: reads NAME`, `# vsblender: exports NAME` (an out-of-date warning then names the values that changed). `result` is a global, or the value main() returns. Or pass function and args. background: true runs the script on a copy in a headless Blender and throws the copy away: nothing is checkpointed, journaled, or written to the open file. The reply starts with how many runs the file on disk does not have; the .blend is never saved unless save is passed (and allowed).",
+    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`, `# vsblender: reads NAME`, `# vsblender: exports NAME` (an out-of-date warning then names the values that changed). `result` is a global, or the value main() returns. Or pass function and args. background: true runs on a throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, and the window is started first when this folder does not already have one. The reply starts with how many runs the file on disk does not have; the .blend is never saved unless save is passed (and allowed).",
     inputSchema: obj({
       path: { type: "string", description: "Workspace .py file. Keep model scripts next to their .blend: <blend folder>/scripts/, shared code in <blend folder>/scripts/lib/." },
       reason: { type: "string", description: "Why: goes into the journal and the NOTES change log. Give one for every change." },
@@ -122,12 +128,12 @@ export const TOOLS: ToolDef[] = [
       atomic: { type: "boolean", description: "Default true: a failed or cancelled run is rolled back. false keeps the partial changes." },
       save: saveArg,
       allow_references: allowReferences,
-      background: { type: "boolean", description: "Run on a copy in a headless Blender and throw the copy away. Nothing is checkpointed, journaled, or written to the open file. The reply is stdout, stderr and result." },
+      background: { type: "boolean", description: "Throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, which is started first when this folder does not already have one." },
     }, ["path"]),
   },
   {
     name: "run_project_script",
-    description: "Exactly run_script, but only for scripts inside the workspace's trusted folders (\"trustedScripts\" in .blender-ai/config.json), so it can be allowed without asking while run_script still asks. Never accepts scripts under .blender-ai/.",
+    description: "Exactly run_script, but only for scripts inside the workspace's trusted folders (\"trustedScripts\" in .blender-ai/config.json). Never accepts scripts under .blender-ai/.",
     inputSchema: obj({
       path: { type: "string", description: "A .py inside a trusted folder." },
       reason: { type: "string" },
@@ -138,12 +144,12 @@ export const TOOLS: ToolDef[] = [
       atomic: { type: "boolean" },
       save: saveArg,
       allow_references: allowReferences,
-      background: { type: "boolean", description: "Run on a copy in a headless Blender and throw the copy away. The open file is unchanged." },
+      background: { type: "boolean", description: "Throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, which is started first when this folder does not already have one." },
     }, ["path"]),
   },
   {
     name: "open_blend",
-    description: "Open a workspace .blend in the Blender that is already listening. Refuses when that file has unsaved changes, and refuses a path outside the workspace. Journaled as an open. To start Blender, use launch_blender.",
+    description: "Open a workspace .blend. Starts a Blender window when this folder does not already have one. Refuses when the open file has unsaved changes, and refuses a path outside the workspace. Journaled as an open.",
     inputSchema: obj({
       path: { type: "string", description: "Workspace .blend." },
       reason: { type: "string" },
@@ -151,7 +157,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "replay",
-    description: "The journaled script runs since the last save, in order: script, sha and reason. Lists them unless run is true, which executes them on the open file (each run is journaled again). A script whose sha no longer matches the file on disk is named and skipped unless force is true.",
+    description: "The journaled script runs since the last save, in order: script, sha and reason. Lists them unless run is true, which executes them on the open file (each run is journaled again) and opens a Blender window first when this folder does not already have one. A script whose sha no longer matches the file on disk is named and skipped unless force is true.",
     inputSchema: obj({
       run: { type: "boolean", description: "Execute the runs. Default false: list them." },
       force: { type: "boolean", description: "Run a script even when its sha does not match the file on disk." },
@@ -159,7 +165,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "run_pipeline",
-    description: "Run the steps of a pipeline.json (in a scripts folder: {\"steps\": [\"01_base\", \"02_detail\", ...], \"after\": {\"01_base\": [\"03_materials\"]}}) from one step to another, as ONE checkpoint, ONE undo step and one journal entry, rolled back if a step fails. mode affected runs only the step and the steps its after map says to re-run. Blocks Blender's UI while it runs; reports progress per step.",
+    description: "Run the steps of a pipeline.json (in a scripts folder: {\"steps\": [\"01_base\", \"02_detail\", ...], \"after\": {\"01_base\": [\"03_materials\"]}}) from one step to another, as ONE checkpoint, ONE undo step and one journal entry, rolled back if a step fails. mode affected runs only the step and the steps its after map says to re-run. Opens a Blender window first when this folder does not already have one. Blocks Blender's UI while it runs; reports progress per step.",
     inputSchema: obj({
       pipeline: { type: "string", description: "pipeline.json (or its folder). Optional when one pipeline in the workspace has the from step." },
       from: { type: "string", description: "First step (default the first)." },
@@ -175,7 +181,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "run_project_pipeline",
-    description: "Exactly run_pipeline, but only for a pipeline.json inside the workspace's trusted folders (\"trustedScripts\"), whose steps are trusted scripts too: allowed without asking together with run_project_script.",
+    description: "Exactly run_pipeline, but only for a pipeline.json inside the workspace's trusted folders (\"trustedScripts\"), whose steps are trusted scripts too. Never accepts a pipeline under .blender-ai/.",
     inputSchema: obj({
       pipeline: { type: "string", description: "pipeline.json (or its folder) inside a trusted folder. Optional when one trusted pipeline has the from step." },
       from: { type: "string" },
@@ -190,8 +196,16 @@ export const TOOLS: ToolDef[] = [
     }),
   },
   {
+    name: "finish",
+    description: "End of this chat: save the open .blend and leave Blender open. Call it when the work is done, before stopping. A file that already matches the session is left as it is. Another folder's chat can then launch_blender with window \"close\" (quit this window and open theirs) or window \"new\" (a second window). It does not switch a window that has another folder's file. Refuses while reference objects are in the scene unless allow_references.",
+    inputSchema: obj({
+      reason: { type: "string", description: "What this save holds. Default: chat finished." },
+      allow_references: allowReferences,
+    }),
+  },
+  {
     name: "save",
-    description: "Save the open .blend: the user's file, so call it when the user asked for a save (or allowed it in setup). Journaled with the reason; the watcher's re-ingest then logs the save as the AI's, pointing at its runs. Refuses while reference objects (vsblender_reference, _REF*) are in the scene unless allow_references. path saves as another workspace .blend (which becomes the open file; an existing file needs overwrite). compress defaults to true.",
+    description: "Save the open .blend: the user's file, so call it when the user asked for a save (or allowed it in setup). Journaled with the reason; the watcher's re-ingest then logs the save as the AI's, pointing at its runs. Refuses while reference objects (vsblender_reference, _REF*) are in the scene unless allow_references. path saves as another workspace .blend (which becomes the open file; an existing file needs overwrite). compress defaults to true. At the end of a chat, call finish instead.",
     inputSchema: obj({
       reason: { type: "string", description: "Why now: what this save holds." },
       path: { type: "string", description: "Save as this workspace .blend instead." },
@@ -202,7 +216,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "append",
-    description: "Copy objects from another workspace .blend into the open one (append, not link): their meshes, materials and parents come along, and with_children (default, when the source has been ingested) their children too. Each copy records where it came from (ai_appended_from/object: describe shows it, find from:<file> selects them). One checkpoint, one undo step, journaled, like run_script. For reusing a built mesh; to rebuild a part with other parameters, use vsblender.part in a script.",
+    description: "Copy objects from another workspace .blend into the open one (append, not link): their meshes, materials and parents come along, and with_children (default, when the source has been ingested) their children too. Opens a Blender window first when this folder does not already have one. Each copy records where it came from (ai_appended_from/object: describe shows it, find from:<file> selects them). One checkpoint, one undo step, journaled, like run_script. For reusing a built mesh; to rebuild a part with other parameters, use vsblender.part in a script.",
     inputSchema: obj({
       from: { type: "string", description: "Workspace .blend, e.g. TestObject/SG1/stargate.blend." },
       objects: { description: "Names or globs: [\"SG DHD*\"]." },
@@ -214,12 +228,12 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "import_reference",
-    description: "Bring a big reference (a scan, a show model, a CAD export: OBJ, FBX, glTF/GLB, STL, PLY, from any folder) into the sidecar without touching the .blend: Blender's own importer runs in a background Blender, the mesh is split into parts (by material, object, or none), and each part is written as binary STL to the sidecar (<blend folder>/.blender-ai/<blend>/refs/<name>/), plus a light overlay of the whole. Registered in references.json with units and transform, so preview overlay {ref}, preview ref= and measure ref= use it by name (\"peg\", \"peg/Chevron\"). Returns a parts table (triangles, bounds, radial bands with radial). Called again with the same file it reuses the parts and only updates transform or units. Writes only under .blender-ai/.",
+    description: "Bring a big reference (a scan, a show model, a CAD export, or a slicer 3MF: OBJ, FBX, glTF/GLB, STL, PLY, 3MF, from any folder) into the sidecar without touching the .blend. Blender's importer runs in a background Blender, except 3MF, which is read directly: build items stay separate, and a Prusa or Bambu negative, modifier or support mesh is left out of the solid and named in the reply. A 3MF's printer, nozzle, layer height and material become the workspace printer profile when none is set; an unknown machine is looked up on the web for its build volume. The mesh is split into parts (by material, object, or none; 3MF defaults to object) and each part is written as binary STL to the sidecar (<blend folder>/.blender-ai/<blend>/refs/<name>/), plus a light overlay of the whole. Registered in references.json with units and transform, so preview overlay {ref}, preview ref= and measure ref= use it by name (\"peg\", \"peg/Chevron\"). Returns a parts table (triangles, bounds, radial bands with radial). Called again with the same file it reuses the parts and only updates transform or units. Writes under .blender-ai/, and may set config.json \"printer\" when that key is missing.",
     inputSchema: obj({
       file: { type: "string", description: "The reference file: absolute, or relative to the workspace." },
       name: { type: "string", description: "Its name in references.json. Default: the file name." },
-      split: { type: "string", description: "material (default: one part per material, e.g. an OBJ's usemtl names), object, or none." },
-      units: { type: "string", description: "What the file's numbers are: mm, cm, m, in. Default: mm for STL, m for glTF/FBX, m (assumed) for OBJ and PLY." },
+      split: { type: "string", description: "material (default: one part per material, e.g. an OBJ's usemtl names), object, or none. A 3MF defaults to object, one part per build item." },
+      units: { type: "string", description: "What the file's numbers are: mm, cm, m, in. Default: mm for STL and 3MF (3MF is converted from the unit it declares), m for glTF/FBX, m (assumed) for OBJ and PLY." },
       axes: { type: "string", description: "blender (default: as File > Import, Y-up files stand up in Z) or native (the file's own coordinates; not for glTF)." },
       transform: { type: "object", description: "Where it sits in the scene: {location, rotation_deg, scale}, scene units. Applied when it is used, so it can be changed later." },
       overlay_cell: { type: "number", description: "Grid (file units) the light overlay is simplified to. Default: the size / 600." },
@@ -332,7 +346,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "restore_checkpoint",
-    description: "Replace the open session's data with a checkpoint's (\"last\" for the newest). Checkpoints the current state first, keeps the file path, and is one undo step. The file on disk is not touched.",
+    description: "Replace the open session's data with a checkpoint's (\"last\" for the newest). Opens a Blender window first when this folder does not already have one. Checkpoints the current state first, keeps the file path, and is one undo step. The file on disk is not touched.",
     inputSchema: obj({ id: { type: "string" }, reason: { type: "string" } }, ["id"]),
   },
   {
@@ -475,8 +489,11 @@ export const TOOLS: ToolDef[] = [
 export const TOOL_NAMES = TOOLS.map((tool) => tool.name);
 
 /**
- * Safe to run without asking: they read, or write only VSBlender's own files under .blender-ai/
- * (sidecar notes, previews, checkpoints). Setup writes these as Claude Code allow rules.
+ * Run without a permission prompt. Setup writes these as Claude Code allow rules.
+ * Grok reads that file. Cline copies the names into alwaysAllow.
+ * The build tools are included so a modelling loop does not stop on yes for every call.
+ * save and finish write the user's .blend and stay on ask, with doctor_fix,
+ * launch_blender_background, import_reference, and reference.
  */
 export const AUTO_APPROVE = [
   "doctor",
@@ -499,17 +516,29 @@ export const AUTO_APPROVE = [
   "checkpoint",
   "launch_blender",
   "notes",
+  "run_script",
+  "run_pipeline",
+  "run_project_script",
+  "run_project_pipeline",
+  "new_blend",
+  "append",
+  "open_blend",
+  "replay",
+  "restore_checkpoint",
+  "set_role",
+  "export_model",
+  "render",
 ];
 
-/** Runs arbitrary Python in the user's Blender. Only auto-approved when the user ticks it in setup. */
+/** Runs arbitrary Python in the user's Blender. On the shared allow list with the other build tools. */
 export const SCRIPT_TOOL = "run_script";
-/** Runs a pipeline of workspace scripts: approved together with run_script. */
+/** Runs a pipeline of workspace scripts. On the shared allow list with run_script. */
 export const PIPELINE_TOOL = "run_pipeline";
-/** run_script restricted to trusted folders: approved on its own setup tick. */
+/** run_script restricted to trusted folders. On the shared allow list. */
 export const TRUSTED_SCRIPT_TOOL = "run_project_script";
-/** run_pipeline restricted to trusted folders: approved with run_project_script. */
+/** run_pipeline restricted to trusted folders. On the shared allow list with run_project_script. */
 export const TRUSTED_PIPELINE_TOOL = "run_project_pipeline";
-/** Saves the user's .blend: only auto-approved when the user ticks it in setup. */
+/** Saves the user's .blend. Asks each time unless the user ticks it in setup. */
 export const SAVE_TOOL = "save";
 
 export function claudeRule(tool: string): string {

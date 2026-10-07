@@ -13,8 +13,10 @@ import { ingestScript, runIngest } from "./ingest";
 import * as jobs from "./jobs";
 import * as modeling from "./modeling";
 import { findFfmpeg } from "./ffmpeg";
+import { loadCatalog, printerForCall } from "./printerLookup";
 import { describePrinter, printerParams, resolvePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
+import { clearLease, decideWindow, findFreePort, leasePort, leasedPort, needsOurWindow, sceneWindowPlan, WindowChoice } from "./windows";
 import { importReference } from "./references";
 import { compare, diff, reference, setRole } from "./review";
 import {
@@ -53,9 +55,10 @@ export function loadWorkspaceContext(env: NodeJS.ProcessEnv = process.env, cwd =
   const rootEnv = env["VSBLENDER_EXTENSION_ROOT"];
   const extensionRoot = rootEnv && fs.existsSync(rootEnv) ? rootEnv : path.resolve(__dirname, "..");
   const config = readConfig(workspace);
-  const port = env["VSBLENDER_PORT"]
+  const configured = env["VSBLENDER_PORT"]
     ? clampPort(Number(env["VSBLENDER_PORT"]), config?.port ?? DEFAULT_PORT)
     : (config?.port ?? DEFAULT_PORT);
+  const port = leasedPort(workspace) ?? configured;
   const blender = env["VSBLENDER_BLENDER"] || config?.blender;
   return {
     workspace,
@@ -159,12 +162,17 @@ export interface Routed {
  * run it on the saved .blend in a one-shot background Blender instead (a few seconds; about 20 s
  * for the first start on Windows). A persistent background Blender would hold the port.
  */
-export async function routeCall(ctx: WorkspaceContext, method: string, params: Record<string, unknown>, timeoutMs: number,
-  blendArg: unknown, extras: CallExtras = {}): Promise<Routed> {
+/** A message when the listening Blender belongs to another folder. Undefined when it is ours, or nothing is listening. */
+export async function requireOurWindow(ctx: WorkspaceContext): Promise<string | undefined> {
   const probe = await probeBridge(ctx.port);
-  if (probe.ok || probe.state !== "absent" || !HEADLESS_OK.has(method)) {
-    return { response: await callBridge(ctx.port, method, params, timeoutMs), source: "live" };
-  }
+  if (!probe.ok) return undefined;
+  const decision = decideWindow(ctx.workspace, probe.window ?? { unknown: true });
+  if (decision.use) return undefined;
+  return decision.message ?? "this Blender window belongs to another folder";
+}
+
+async function readSaved(ctx: WorkspaceContext, method: string, params: Record<string, unknown>, timeoutMs: number,
+  blendArg: unknown, extras: CallExtras, because: string): Promise<Routed> {
   if (!ctx.blender || !fs.existsSync(ctx.blender)) {
     throw new Error(`Blender is not running, and no Blender executable is configured to read the saved file. Run VSBlender: Setup, or launch_blender.`);
   }
@@ -172,7 +180,7 @@ export async function routeCall(ctx: WorkspaceContext, method: string, params: R
   try {
     blend = pickBlend(ctx, blendArg);
   } catch (error) {
-    throw new Error(`Blender is not running, so this reads a saved file, and ${errorText(error)}`);
+    throw new Error(`${because}, and ${errorText(error)}`);
   }
   const result = await jobs.runToEnd(ctx, {
     blend,
@@ -185,9 +193,27 @@ export async function routeCall(ctx: WorkspaceContext, method: string, params: R
   return { response: { ok: true, result: (result["result"] as Record<string, unknown>) ?? {}, warnings }, source: "disk", blend };
 }
 
+export async function routeCall(ctx: WorkspaceContext, method: string, params: Record<string, unknown>, timeoutMs: number,
+  blendArg: unknown, extras: CallExtras = {}): Promise<Routed> {
+  const probe = await probeBridge(ctx.port);
+  if (probe.ok) {
+    const decision = decideWindow(ctx.workspace, probe.window ?? { unknown: true });
+    if (!decision.use) {
+      if (!HEADLESS_OK.has(method)) throw new Error(decision.message ?? "this Blender window belongs to another folder");
+      return readSaved(ctx, method, params, timeoutMs, blendArg, extras,
+        "another folder's Blender is open, so this reads the saved file and leaves that window alone");
+    }
+    return { response: await callBridge(ctx.port, method, params, timeoutMs), source: "live" };
+  }
+  if (probe.state !== "absent" || !HEADLESS_OK.has(method)) {
+    return { response: await callBridge(ctx.port, method, params, timeoutMs), source: "live" };
+  }
+  return readSaved(ctx, method, params, timeoutMs, blendArg, extras, "Blender is not running, so this reads a saved file");
+}
+
 export function sourceNote(ctx: WorkspaceContext, routed: Routed): string {
   return routed.source === "disk" && routed.blend
-    ? `source: saved file ${relativeTo(ctx.workspace, routed.blend)} (Blender is not running; unsaved work is not included)\n`
+    ? `source: saved file ${relativeTo(ctx.workspace, routed.blend)} (the open window was left alone; unsaved work in a window is not included)\n`
     : "";
 }
 
@@ -210,6 +236,7 @@ export async function bridgeTool(ctx: WorkspaceContext, method: string, params: 
 
 /** The .blend the running Blender has open, when it is in this workspace. */
 export async function liveBlend(ctx: WorkspaceContext): Promise<string | undefined> {
+  if (await requireOurWindow(ctx)) return undefined;
   try {
     const response = await callBridge(ctx.port, "session_info", {}, 8000);
     const file = String(response.result?.["file"] ?? "");
@@ -237,11 +264,14 @@ export async function doctor(ctx: WorkspaceContext, fix: boolean, archive = fals
 const gotchasSent = new Set<string>();
 
 export async function sessionInfo(ctx: WorkspaceContext, args: Record<string, unknown> = {}): Promise<ToolOutcome> {
+  const blocked = await requireOurWindow(ctx);
+  if (blocked) return ok(blocked);
   try {
     const response = await callBridge(ctx.port, "session_info", {}, 15000);
     if (!response.ok) return fail(response.error || "session_info failed");
     const version = String(response.result?.["blender_version"] ?? "");
-    const { profile, warnings } = resolvePrinter(ctx.printer);
+    const prepared = await printerForCall(ctx);
+    const { profile, warnings } = prepared;
     // The sheet is about 1.5k tokens: sent the first time per Blender version, or when asked for.
     const mode = typeof args["gotchas"] === "string" ? args["gotchas"] : "new";
     let gotchas: string[] | string;
@@ -266,43 +296,39 @@ export async function sessionInfo(ctx: WorkspaceContext, args: Record<string, un
   }
 }
 
-export async function launchBlender(ctx: WorkspaceContext, args: Record<string, unknown>, background = false): Promise<ToolOutcome> {
-  if (!ctx.blender || !fs.existsSync(ctx.blender)) {
-    return fail("No Blender executable is configured. Run VSBlender: Setup.");
-  }
-  let file: string | undefined;
-  try {
-    if (typeof args["file"] === "string" && args["file"].trim()) file = pickBlend(ctx, args["file"]);
-  } catch (error) {
-    return fail(errorText(error));
-  }
-  const probe = await probeBridge(ctx.port);
-  if (probe.ok) {
-    if (!file) return ok(`Blender bridge already listening on ${ctx.port}.`);
-    try {
-      const opened = await callBridge(ctx.port, "open_blend", { path: file, reason: "launch_blender", actor: "user" }, 90000);
-      if (opened.ok && opened.result?.["opened"] === true) {
-        const already = opened.result?.["already"] === true;
-        return ok(already ? `Already open: ${file}` : `Opened ${file}`);
-      }
-      const reason = String(opened.result?.["reason"] ?? opened.error ?? "could not open the file");
-      return fail(`${reason}. The bridge on port ${ctx.port} was left on the file it already had open.`);
-    } catch (error) {
-      const back = await waitForBridge(ctx.port, 20000);
-      if (back) return ok(`Asked Blender to open ${file}. The bridge is listening again. ${errorText(error)}`);
-      return fail(`Opening the file dropped the bridge and it did not come back. ${errorText(error)}`);
-    }
-  }
-  // Only start Blender when nothing holds the port. A Blender that is busy (rendering, running a
-  // long script) still owns it, and a second one would either fail to bind or fight over requests.
-  if (probe.state !== "absent") return fail(`${probe.detail}. Not starting another Blender.`);
-  // A new Blender opens the workspace's .blend when there is only one. A running one is never
-  // switched to another file unless a file was named.
-  if (!file) {
-    const files = listBlendFiles(ctx.workspace);
-    if (files.length === 1) file = files[0];
-  }
+function windowChoice(args: Record<string, unknown>): WindowChoice | undefined {
+  return args["window"] === "close" || args["window"] === "new" ? args["window"] : undefined;
+}
 
+async function waitUntilAbsent(port: number, timeoutMs: number): Promise<boolean> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const probe = await probeBridge(port);
+    if (probe.state === "absent") return true;
+    await new Promise((resolve) => setTimeout(resolve, 400));
+  }
+  return false;
+}
+
+async function openInOurs(ctx: WorkspaceContext, file: string): Promise<ToolOutcome> {
+  try {
+    const opened = await callBridge(ctx.port, "open_blend", { path: file, reason: "launch_blender", actor: "user" }, 90000);
+    if (opened.ok && opened.result?.["opened"] === true) {
+      const already = opened.result?.["already"] === true;
+      return ok(already ? `Already open: ${file}` : `Opened ${file}`);
+    }
+    const reason = String(opened.result?.["reason"] ?? opened.error ?? "could not open the file");
+    return fail(`${reason}. The bridge on port ${ctx.port} was left on the file it already had open.`);
+  } catch (error) {
+    const back = await waitForBridge(ctx.port, 20000);
+    if (back) return ok(`Asked Blender to open ${file}. The bridge is listening again. ${errorText(error)}`);
+    return fail(`Opening the file dropped the bridge and it did not come back. ${errorText(error)}`);
+  }
+}
+
+async function startBlenderProcess(ctx: WorkspaceContext, file: string | undefined, background: boolean): Promise<ToolOutcome> {
+  const blender = ctx.blender;
+  if (!blender || !fs.existsSync(blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
   const starter = path.join(ctx.extensionRoot, "resources", "start_bridge.py");
   const addon = jobs.addonSource(ctx.extensionRoot);
   if (!fs.existsSync(starter)) return fail(`missing ${starter}`);
@@ -310,7 +336,7 @@ export async function launchBlender(ctx: WorkspaceContext, args: Record<string, 
   const logPath = path.join(ctx.workspace, ".blender-ai", "launch.log");
   fs.mkdirSync(path.dirname(logPath), { recursive: true });
   const logFd = fs.openSync(logPath, "a");
-  const child = spawn(ctx.blender, launchArgs, {
+  const child = spawn(blender, launchArgs, {
     detached: true,
     windowsHide: background,
     stdio: ["ignore", logFd, logFd],
@@ -332,10 +358,144 @@ export async function launchBlender(ctx: WorkspaceContext, args: Record<string, 
   return ok(`${mode} is listening on ${ctx.port}${file ? ` with ${relativeTo(ctx.workspace, file)}` : ""}. pid ${child.pid ?? "?"}`);
 }
 
+export async function launchBlender(ctx: WorkspaceContext, args: Record<string, unknown>, background = false): Promise<ToolOutcome> {
+  if (!ctx.blender || !fs.existsSync(ctx.blender)) {
+    return fail("No Blender executable is configured. Run VSBlender: Setup.");
+  }
+  let file: string | undefined;
+  try {
+    if (typeof args["file"] === "string" && args["file"].trim()) file = pickBlend(ctx, args["file"]);
+  } catch (error) {
+    return fail(errorText(error));
+  }
+  const choice = windowChoice(args);
+  const probe = await probeBridge(ctx.port);
+  if (probe.ok) {
+    const decision = decideWindow(ctx.workspace, probe.window ?? { unknown: true }, choice);
+    if (decision.use) {
+      if (!file) return ok(`Blender bridge already listening on ${ctx.port}.`);
+      return openInOurs(ctx, file);
+    }
+    if (decision.separate) {
+      let port: number;
+      try {
+        port = await findFreePort(ctx.port + 1);
+      } catch (error) {
+        return fail(errorText(error));
+      }
+      leasePort(ctx.workspace, port);
+      if (!file) {
+        const files = listBlendFiles(ctx.workspace);
+        if (files.length === 1) file = files[0];
+      }
+      const started = await startBlenderProcess({ ...ctx, port }, file, background);
+      if (!started.ok) {
+        clearLease(ctx.workspace);
+        return started;
+      }
+      return ok(`Opened a second Blender on port ${port} and left the other window as it is. ${started.text}`);
+    }
+    if (decision.closeFirst) {
+      try {
+        const quit = await callBridge(ctx.port, "quit_if_saved", {}, 20000);
+        if (!quit.ok || quit.result?.["quit"] !== true) {
+          const reason = String(quit.result?.["reason"] ?? quit.error ?? "it did not close");
+          return fail(`That Blender stayed open: ${reason}`);
+        }
+      } catch (error) {
+        return fail(`Could not close the other Blender. ${errorText(error)}`);
+      }
+      const gone = await waitUntilAbsent(ctx.port, 20000);
+      if (!gone) return fail(`Asked the other Blender to close. Port ${ctx.port} is still taken.`);
+    } else {
+      return fail(decision.message ?? "That Blender belongs to another folder.");
+    }
+  } else if (probe.state !== "absent") {
+    return fail(`${probe.detail}. Not starting another Blender on port ${ctx.port}.`);
+  }
+  if (!file) {
+    const files = listBlendFiles(ctx.workspace);
+    if (files.length === 1) file = files[0];
+  }
+  return startBlenderProcess(ctx, file, background);
+}
+
+/** A second window on a free port. Used when this workspace's listener is headless and has never been saved. */
+async function openSecondWindow(ctx: WorkspaceContext, file?: string): Promise<{ error?: string; note?: string }> {
+  let port: number;
+  try {
+    port = await findFreePort(ctx.port + 1);
+  } catch (error) {
+    return { error: errorText(error) };
+  }
+  leasePort(ctx.workspace, port);
+  let openFile = file;
+  if (!openFile) {
+    const files = listBlendFiles(ctx.workspace);
+    if (files.length === 1) openFile = files[0];
+  }
+  const started = await startBlenderProcess({ ...ctx, port }, openFile, false);
+  if (!started.ok) {
+    clearLease(ctx.workspace);
+    return { error: started.text };
+  }
+  ctx.port = port;
+  return { note: `Opened a second Blender on port ${port} and left the other one as it is. ${started.text}` };
+}
+
+/**
+ * Make sure a Blender window for this workspace is listening before objects are made or changed.
+ * An unsaved headless session is left running. Another folder's window is left alone, and a second window is opened.
+ */
+export async function ensureSceneWindow(ctx: WorkspaceContext, file?: string): Promise<{ error?: string; note?: string }> {
+  const probe = await probeBridge(ctx.port);
+  if (!probe.ok && probe.state !== "absent") {
+    return { error: `${probe.detail}. Not starting another Blender on port ${ctx.port}.` };
+  }
+  const snap = probe.ok ? (probe.window ?? { unknown: true }) : undefined;
+  const plan = sceneWindowPlan(ctx.workspace, snap, file);
+  if (plan.message) return { error: plan.message };
+  if (plan.switchTo) {
+    const opened = await openInOurs(ctx, plan.switchTo);
+    return opened.ok ? { note: opened.text } : { error: opened.text };
+  }
+  if (plan.ready) return {};
+  if (plan.replace) {
+    try {
+      const quit = await callBridge(ctx.port, "quit_if_saved", {}, 20000);
+      if (!quit.ok || quit.result?.["quit"] !== true) {
+        const reason = String(quit.result?.["reason"] ?? quit.error ?? "it did not close");
+        return { error: `The headless Blender stayed open: ${reason}` };
+      }
+    } catch (error) {
+      return { error: `Could not close the headless Blender. ${errorText(error)}` };
+    }
+    const gone = await waitUntilAbsent(ctx.port, 20000);
+    if (!gone) return { error: `Asked the headless Blender to close. Port ${ctx.port} is still taken.` };
+    const reopen = file || (snap?.file || "").trim() || undefined;
+    const started = await launchBlender(ctx, reopen ? { file: reopen } : {}, false);
+    return started.ok ? { note: started.text } : { error: started.text };
+  }
+  if (plan.separate) {
+    const started = await launchBlender(ctx, { ...(file ? { file } : {}), window: "new" }, false);
+    if (!started.ok) return { error: started.text };
+    const leased = leasedPort(ctx.workspace);
+    if (leased !== undefined) ctx.port = leased;
+    return { note: started.text };
+  }
+  if (plan.beside) return openSecondWindow(ctx, file);
+  if (plan.launch) {
+    const started = await launchBlender(ctx, file ? { file } : {}, false);
+    return started.ok ? { note: started.text } : { error: started.text };
+  }
+  return { error: "Blender has no window for this folder." };
+}
+
 // ----------------------------------------------------------------------------- run_script
-/** The printer profile scripts see through vsblender.printer(). configured: false when the workspace set none. */
+/** The printer profile scripts see through vsblender.printer(). configured: false when the workspace set none.
+ * Cached lookups are included. A name that is not cached yet is resolved by printerForCall, which searches. */
 export function printerContext(ctx: WorkspaceContext, override?: unknown): Record<string, unknown> {
-  const { profile, warnings } = resolvePrinter(ctx.printer, override);
+  const { profile, warnings } = resolvePrinter(ctx.printer, override, loadCatalog(ctx.workspace));
   return { ...printerParams(profile), configured: ctx.printer !== undefined || override !== undefined, warnings };
 }
 
@@ -398,6 +558,40 @@ export function saveLines(result: Record<string, unknown>): string[] {
   return lines;
 }
 
+/** True when the first 40 lines mark the script `# vsblender: read-only` (a `;` can share the line). */
+export function scriptMarkedReadOnly(source: string): boolean {
+  const lines = source.split(/\r?\n/).slice(0, 40);
+  for (const line of lines) {
+    const match = /^\s*#\s*vsblender:\s*(.+?)\s*$/i.exec(line);
+    const body = match?.[1];
+    if (!body) continue;
+    for (const part of body.split(";")) {
+      const trimmed = part.trim();
+      const space = trimmed.search(/\s/);
+      const key = (space < 0 ? trimmed : trimmed.slice(0, space)).toLowerCase().replace(/_/g, "-").replace(/:$/, "");
+      if (key === "read-only" || key === "readonly") return true;
+    }
+  }
+  return false;
+}
+
+function scriptFileIsReadOnly(scriptPath: string): boolean {
+  try {
+    return scriptMarkedReadOnly(fs.readFileSync(scriptPath, "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+function requestIsReadOnly(ctx: WorkspaceContext, requested: unknown): boolean {
+  if (typeof requested !== "string" || !requested.trim()) return false;
+  try {
+    return scriptFileIsReadOnly(resolveInside(ctx.workspace, requested));
+  } catch {
+    return false;
+  }
+}
+
 /** A script on a throwaway copy. The open file, its journal and its checkpoints are not touched. */
 async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
   if (!ctx.blender || !fs.existsSync(ctx.blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
@@ -412,13 +606,14 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
   if (!fs.existsSync(script)) return fail(`file not found: ${args["path"]}`);
   const rel = relativeTo(ctx.workspace, script);
   const probe = await probeBridge(ctx.port);
+  const foreign = probe.ok && !decideWindow(ctx.workspace, probe.window ?? { unknown: true }).use;
   const id = jobs.newJobId("script");
   const dir = path.join(jobs.jobsDir(ctx.workspace), id);
   fs.mkdirSync(dir, { recursive: true });
   let blend: string;
   let source: string;
   let scratch: string | undefined;
-  if (probe.ok) {
+  if (probe.ok && !foreign) {
     const copy = path.join(dir, "scene.blend");
     try {
       const response = await callBridge(ctx.port, "save_copy", { path: copy }, 300000);
@@ -437,7 +632,9 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
     } catch (error) {
       return fail(`Blender is not running, so the saved file is used, and ${errorText(error)}`);
     }
-    source = `the saved file ${relativeTo(ctx.workspace, blend)} (Blender is not running; the file is not written)`;
+    source = foreign
+      ? `the saved file ${relativeTo(ctx.workspace, blend)} (another folder's Blender is open; that window was left alone)`
+      : `the saved file ${relativeTo(ctx.workspace, blend)} (Blender is not running; the file is not written)`;
   }
   const spec: Record<string, unknown> = { kind: "script", script };
   if (typeof args["function"] === "string" && args["function"]) spec["function"] = args["function"];
@@ -461,7 +658,6 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
 }
 
 export async function runScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
-  if (args["background"] === true) return runScriptInBackground(ctx, args);
   if (typeof args["path"] !== "string" || !args["path"].trim()) return fail("path is required");
   let script: string;
   try {
@@ -471,9 +667,13 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
   }
   if (!script.toLowerCase().endsWith(".py")) return fail("path must be a .py file");
   if (!fs.existsSync(script)) return fail(`file not found: ${args["path"]}`);
-  const reason = typeof args["reason"] === "string" ? args["reason"].trim() : "";
+  // A throwaway copy is only for a script that says it does not change the scene.
+  if (args["background"] === true && scriptFileIsReadOnly(script)) return runScriptInBackground(ctx, args);
   const refused = saveRefusal(ctx, args);
   if (refused) return fail(refused);
+  const ensured = await ensureSceneWindow(ctx);
+  if (ensured.error) return fail(ensured.error);
+  const reason = typeof args["reason"] === "string" ? args["reason"].trim() : "";
   const params: Record<string, unknown> = {
     path: script,
     reason,
@@ -481,7 +681,7 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
     checkpoint: checkpointParams(ctx, args),
     lib_paths: importPaths(ctx),
     reference_roots: referenceRoots(ctx),
-    printer: printerContext(ctx),
+    printer: (await printerForCall(ctx)).params,
   };
   if (args["save"] === true) params["save"] = true;
   if (args["allow_references"] === true) params["allow_references"] = true;
@@ -526,6 +726,10 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
     if (stdout.trim()) lines.push(`stdout:\n${stdout.trimEnd()}`);
     if (stderr.trim()) lines.push(`stderr:\n${stderr.trimEnd()}`);
     lines.push(...saveLines(result));
+    if (args["background"] === true) {
+      lines.push("background applies only to a script marked # vsblender: read-only; this one ran in the open Blender.");
+    }
+    if (ensured.note) lines.push(ensured.note);
     const banner = unsavedBanner(result);
     if (banner) lines.unshift(banner);
     return ok(lines.join("\n"), { details: { ...result, changed: response.changed ?? [] } });
@@ -966,6 +1170,35 @@ export async function cancelJob(_ctx: WorkspaceContext, args: Record<string, unk
 }
 
 // ----------------------------------------------------------------------------- saving
+/** Save the open file at the end of a chat and leave Blender open for the next folder. */
+export async function finishSession(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const probe = await probeBridge(ctx.port);
+  if (!probe.ok) {
+    return fail(probe.state === "absent"
+      ? "Blender is not running, so there is no open file to finish. The file on disk is the latest version."
+      : `${probe.detail}. Not finishing.`);
+  }
+  const decision = decideWindow(ctx.workspace, probe.window ?? { unknown: true });
+  if (!decision.use) return fail(decision.message ?? "this Blender window belongs to another folder");
+  const params: Record<string, unknown> = {
+    reason: typeof args["reason"] === "string" && args["reason"].trim() ? args["reason"].trim() : "chat finished",
+    actor: "ai",
+    compress: args["compress"] !== false,
+  };
+  if (args["allow_references"] === true) params["allow_references"] = true;
+  try {
+    const response = await callBridge(ctx.port, "finish", params, 300000);
+    if (!response.ok) return fail(bridgeError(response, "finish"));
+    const result = response.result ?? {};
+    const text = typeof result["text"] === "string"
+      ? result["text"]
+      : `saved ${String(result["saved"] ?? "the open file")}. Another chat can close this window or open another one.`;
+    return ok(text, { details: result });
+  } catch (error) {
+    return fail(bridgeFailure(ctx.port, error, 300000));
+  }
+}
+
 export async function save(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
   const probe = await probeBridge(ctx.port);
   if (!probe.ok) {
@@ -1014,6 +1247,8 @@ export async function append(ctx: WorkspaceContext, args: Record<string, unknown
   if (!source.toLowerCase().endsWith(".blend") || !fs.existsSync(source)) return fail(`not a .blend in the workspace: ${from}`);
   const objects = typeof args["objects"] === "string" ? [args["objects"]] : Array.isArray(args["objects"]) ? args["objects"] : [];
   if (!objects.length) return fail("objects is required: names or globs, e.g. [\"SG DHD*\"]");
+  const ensured = await ensureSceneWindow(ctx);
+  if (ensured.error) return fail(ensured.error);
   const params: Record<string, unknown> = {
     from: source, objects, reason: args["reason"] ?? null, actor: "ai", checkpoint: checkpointParams(ctx, args),
     with_children: args["with_children"] !== false,
@@ -1033,6 +1268,7 @@ export async function append(ctx: WorkspaceContext, args: Record<string, unknown
     ];
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
     lines.push(...saveLines(result));
+    if (ensured.note) lines.push(ensured.note);
     return ok(lines.join("\n"), { details: result });
   } catch (error) {
     return fail(bridgeFailure(ctx.port, error, 300000));
@@ -1052,6 +1288,9 @@ export async function openBlend(ctx: WorkspaceContext, args: Record<string, unkn
   }
   if (!abs.toLowerCase().endsWith(".blend")) return fail("path must end in .blend");
   if (!fs.existsSync(abs)) return fail(`file not found: ${requested}`);
+  const ensured = await ensureSceneWindow(ctx, abs);
+  if (ensured.error) return fail(ensured.error);
+  if (ensured.note) return ok(ensured.note);
   const probe = await probeBridge(ctx.port);
   if (!probe.ok) {
     return fail(probe.state === "absent"
@@ -1077,13 +1316,20 @@ export async function openBlend(ctx: WorkspaceContext, args: Record<string, unkn
 
 /** Journaled script runs since the last save. run: true executes them; a sha mismatch is skipped unless force. */
 export async function replay(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
-  const probe = await probeBridge(ctx.port);
-  if (!probe.ok) {
-    return fail(probe.state === "absent"
-      ? "Blender is not running, so there is no open session to replay into."
-      : `${probe.detail}. Not replaying.`);
-  }
   const run = args["run"] === true;
+  let note: string | undefined;
+  if (run) {
+    const ensured = await ensureSceneWindow(ctx);
+    if (ensured.error) return fail(ensured.error);
+    note = ensured.note;
+  } else {
+    const probe = await probeBridge(ctx.port);
+    if (!probe.ok) {
+      return fail(probe.state === "absent"
+        ? "Blender is not running, so there is no open session to replay into."
+        : `${probe.detail}. Not replaying.`);
+    }
+  }
   const timeout = run ? 600000 : 30000;
   try {
     const response = await callBridge(ctx.port, "replay", {
@@ -1092,7 +1338,7 @@ export async function replay(ctx: WorkspaceContext, args: Record<string, unknown
     if (!response.ok) return fail(bridgeError(response, "replay"));
     const result = response.result ?? {};
     const text = typeof result["text"] === "string" ? result["text"] : JSON.stringify(result, null, 1);
-    return ok(text, { details: result });
+    return ok(note ? `${text}\n${note}` : text, { details: result });
   } catch (error) {
     return fail(bridgeFailure(ctx.port, error, timeout));
   }
@@ -1108,17 +1354,39 @@ export async function checkpoint(ctx: WorkspaceContext, args: Record<string, unk
 export async function restoreCheckpoint(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
   const id = typeof args["id"] === "string" ? args["id"].trim() : "";
   if (!id) return fail("id is required: a checkpoint id from session_info, or last");
-  return bridgeTool(ctx, "restore_checkpoint", { id, reason: args["reason"] ?? null, actor: "ai" }, 600000,
+  const ensured = await ensureSceneWindow(ctx);
+  if (ensured.error) return fail(ensured.error);
+  const outcome = await bridgeTool(ctx, "restore_checkpoint", { id, reason: args["reason"] ?? null, actor: "ai" }, 600000,
     (result) => [
       `restored: ${String(result["restored"])}`,
       `the state before the restore is checkpoint ${String(result["safety_checkpoint"])}`,
       `file: ${String(result["file"])} (path unchanged, not saved)`,
       "Ctrl+Z in Blender also undoes the restore.",
     ].join("\n"));
+  if (outcome.ok && ensured.note) return { ...outcome, text: `${outcome.text}\n${ensured.note}` };
+  return outcome;
+}
+
+function toolOpensWindow(ctx: WorkspaceContext, name: string, args: Record<string, unknown>): boolean {
+  if (name === "run_script" || name === "run_project_script") {
+    if (args["background"] === true && requestIsReadOnly(ctx, args["path"])) return false;
+    return true;
+  }
+  if (name === "replay") return args["run"] === true;
+  return name === "run_pipeline"
+    || name === "run_project_pipeline"
+    || name === "append"
+    || name === "restore_checkpoint"
+    || name === "open_blend";
 }
 
 // ----------------------------------------------------------------------------- dispatch
 export async function callTool(ctx: WorkspaceContext, name: string, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
+  // Tools that open a window do it themselves, including a second window when this port is another folder's.
+  if (!toolOpensWindow(ctx, name, args) && needsOurWindow(name, args)) {
+    const blocked = await requireOurWindow(ctx);
+    if (blocked) return fail(blocked);
+  }
   switch (name) {
     case "doctor":
       return doctor(ctx, false);
@@ -1156,6 +1424,8 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
       return restoreCheckpoint(ctx, args);
     case "save":
       return save(ctx, args);
+    case "finish":
+      return finishSession(ctx, args);
     case "append":
       return append(ctx, args);
     case "import_reference":

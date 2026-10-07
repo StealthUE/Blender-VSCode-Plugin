@@ -1,9 +1,10 @@
 import * as fs from "fs";
 import * as path from "path";
 import { listBlendFiles, relativeTo, resolveInside, sidecarDir } from "./blendFiles";
-import { callBridge, probeBridge } from "./bridge";
+import { callBridge } from "./bridge";
 import * as jobs from "./jobs";
-import { describePrinter, printerParams, resolvePrinter } from "./printers";
+import { printerForCall } from "./printerLookup";
+import { describePrinter, printerParams } from "./printers";
 import { readConfig, writeConfig } from "./projectConfig";
 import {
   bridgeError,
@@ -11,15 +12,14 @@ import {
   callWithProgress,
   checkpointLine,
   checkpointParams,
+  ensureSceneWindow,
   errorText,
   fail,
   imageReply,
   importPaths,
-  launchBlender,
   liveBlend,
   ok,
   PREVIEW_BYTES,
-  printerContext,
   referenceRoots,
   routeCall,
   runScript,
@@ -58,7 +58,7 @@ function failed(ctx: WorkspaceContext, error: unknown, timeout: number): ToolOut
 export async function checkModel(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   const purpose = str(args["purpose"]);
   if (purpose && !PURPOSES.includes(purpose)) return fail(`purpose must be one of ${PURPOSES.join(", ")}`);
-  const printer = printerContext(ctx, args["printer"]);
+  const printer = (await printerForCall(ctx, args["printer"])).params;
   const params: Record<string, unknown> = {
     ...copyKeys(args, ["targets", "purpose", "deep", "max_tris", "mm_per_unit", "suggest_orientation", "place_on_bed", "views", "size", "frame"]),
     printer,
@@ -114,7 +114,7 @@ export async function exportModel(ctx: WorkspaceContext, args: Record<string, un
       return fail(errorText(error));
     }
   }
-  const printer = printerContext(ctx, args["printer"]);
+  const printer = (await printerForCall(ctx, args["printer"])).params;
   const params: Record<string, unknown> = {
     ...copyKeys(args, ["targets", "purpose", "split", "overwrite", "place_on_bed", "center", "assembly", "ascii",
       "apply_modifiers", "mm_per_unit", "reason"]),
@@ -144,20 +144,25 @@ export async function exportModel(ctx: WorkspaceContext, args: Record<string, un
   const dir = path.join(jobs.jobsDir(ctx.workspace), id);
   fs.mkdirSync(dir, { recursive: true });
   const copy = path.join(dir, "scene.blend");
-  try {
-    const saved = await callBridge(ctx.port, "save_copy", { path: copy }, 300000);
-    if (!saved.ok) return fail(bridgeError(saved, "save_copy"));
-  } catch (error) {
-    return failed(ctx, error, 300000);
+  let blendForExport = copy;
+  if (routed.source === "live") {
+    try {
+      const saved = await callBridge(ctx.port, "save_copy", { path: copy }, 300000);
+      if (!saved.ok) return fail(bridgeError(saved, "save_copy"));
+    } catch (error) {
+      return failed(ctx, error, 300000);
+    }
+  } else {
+    blendForExport = routed.blend ?? copy;
   }
   let done: Record<string, unknown>;
   try {
     done = await jobs.runToEnd(ctx, {
-      blend: copy,
+      blend: blendForExport,
       spec: { kind: "export", export: job },
       kind: "export",
       label: `${String(job["format"])} export`,
-      scratch: copy,
+      ...(routed.source === "live" ? { scratch: copy } : {}),
     }, 600000, extras.signal);
   } catch (error) {
     return fail(errorText(error));
@@ -206,7 +211,7 @@ export async function newBlend(ctx: WorkspaceContext, args: Record<string, unkno
   if (fs.existsSync(abs)) return fail(`${relativeTo(ctx.workspace, abs)} exists. new_blend never overwrites a file; pick another path.`);
   const template = str(args["template"]) ?? "empty";
   if (!TEMPLATES.includes(template)) return fail(`template must be one of ${TEMPLATES.join(", ")}`);
-  const { profile, warnings } = resolvePrinter(ctx.printer, args["printer"]);
+  const { profile, warnings } = await printerForCall(ctx, args["printer"]);
   let result: Record<string, unknown>;
   try {
     result = await jobs.runToEnd(ctx, {
@@ -223,23 +228,12 @@ export async function newBlend(ctx: WorkspaceContext, args: Record<string, unkno
   const trusted = trustScriptsFolder(ctx.workspace, abs);
   for (const item of (result["applied"] as string[] | undefined) ?? []) lines.push(`- ${item}`);
   if (template === "print_mm") lines.push(`printer: ${describePrinter(profile)}${warnings.length ? `; ${warnings.join("; ")}` : ""}`);
-  if (args["open"] === true) {
-    const probe = await probeBridge(ctx.port);
-    if (probe.ok) {
-      try {
-        const opened = await callBridge(ctx.port, "open_blend", { path: abs, reason: "new_blend", actor: "ai" }, 90000);
-        if (opened.ok && opened.result?.["opened"] === true) lines.push(`opened it in the running Blender`);
-        else lines.push(`not opened: ${String(opened.result?.["reason"] ?? opened.error ?? "the open file could not be replaced")}. `
-          + "Blender keeps the file it has open; save that first, then launch_blender with this file.");
-      } catch (error) {
-        lines.push(`not opened: ${errorText(error)}`);
-      }
-    } else {
-      const launched = await launchBlender(ctx, { file: rel }, false);
-      lines.push(launched.ok ? launched.text : `not opened: ${launched.text}`);
-    }
+  if (args["open"] !== false) {
+    const ensured = await ensureSceneWindow(ctx, abs);
+    if (ensured.error) lines.push(`not opened: ${ensured.error}`);
+    else lines.push(ensured.note ?? "opened it in Blender");
   } else {
-    lines.push(`open it with launch_blender {"file": "${rel}"} (or new_blend with open: true)`);
+    lines.push(`open it with launch_blender {"file": "${rel}"}`);
   }
   if (trusted) {
     lines.push(`Put its scripts in ${trusted}/ (trusted, including before that folder exists) and shared code in scripts/lib/.`);
@@ -348,6 +342,8 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
   }
   const refused = saveRefusal(ctx, args);
   if (refused) return fail(refused);
+  const ensured = await ensureSceneWindow(ctx);
+  if (ensured.error) return fail(ensured.error);
   const params: Record<string, unknown> = {
     pipeline: file,
     ...copyKeys(args, ["from", "to", "mode", "reason"]),
@@ -356,7 +352,7 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
     checkpoint: checkpointParams(ctx, args),
     lib_paths: importPaths(ctx),
     reference_roots: referenceRoots(ctx),
-    printer: printerContext(ctx),
+    printer: (await printerForCall(ctx)).params,
   };
   if (args["save"] === true) params["save"] = true;
   if (args["allow_references"] === true) params["allow_references"] = true;
@@ -371,6 +367,7 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
     for (const step of steps) lines.push(`- ${String(step["step"])}: ${String(step["changes"] ?? "")}`);
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
     lines.push(...saveLines(result));
+    if (ensured.note) lines.push(ensured.note);
     const banner = unsavedBanner(result);
     if (banner) lines.unshift(banner);
     return ok(lines.join("\n"), { details: result });
@@ -388,8 +385,8 @@ function trustedPath(ctx: WorkspaceContext, requested: string, what: string): { 
     return relFile === root || relFile.startsWith(`${root}/`);
   };
   if (!trusted.length) {
-    return { problem: "no trusted script folders. Add \"trustedScripts\": [\"Models/scripts\"] to .blender-ai/config.json "
-      + `(and tick "Run trusted project scripts without asking" in setup), or use ${what === "pipeline" ? "run_pipeline" : "run_script"}.` };
+    return { problem: "no trusted script folders. Add \"trustedScripts\": [\"Models/scripts\"] to .blender-ai/config.json, "
+      + `or use ${what === "pipeline" ? "run_pipeline" : "run_script"}.` };
   }
   let real: string;
   try {
@@ -416,7 +413,7 @@ function trustedPath(ctx: WorkspaceContext, requested: string, what: string): { 
   return { real };
 }
 
-/** run_script for files in the workspace's trusted folders only, so it can be allowed without asking. */
+/** run_script for files in the workspace's trusted folders only. */
 export async function runProjectScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
   const requested = str(args["path"]);
   if ((ctx.trustedScripts ?? []).length && !requested) return fail("path is required");

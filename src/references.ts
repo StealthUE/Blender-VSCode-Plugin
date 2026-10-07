@@ -3,16 +3,19 @@ import * as path from "path";
 import { relativeTo, sidecarDir } from "./blendFiles";
 import { findFfmpeg } from "./ffmpeg";
 import * as jobs from "./jobs";
+import { adoptSlicerPrinter } from "./printerLookup";
 import { currentBlend, errorText, fail, imageReply, ok, PREVIEW_BYTES, referenceRoots, tempPng } from "./tools";
 import { CallExtras, ToolOutcome, WorkspaceContext } from "./types";
 
-const IMPORTABLE = /\.(obj|fbx|gltf|glb|stl|ply)$/i;
+const IMPORTABLE = /\.(obj|fbx|gltf|glb|stl|ply|3mf)$/i;
 const VIDEO = /\.(mp4|mov|m4v|mkv|webm|avi)$/i;
 
 /** What a file's numbers mean when the call does not say: STL is millimetres, glTF and FBX arrive in metres. */
 export function defaultUnits(file: string): { units: string; assumed: boolean } {
   const ext = path.extname(file).toLowerCase();
   if (ext === ".stl") return { units: "mm", assumed: true };
+  // read_3mf converts the unit the package declares into millimetres.
+  if (ext === ".3mf") return { units: "mm", assumed: false };
   if ([".gltf", ".glb", ".fbx"].includes(ext)) return { units: "m", assumed: false };
   return { units: "m", assumed: true };
 }
@@ -80,9 +83,10 @@ export async function importReference(ctx: WorkspaceContext, args: Record<string
   } catch (error) {
     return fail(errorText(error));
   }
-  if (!IMPORTABLE.test(source)) return fail("import_reference reads OBJ, FBX, glTF/GLB, STL and PLY files");
+  if (!IMPORTABLE.test(source)) return fail("import_reference reads OBJ, FBX, glTF/GLB, STL, PLY and 3MF files");
   const name = safeName(typeof args["name"] === "string" && args["name"].trim() ? args["name"].trim() : path.basename(source, path.extname(source)));
-  const split = typeof args["split"] === "string" ? args["split"] : "material";
+  // A slicer 3MF's build items are the parts. Splitting them by material would merge every item into "default".
+  const split = typeof args["split"] === "string" ? args["split"] : (path.extname(source).toLowerCase() === ".3mf" ? "object" : "material");
   if (!["material", "object", "none"].includes(split)) return fail("split must be material, object or none");
   const axes = args["axes"] === "native" ? "native" : "blender";
   const unitGuess = defaultUnits(source);
@@ -153,9 +157,17 @@ export async function importReference(ctx: WorkspaceContext, args: Record<string
       + `${Number(result["tris"]).toLocaleString("en-US")} triangles${seconds && !reused ? ` (import ${String(seconds["import"])} s, all ${String(seconds["total"])} s)` : ""}`,
     `files: ${rel(outDir)}/ (${mb(bytes)} of part STL), light overlay _overlay.stl (${Number(result["overlay_tris"]).toLocaleString("en-US")} triangles)`,
     `units: ${units}${unitGuess.assumed && !(typeof args["units"] === "string" && args["units"]) ? ` (assumed: ${path.extname(source).toUpperCase().slice(1)} carries no units; pass units if that is wrong)` : ""}; `
-      + `axes: ${axes === "native" ? "the file's own coordinates" : "as File > Import (Y-up files stand up in Z)"}; transform ${JSON.stringify(transform)}`,
+      + (path.extname(source).toLowerCase() === ".3mf"
+        ? "axes: 3MF is Z-up and the build-item transform is already applied"
+        : `axes: ${axes === "native" ? "the file's own coordinates" : "as File > Import (Y-up files stand up in Z)"}`)
+      + `; transform ${JSON.stringify(transform)}`,
   ];
   if (typeof result["note"] === "string" && result["note"]) lines.push(`note: ${result["note"]}`);
+  const slicer = result["slicer"] as { printer?: unknown } | undefined;
+  if (slicer?.printer) {
+    const adopted = await adoptSlicerPrinter(ctx.workspace, slicer.printer, ctx.printer);
+    if (adopted) lines.push(adopted);
+  }
   lines.push(`parts (file units, bounds min .. max${rows.some((row) => row["r"]) ? "; radial bands about the given axis" : ""}):`);
   for (const row of rows.slice(0, 40)) {
     const fmt = (v: unknown): string => (Array.isArray(v) ? `(${v.map((x) => Number(x).toFixed(3)).join(", ")})` : String(v));

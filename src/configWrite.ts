@@ -104,14 +104,15 @@ export function claudeServerEntry(launch: ServerLaunch): JsonRecord {
   return { command: launch.command, args: launch.args, env: launch.env };
 }
 
-/** Cline reads alwaysAllow from the server entry: the read-only tools, plus the script and save tools when allowed. */
+/** Cline reads alwaysAllow from the server entry: the shared allow list, plus save when that tick is on. */
 export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean, allowTrusted = false, allowSave = false): JsonRecord {
   const extra = [
     ...(allowScripts ? [SCRIPT_TOOL, PIPELINE_TOOL] : []),
     ...(allowScripts || allowTrusted ? [TRUSTED_SCRIPT_TOOL, TRUSTED_PIPELINE_TOOL] : []),
     ...(allowSave ? [SAVE_TOOL] : []),
   ];
-  return { ...claudeServerEntry(launch), alwaysAllow: [...AUTO_APPROVE, ...extra], disabled: false };
+  const alwaysAllow = [...new Set([...AUTO_APPROVE, ...extra])];
+  return { ...claudeServerEntry(launch), alwaysAllow, disabled: false };
 }
 
 const TOOL_TIMEOUT_SEC = 600;
@@ -224,8 +225,9 @@ function ruleList(permissions: JsonRecord, key: string): string[] {
 }
 
 /**
- * .claude/settings.json: deny reading or editing .blend files, and allow the read-only VSBlender tools
- * without asking. Rules for tools that no longer exist are dropped. Other rules are left alone.
+ * .claude/settings.json: deny reading or editing .blend files, and allow the shared VSBlender list
+ * (read-only tools and the build loop) without asking. Rules for tools that no longer exist are
+ * dropped. Other rules are left alone.
  */
 export function mergeClaudeSettings(existing: string | undefined): string | undefined {
   const settings = parseSettings(existing);
@@ -252,8 +254,9 @@ export function mergeClaudeSettings(existing: string | undefined): string | unde
 export const mergeClaudeDeny = mergeClaudeSettings;
 
 /**
- * .claude/settings.local.json is personal and not committed: the place for "run scripts without
- * asking". allow undefined leaves the file as it is.
+ * .claude/settings.local.json is personal and not committed. save lives here when its tick is on.
+ * The script tools are already on the shared allow list; a true here writes a personal copy, and a
+ * false removes only that copy. allow undefined leaves the file as it is.
  */
 export function mergeClaudeLocal(existing: string | undefined, allowScripts: boolean | undefined,
   allowTrusted?: boolean, allowSave?: boolean): string | undefined {
