@@ -1,7 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { listBlendFiles, relativeTo, resolveInside, sidecarDir } from "./blendFiles";
-import { callBridge } from "./bridge";
+import { callBridge, ChangeReport, formatChanges } from "./bridge";
 import * as jobs from "./jobs";
 import { printerForCall } from "./printerLookup";
 import { describePrinter, printerParams } from "./printers";
@@ -23,9 +23,10 @@ import {
   referenceRoots,
   routeCall,
   runScript,
+  runBanner,
   saveLines,
   saveRefusal,
-  unsavedBanner,
+  saveWanted,
   sourceNote,
   tempPng,
 } from "./tools";
@@ -60,7 +61,8 @@ export async function checkModel(ctx: WorkspaceContext, args: Record<string, unk
   if (purpose && !PURPOSES.includes(purpose)) return fail(`purpose must be one of ${PURPOSES.join(", ")}`);
   const printer = (await printerForCall(ctx, args["printer"])).params;
   const params: Record<string, unknown> = {
-    ...copyKeys(args, ["targets", "purpose", "deep", "max_tris", "mm_per_unit", "suggest_orientation", "place_on_bed", "views", "size", "frame"]),
+    ...copyKeys(args, ["targets", "purpose", "deep", "max_tris", "mm_per_unit", "suggest_orientation", "place_on_bed", "views", "size",
+      "frame", "pose"]),
     printer,
     image: args["image"] !== false,
     out: tempPng("check"),
@@ -117,7 +119,7 @@ export async function exportModel(ctx: WorkspaceContext, args: Record<string, un
   const printer = (await printerForCall(ctx, args["printer"])).params;
   const params: Record<string, unknown> = {
     ...copyKeys(args, ["targets", "purpose", "split", "overwrite", "place_on_bed", "center", "assembly", "ascii",
-      "apply_modifiers", "mm_per_unit", "reason"]),
+      "apply_modifiers", "mm_per_unit", "reason", "colours", "colors", "parts", "extruders", "slicer"]),
     ...(format ? { format } : {}),
     ...(output ? { path: output } : {}),
     printer,
@@ -354,7 +356,7 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
     reference_roots: referenceRoots(ctx),
     printer: (await printerForCall(ctx)).params,
   };
-  if (args["save"] === true) params["save"] = true;
+  if (saveWanted(ctx, args)) params["save"] = true;
   if (args["allow_references"] === true) params["allow_references"] = true;
   const timeout = Math.min(600000, Math.max(1000, Number(args["timeout_ms"]) || 300000));
   const rel = relativeTo(ctx.workspace, file);
@@ -366,9 +368,11 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
     const lines = [`pipeline: ${rel}`, `ran ${steps.length} step(s) as one undo step`, checkpointLine(result, "all of them")];
     for (const step of steps) lines.push(`- ${String(step["step"])}: ${String(step["changes"] ?? "")}`);
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
+    const linked = formatChanges(result["changes"] as ChangeReport | undefined).filter((line) => line.startsWith("linked:"));
+    lines.push(...linked);
     lines.push(...saveLines(result));
     if (ensured.note) lines.push(ensured.note);
-    const banner = unsavedBanner(result);
+    const banner = runBanner(result);
     if (banner) lines.unshift(banner);
     return ok(lines.join("\n"), { details: result });
   } catch (error) {

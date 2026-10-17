@@ -3,7 +3,7 @@ import * as path from "path";
 import { execFileText } from "./exec";
 import { compareVersions, findNode } from "./findBlender";
 import { callBridge, probeBridge } from "./bridge";
-import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
+import { ingestStatus, listBlendFiles, previewsStatus, relativeTo } from "./blendFiles";
 import { printerForCall } from "./printerLookup";
 import { describePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
@@ -240,10 +240,14 @@ export async function runDoctor(
       const rel = relativeTo(ctx.workspace, file);
       const fold = (p: string): string => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p));
       const open = live.file && fold(live.file) === fold(file);
+      const previews = previewsStatus(file);
+      const note = previews.status === "older"
+        ? `; previews from ${previews.renderedAt ?? "an earlier ingest"} are OLDER than the file (ingest with previews)`
+        : previews.status === "unrecorded" ? "; previews of unknown age (ingest with previews to record them)" : "";
       if (open && live.status) {
-        return `${rel} (${live.status}, open in Blender${live.dirty ? " with unsaved changes" : ""}${live.status === "current" ? "" : `: ${live.detail ?? ""}`})`;
+        return `${rel} (${live.status}, open in Blender${live.dirty ? " with unsaved changes" : ""}${live.status === "current" ? "" : `: ${live.detail ?? ""}`}${note})`;
       }
-      return `${rel} (${ingestStatus(file)})`;
+      return `${rel} (${ingestStatus(file)}${note})`;
     }).join(", ");
     checks.push(check("blend files", true, summary));
     const recoveryFiles = blends.filter((file) => {

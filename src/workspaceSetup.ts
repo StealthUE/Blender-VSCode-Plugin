@@ -90,7 +90,7 @@ export function applyWorkspace(input: ApplyInput): ApplyResult {
     { rel: ".mcp.json", style: "mcpServers", enabled: input.clients.claude, entry: claudeServerEntry(input.launch) },
     { rel: path.join(".vscode", "mcp.json"), style: "servers", enabled: input.clients.vscode, entry: vscodeServerEntry(input.launch) },
     { rel: path.join(".cursor", "mcp.json"), style: "mcpServers", enabled: input.clients.cursor, entry: claudeServerEntry(input.launch) },
-    { rel: path.join(".cline", "mcp.json"), style: "mcpServers", enabled: input.clients.cline, entry: clineServerEntry(input.launch, input.allowScripts === true, input.allowTrustedScripts === true, input.allowSave === true) },
+    { rel: path.join(".cline", "mcp.json"), style: "mcpServers", enabled: input.clients.cline, entry: clineServerEntry(input.launch, input.allowScripts === true, input.allowTrustedScripts === true, input.allowSave !== false) },
   ];
 
   for (const target of targets) {
@@ -146,7 +146,8 @@ export function applyWorkspace(input: ApplyInput): ApplyResult {
     record(result, settingsFile, writeIfChanged(settingsFile, mergeClaudeSettings(readText(settingsFile))));
     const localFile = path.join(input.workspace, ".claude", "settings.local.json");
     const localExisting = readText(localFile);
-    const localNext = mergeClaudeLocal(localExisting, input.allowScripts, input.allowTrustedScripts, input.allowSave);
+    // Saving is on unless the folder says "allowSave": false: save and finish then run without asking.
+    const localNext = mergeClaudeLocal(localExisting, input.allowScripts, input.allowTrustedScripts, input.allowSave !== false);
     if (localNext === undefined && localExisting !== undefined) result.skipped.push(localFile);
     else if (localNext !== undefined && localNext !== localExisting) record(result, localFile, writeIfChanged(localFile, localNext));
   }

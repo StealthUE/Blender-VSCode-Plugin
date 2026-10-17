@@ -53,7 +53,7 @@ async function collectState(workspace: string): Promise<PanelState> {
     port: saved?.port ?? clampPort(settings.get<number>("port"), DEFAULT_PORT),
     clients: configuredClients(workspace),
     replaceLegacy: saved?.replaceLegacy ?? settings.get<boolean>("replaceLegacy") !== false,
-    allowSave: saved?.allowSave ?? false,
+    allowSave: saved?.allowSave !== false,
     trustedScripts: (saved?.trustedScripts ?? []).join(", "),
     printer: typeof saved?.printer === "string" ? saved.printer : saved?.printer && typeof saved.printer === "object" ? "custom" : "",
     ignoreClientConfig: saved?.ignoreClientConfig ?? true,
@@ -108,8 +108,8 @@ function html(state: PanelState): string {
   </fieldset>
   <fieldset>
     <legend>Approvals and git</legend>
-    <p class="muted">Claude Code and Grok run a build without a prompt on each tool: scripts, pipelines, new files, append, open, replay, restore, roles, export, and render, plus the read-only tools. These ask each time: save (unless the tick below is on), finish, doctor_fix, a hidden Blender, import_reference, and reference. VS Code and Cursor keep approvals in their own settings.</p>
-    <label><input type="checkbox" id="allowSave" ${state.allowSave ? "checked" : ""}> Let the AI save the .blend (the save tool runs without asking, and runs can pass save: true). Off: the save tool asks you each time. Checkpoints keep unsaved work safe either way.</label>
+    <p class="muted">Claude Code and Grok run a build without a prompt on each tool: scripts, pipelines, new files, append, open, replay, restore, roles, export, and render, plus the read-only tools, and save and finish while the tick below is on. These ask each time: doctor_fix, a hidden Blender, import_reference, and reference. VS Code and Cursor keep approvals in their own settings.</p>
+    <label><input type="checkbox" id="allowSave" ${state.allowSave ? "checked" : ""}> Save the .blend after every run (recommended). Each run that changes the model saves the file, journaled with its reason; a checkpoint from before every run still lets you go back. Off: the AI asks before saving and the editor offers Save.</label>
     <label>Trusted script folders (comma separated, workspace relative) <input type="text" id="trustedScripts" value="${escapeAttr(state.trustedScripts)}" placeholder="Models/scripts"></label>
     <label><input type="checkbox" id="ignoreClientConfig" ${state.ignoreClientConfig ? "checked" : ""}> Keep the MCP config files out of git. .mcp.json and the others hold paths for this machine; each person runs setup.</label>
   </fieldset>
@@ -285,8 +285,10 @@ export async function showSetup(
       next.push("Claude Code asks you to approve the vsblender server in .mcp.json the first time it starts in this folder.");
     }
     if (clients.claude || clients.grok) {
-      next.push("Scripts, pipelines, new files, append, open, replay, restore, roles, export, and render run without asking. save, finish, doctor_fix, a hidden Blender, import_reference, and reference ask each time.");
-      if (allowSave) next.push("save runs without asking, and runs can pass save: true.");
+      next.push("Scripts, pipelines, new files, append, open, replay, restore, roles, export, and render run without asking. doctor_fix, a hidden Blender, import_reference, and reference ask each time.");
+      next.push(allowSave
+        ? "Each run saves the .blend when it is done; save and finish run without asking."
+        : "Runs leave the .blend unsaved: save and finish ask you, and the editor offers Save after a run.");
     }
     if (clients.vscode) next.push("VS Code: start the vsblender server from .vscode/mcp.json (or the MCP Servers view) if it does not start by itself.");
     if (clients.grok) next.push("Grok: the server is in .grok/config.toml. If a session has no vsblender tools, turn it on in /mcps. The guide tells the model to stop and ask you, not to build the part in another program.");

@@ -104,6 +104,8 @@ export interface StartOptions {
   scratch?: string;
   autoexec?: boolean;
   factoryStartup?: boolean;
+  /** The job folder to use when the caller already made one (a background run's copy lives there). */
+  id?: string;
 }
 
 export function startJob(ctx: WorkspaceContext, id: string, options: StartOptions): Job {
@@ -223,7 +225,7 @@ export function waitFor(job: Job, timeoutMs: number, signal?: AbortSignal): Prom
 
 /** Run a short job to completion and return its result, for previews of checkpoints and compositing. */
 export async function runToEnd(ctx: WorkspaceContext, options: StartOptions, timeoutMs: number, signal?: AbortSignal): Promise<Record<string, unknown>> {
-  const id = newJobId(options.kind);
+  const id = options.id ?? newJobId(options.kind);
   const job = startJob(ctx, id, options);
   await waitFor(job, timeoutMs, signal);
   if (job.state === "running") {

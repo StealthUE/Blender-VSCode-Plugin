@@ -105,7 +105,7 @@ export interface CallExtras {
 
 export const DEFAULT_PORT = 47876;
 export const SERVER_NAME = "vsblender";
-export const ADDON_VERSION = "0.7.0";
+export const ADDON_VERSION = "0.8.0";
 export const GUIDE_STAMP = "<!-- vsblender-guide";
 export const DEFAULT_LIB_PATHS = ["scripts/lib"];
 

@@ -68,8 +68,10 @@ export async function setRole(ctx: WorkspaceContext, args: Record<string, unknow
   if (!existing) lines.push("This object was not in the sidecar yet; the next ingest adds its other facts.");
   if (args["write_to_file"] === true) {
     try {
-      const response = await callBridge(ctx.port, "write_role_property", { target, role }, 15000);
-      lines.push(response.ok ? "ai_role was stamped on the object in Blender (one undo step; not saved)." : `ai_role not written: ${response.error ?? "failed"}`);
+      const response = await callBridge(ctx.port, "write_role_property",
+        { target, role, ...(ctx.allowSave !== false ? { save: true } : {}) }, 30000);
+      const saved = response.result?.["saved"] ? "saved" : "not saved";
+      lines.push(response.ok ? `ai_role was stamped on the object in Blender (one undo step; ${saved}).` : `ai_role not written: ${response.error ?? "failed"}`);
     } catch (error) {
       lines.push(`ai_role not written: ${bridgeFailure(ctx.port, error, 15000)}`);
     }

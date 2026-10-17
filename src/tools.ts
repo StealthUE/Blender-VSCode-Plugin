@@ -16,7 +16,7 @@ import { findFfmpeg } from "./ffmpeg";
 import { loadCatalog, printerForCall } from "./printerLookup";
 import { describePrinter, printerParams, resolvePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
-import { clearLease, decideWindow, findFreePort, leasePort, leasedPort, needsOurWindow, sceneWindowPlan, WindowChoice } from "./windows";
+import { clearLease, decideWindow, findFreePort, leasePort, leasedPort, needsOurWindow, pathsEqual, sceneWindowPlan, WindowChoice, WindowSnapshot } from "./windows";
 import { importReference } from "./references";
 import { compare, diff, reference, setRole } from "./review";
 import {
@@ -154,7 +154,10 @@ export interface Routed {
   response: BridgeResponse;
   /** live: the open session. disk: the saved file, read by a background Blender. */
   source: "live" | "disk";
+  /** The file the answer describes: the saved file read, or the one the window has open. */
   blend?: string;
+  /** live: the session has changes the file on disk does not. */
+  dirty?: boolean;
 }
 
 /**
@@ -193,28 +196,82 @@ async function readSaved(ctx: WorkspaceContext, method: string, params: Record<s
   return { response: { ok: true, result: (result["result"] as Record<string, unknown>) ?? {}, warnings }, source: "disk", blend };
 }
 
+export interface RouteChoice {
+  /** live: ask the open session. saved: read the saved file in a background Blender. refuse: neither. */
+  route: "live" | "saved" | "refuse";
+  because?: string;
+}
+
+/**
+ * Where a bridge call is answered. requested: the .blend a path argument names (absolute), if any.
+ * A read-only tool asked about a file other than the one this workspace's window has open reads that
+ * saved file: answering from the open session would describe the wrong model.
+ */
+export function chooseRoute(workspace: string, method: string, probe: { ok: boolean; state?: string },
+  snap: WindowSnapshot | undefined, requested?: string): RouteChoice {
+  const readOnly = HEADLESS_OK.has(method);
+  if (probe.ok) {
+    const decision = decideWindow(workspace, snap ?? { unknown: true });
+    if (!decision.use) {
+      if (!readOnly) return { route: "refuse", because: decision.message ?? "this Blender window belongs to another folder" };
+      return { route: "saved", because: "another folder's Blender is open, so this reads the saved file and leaves that window alone" };
+    }
+    const open = (snap?.file || "").trim();
+    if (readOnly && requested && open && !pathsEqual(requested, open)) {
+      return {
+        route: "saved",
+        because: `path ${relativeTo(workspace, requested)} is not the file open in Blender (${relativeTo(workspace, open)}), `
+          + `so this reads the saved ${relativeTo(workspace, requested)}`,
+      };
+    }
+    return { route: "live" };
+  }
+  if (probe.state !== "absent" || !readOnly) return { route: "live" };
+  return { route: "saved", because: "Blender is not running, so this reads a saved file" };
+}
+
 export async function routeCall(ctx: WorkspaceContext, method: string, params: Record<string, unknown>, timeoutMs: number,
   blendArg: unknown, extras: CallExtras = {}): Promise<Routed> {
   const probe = await probeBridge(ctx.port);
-  if (probe.ok) {
-    const decision = decideWindow(ctx.workspace, probe.window ?? { unknown: true });
-    if (!decision.use) {
-      if (!HEADLESS_OK.has(method)) throw new Error(decision.message ?? "this Blender window belongs to another folder");
-      return readSaved(ctx, method, params, timeoutMs, blendArg, extras,
-        "another folder's Blender is open, so this reads the saved file and leaves that window alone");
-    }
-    return { response: await callBridge(ctx.port, method, params, timeoutMs), source: "live" };
-  }
-  if (probe.state !== "absent" || !HEADLESS_OK.has(method)) {
-    return { response: await callBridge(ctx.port, method, params, timeoutMs), source: "live" };
-  }
-  return readSaved(ctx, method, params, timeoutMs, blendArg, extras, "Blender is not running, so this reads a saved file");
+  const requested = typeof blendArg === "string" && blendArg.trim() ? pickBlend(ctx, blendArg) : undefined;
+  const choice = chooseRoute(ctx.workspace, method, probe, probe.window, requested);
+  if (choice.route === "refuse") throw new Error(choice.because ?? "this Blender window belongs to another folder");
+  if (choice.route === "saved") return readSaved(ctx, method, params, timeoutMs, blendArg, extras, choice.because ?? "");
+  const open = (probe.window?.file || "").trim();
+  return {
+    response: await callBridge(ctx.port, method, params, timeoutMs), source: "live",
+    ...(open ? { blend: open } : {}),
+    ...(probe.window?.dirty || Number(probe.window?.runs || 0) > 0 ? { dirty: true } : {}),
+  };
 }
 
+/**
+ * A reply with its source. A live JSON answer (describe, spatial) keeps parsing: the source becomes
+ * its first field. Anything else, and every saved-file answer, starts with the source line.
+ */
+export function withSource(note: string, text: string, source: Routed["source"]): string {
+  if (note && source === "live" && /^\s*\{/.test(text)) {
+    try {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return JSON.stringify({ source: note.replace(/^source:\s*/, "").trim(), ...parsed }, null, 1);
+      }
+    } catch {
+      // Not JSON after all: the line goes first.
+    }
+  }
+  return note + text;
+}
+
+/** The first line of every read-only reply: which file it describes. */
 export function sourceNote(ctx: WorkspaceContext, routed: Routed): string {
-  return routed.source === "disk" && routed.blend
-    ? `source: saved file ${relativeTo(ctx.workspace, routed.blend)} (the open window was left alone; unsaved work in a window is not included)\n`
-    : "";
+  if (routed.source === "disk" && routed.blend) {
+    return `source: saved file ${relativeTo(ctx.workspace, routed.blend)} (the open window was left alone; unsaved work in a window is not included)\n`;
+  }
+  if (routed.source === "live" && routed.blend) {
+    return `source: open session, ${relativeTo(ctx.workspace, routed.blend)}${routed.dirty ? " (with changes not saved to disk)" : ""}\n`;
+  }
+  return "";
 }
 
 /** Call a bridge method and turn its reply into text. Most read-only tools are just this. */
@@ -227,9 +284,11 @@ export async function bridgeTool(ctx: WorkspaceContext, method: string, params: 
     const result = response.result ?? {};
     const text = format ? format(result) : typeof result["text"] === "string" ? result["text"] : JSON.stringify(result, null, 1);
     const warnings = response.warnings?.length ? `\nwarnings: ${response.warnings.join("; ")}` : "";
-    return ok(sourceNote(ctx, routed) + text + warnings, { details: { ...result, source: routed.source } });
+    return ok(withSource(sourceNote(ctx, routed), text, routed.source) + warnings, { details: { ...result, source: routed.source } });
   } catch (error) {
-    if (/did not finish|failed:|not running/i.test(errorText(error))) return fail(errorText(error));
+    if (/did not finish|failed:|not running|file not found|path must|outside the workspace|more than one \.blend/i.test(errorText(error))) {
+      return fail(errorText(error));
+    }
     return fail(bridgeFailure(ctx.port, error, timeoutMs));
   }
 }
@@ -287,7 +346,9 @@ export async function sessionInfo(ctx: WorkspaceContext, args: Record<string, un
       printer: ctx.printer !== undefined
         ? `${describePrinter(profile)}${warnings.length ? ` (${warnings.join("; ")})` : ""}`
         : `none set (purpose print uses ${describePrinter(profile)}); set "printer" in .blender-ai/config.json`,
-      save: ctx.allowSave ? "the user lets the AI save (save tool, save: true on runs)" : "the save tool asks the user; save: true on runs is off",
+      save: autoSaveOn(ctx)
+        ? "each run saves the .blend when it is done (allowSave); save and finish run without asking"
+        : "this folder asks before saving (allowSave false): runs leave the file unsaved, the save tool asks the user",
       gotchas,
     };
     return ok(JSON.stringify(info, null, 2), { details: info });
@@ -453,6 +514,18 @@ export async function ensureSceneWindow(ctx: WorkspaceContext, file?: string): P
     return { error: `${probe.detail}. Not starting another Blender on port ${ctx.port}.` };
   }
   const snap = probe.ok ? (probe.window ?? { unknown: true }) : undefined;
+  // Tests and CI drive a headless Blender on purpose: VSBLENDER_HEADLESS_EDITS=1 keeps the edits there,
+  // and opens another file in it, instead of replacing it with a window.
+  if (process.env["VSBLENDER_HEADLESS_EDITS"] === "1" && snap && !snap.unknown && snap.background
+    && decideWindow(ctx.workspace, snap).use) {
+    const open = (snap.file || "").trim();
+    if (!file || (open && pathsEqual(file, open))) return {};
+    if (snap.dirty || Number(snap.runs || 0) > 0) {
+      return { error: `unsaved changes. Blender keeps ${open || "the open session"}. Call finish, then open this file.` };
+    }
+    const opened = await openInOurs(ctx, file);
+    return opened.ok ? { note: opened.text } : { error: opened.text };
+  }
   const plan = sceneWindowPlan(ctx.workspace, snap, file);
   if (plan.message) return { error: plan.message };
   if (plan.switchTo) {
@@ -504,11 +577,22 @@ function changesText(report: ChangeReport | undefined): string {
   return lines.length ? `changes:\n  ${lines.join("\n  ")}` : "changes: none";
 }
 
-/** save: true on a script tool saves the user's file, which only the user can allow (allowSave in setup). */
+/** The plugin saves the .blend after every run unless the folder turned that off ("allowSave": false). */
+export function autoSaveOn(ctx: WorkspaceContext): boolean {
+  return ctx.allowSave !== false;
+}
+
+/** Whether a run saves when it is done: on by default, off for save: false or a folder that asks first. */
+export function saveWanted(ctx: WorkspaceContext, args: Record<string, unknown>): boolean {
+  if (args["save"] === false) return false;
+  return autoSaveOn(ctx);
+}
+
+/** save: true in a folder that asks before saving (allowSave false) is refused: only the user turns that on. */
 export function saveRefusal(ctx: WorkspaceContext, args: Record<string, unknown>): string | undefined {
-  if (args["save"] !== true || ctx.allowSave === true) return undefined;
-  return "save: true needs the user's permission: tick \"Let the AI save the .blend\" in VSBlender: Setup "
-    + "(\"allowSave\": true in .blender-ai/config.json). Run without save, then call the save tool, which asks the user.";
+  if (args["save"] !== true || autoSaveOn(ctx)) return undefined;
+  return "this folder asks before saving (\"allowSave\": false in .blender-ai/config.json), so save: true is refused. "
+    + "Run without save, then call the save tool, which asks the user. The user can turn saving on in VSBlender: Setup.";
 }
 
 export function checkpointParams(ctx: WorkspaceContext, args: Record<string, unknown>): Record<string, unknown> {
@@ -546,6 +630,16 @@ export function unsavedBanner(result: Record<string, unknown>): string | undefin
   if (!(runs > 0)) return undefined;
   const file = unsaved?.file ? String(unsaved.file) : "the open file";
   return `${runs} runs, the file on disk does not have them (${file})`;
+}
+
+/** The first line of a run: saved, not saved and why, or the unsaved count. */
+export function runBanner(result: Record<string, unknown>): string | undefined {
+  const saved = result["saved"] as Record<string, unknown> | undefined;
+  if (saved && typeof saved === "object") return `saved ${String(saved["saved"])}`;
+  if (typeof result["save_skipped"] === "string") {
+    return `not saved: ${result["save_skipped"]}${unsavedBanner(result) ? `\n${unsavedBanner(result)}` : ""}`;
+  }
+  return unsavedBanner(result);
 }
 
 /** The last lines of a run: what was saved, and what the file on disk does not have yet. */
@@ -609,17 +703,21 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
   const foreign = probe.ok && !decideWindow(ctx.workspace, probe.window ?? { unknown: true }).use;
   const id = jobs.newJobId("script");
   const dir = path.join(jobs.jobsDir(ctx.workspace), id);
-  fs.mkdirSync(dir, { recursive: true });
   let blend: string;
   let source: string;
   let scratch: string | undefined;
+  let sourceBlend: string | undefined;
   if (probe.ok && !foreign) {
+    fs.mkdirSync(dir, { recursive: true });
     const copy = path.join(dir, "scene.blend");
     try {
       const response = await callBridge(ctx.port, "save_copy", { path: copy }, 300000);
       if (!response.ok) return fail(bridgeError(response, "save_copy"));
       blend = copy;
       scratch = copy;
+      // The copy's own path is a job folder: the script reads its real file from vsblender.source_blend().
+      const from = response.result?.["source"];
+      if (typeof from === "string" && from) sourceBlend = from;
       source = "a copy of the open session (thrown away; the open file is unchanged)";
     } catch (error) {
       return fail(bridgeFailure(ctx.port, error, 300000));
@@ -636,13 +734,17 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
       ? `the saved file ${relativeTo(ctx.workspace, blend)} (another folder's Blender is open; that window was left alone)`
       : `the saved file ${relativeTo(ctx.workspace, blend)} (Blender is not running; the file is not written)`;
   }
-  const spec: Record<string, unknown> = { kind: "script", script };
+  const spec: Record<string, unknown> = {
+    kind: "script", script, lib_paths: importPaths(ctx), source_blend: sourceBlend ?? blend,
+    printer: (await printerForCall(ctx)).params, reference_roots: referenceRoots(ctx),
+  };
   if (typeof args["function"] === "string" && args["function"]) spec["function"] = args["function"];
   if (args["args"] && typeof args["args"] === "object") spec["args"] = args["args"];
-  const timeout = Math.min(600000, Math.max(1000, Number(args["timeout_ms"]) || 60000));
+  // A background run never holds the window, so it may take the longest a call can.
+  const timeout = Math.min(600000, Math.max(1000, Number(args["timeout_ms"]) || 600000));
   try {
     const result = await jobs.runToEnd(ctx, {
-      blend, spec, kind: "script", label: `background ${rel}`, ...(scratch ? { scratch } : {}),
+      blend, spec, kind: "script", label: `background ${rel}`, ...(scratch ? { scratch, id } : {}),
     }, timeout);
     const lines = [`background: ${rel}`, source, `result: ${JSON.stringify(result["result"])}`];
     const stdout = typeof result["stdout"] === "string" ? result["stdout"] : "";
@@ -653,7 +755,8 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
     lines.push("The copy was thrown away. Nothing was checkpointed or journaled, and the open file is unchanged.");
     return ok(lines.join("\n"), { details: result });
   } catch (error) {
-    return fail(errorText(error));
+    const text = errorText(error);
+    return fail(/did not finish within/.test(text) ? `${text}. The job was stopped; pass timeout_ms (up to 600000) for a longer run.` : text);
   }
 }
 
@@ -683,7 +786,7 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
     reference_roots: referenceRoots(ctx),
     printer: (await printerForCall(ctx)).params,
   };
-  if (args["save"] === true) params["save"] = true;
+  if (saveWanted(ctx, args)) params["save"] = true;
   if (args["allow_references"] === true) params["allow_references"] = true;
   if (typeof args["atomic"] === "boolean") params["atomic"] = args["atomic"];
   if (typeof args["function"] === "string" && args["function"]) params["function"] = args["function"];
@@ -730,13 +833,14 @@ export async function runScript(ctx: WorkspaceContext, args: Record<string, unkn
       lines.push("background applies only to a script marked # vsblender: read-only; this one ran in the open Blender.");
     }
     if (ensured.note) lines.push(ensured.note);
-    const banner = unsavedBanner(result);
+    const banner = runBanner(result);
     if (banner) lines.unshift(banner);
     return ok(lines.join("\n"), { details: { ...result, changed: response.changed ?? [] } });
   } catch (error) {
     if (/timed out/i.test(errorText(error))) {
       const asked = await cancelScript(ctx.port);
-      return fail(`${bridgeFailure(ctx.port, error, timeout)}${asked ? " The script was asked to stop at its next vsblender.progress() call; a script that never calls it runs to the end." : ""}`);
+      return fail(`${bridgeFailure(ctx.port, error, timeout)}${asked ? " The script was asked to stop at its next vsblender.progress() call; a script that never calls it runs to the end." : ""}`
+        + ` For a longer run pass timeout_ms (up to 600000).`);
     }
     return fail(bridgeFailure(ctx.port, error, timeout));
   }
@@ -906,6 +1010,13 @@ export function previewParams(args: Record<string, unknown>): Record<string, unk
     if (value !== undefined && value !== null && value !== "") params[key] = value;
   }
   if (args["frame"] !== undefined && args["frame"] !== null && args["frame"] !== "") params["frame"] = Number(args["frame"]);
+  // material names one material to show on a ball; material: true means lit material shading.
+  if (params["material"] === true || params["material"] === "true") {
+    delete params["material"];
+    if (!params["shading"]) params["shading"] = "material";
+  } else if (params["material"] === false || params["material"] === "false") {
+    delete params["material"];
+  }
   // The add-on re-encodes or shrinks an image that would not fit in a tool reply, instead of omitting it.
   params["max_bytes"] = PREVIEW_BYTES;
   return params;
@@ -1199,6 +1310,23 @@ export async function finishSession(ctx: WorkspaceContext, args: Record<string, 
   }
 }
 
+/** What a save put in the file: the runs it saved, or why there were none (the editor or Blender saved first). */
+export function savedRunsText(result: Record<string, unknown>): string {
+  const runs = Number(result["runs"] ?? 0);
+  const named = Array.isArray(result["saved_runs"]) ? (result["saved_runs"] as string[]) : [];
+  if (runs) {
+    return `${runs} run(s) since the last save are in the file now${named.length ? `:\n  ${named.join("\n  ")}` : "."}`;
+  }
+  const previous = result["previous_save"] as { time?: string; actor?: string; runs?: number; reason?: string } | undefined;
+  if (previous && previous.time) {
+    const who = previous.actor === "user" ? "from the editor" : previous.actor === "blender" ? "in Blender" : "by the AI";
+    const when = String(previous.time).slice(11, 19);
+    const what = Number(previous.runs ?? 0) ? ` with ${previous.runs} run(s)` : "";
+    return `Nothing new to save: the file was saved ${who} at ${when}${what}${previous.reason ? ` (${previous.reason})` : ""}.`;
+  }
+  return "There were no runs through the bridge since the last save.";
+}
+
 export async function save(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
   const probe = await probeBridge(ctx.port);
   if (!probe.ok) {
@@ -1221,10 +1349,9 @@ export async function save(ctx: WorkspaceContext, args: Record<string, unknown>)
     const response = await callBridge(ctx.port, "save_file", params, 300000);
     if (!response.ok) return fail(bridgeError(response, "save_file"));
     const result = response.result ?? {};
-    const runs = Number(result["runs"] ?? 0);
     const lines = [
       `saved: ${String(result["saved"])} (${mb(result["bytes"])}${result["compress"] ? ", compressed" : ""})`,
-      runs ? `${runs} run(s) since the last save are in the file now.` : "There were no runs through the bridge since the last save.",
+      savedRunsText(result),
       "Journaled with the reason. The watcher re-ingests the saved file; its change log says the changes came from the AI's runs.",
     ];
     if (Array.isArray(result["references_kept"])) lines.push(`kept reference objects in the file (allow_references): ${(result["references_kept"] as string[]).join(", ")}`);
@@ -1253,6 +1380,7 @@ export async function append(ctx: WorkspaceContext, args: Record<string, unknown
     from: source, objects, reason: args["reason"] ?? null, actor: "ai", checkpoint: checkpointParams(ctx, args),
     with_children: args["with_children"] !== false,
   };
+  if (saveWanted(ctx, args)) params["save"] = true;
   if (typeof args["collection"] === "string" && args["collection"].trim()) params["collection"] = args["collection"].trim();
   try {
     const response = await callBridge(ctx.port, "append_objects", params, 300000);
@@ -1269,6 +1397,8 @@ export async function append(ctx: WorkspaceContext, args: Record<string, unknown
     if (response.warnings?.length) lines.push(`warnings:\n${response.warnings.join("\n")}`);
     lines.push(...saveLines(result));
     if (ensured.note) lines.push(ensured.note);
+    const banner = runBanner(result);
+    if (banner) lines.unshift(banner);
     return ok(lines.join("\n"), { details: result });
   } catch (error) {
     return fail(bridgeFailure(ctx.port, error, 300000));
@@ -1334,6 +1464,10 @@ export async function replay(ctx: WorkspaceContext, args: Record<string, unknown
   try {
     const response = await callBridge(ctx.port, "replay", {
       run, force: args["force"] === true, actor: "ai",
+      ...(run ? {
+        lib_paths: importPaths(ctx), reference_roots: referenceRoots(ctx), printer: (await printerForCall(ctx)).params,
+        checkpoint: checkpointParams(ctx, args), ...(saveWanted(ctx, args) ? { save: true } : {}),
+      } : {}),
     }, timeout);
     if (!response.ok) return fail(bridgeError(response, "replay"));
     const result = response.result ?? {};
@@ -1356,11 +1490,14 @@ export async function restoreCheckpoint(ctx: WorkspaceContext, args: Record<stri
   if (!id) return fail("id is required: a checkpoint id from session_info, or last");
   const ensured = await ensureSceneWindow(ctx);
   if (ensured.error) return fail(ensured.error);
-  const outcome = await bridgeTool(ctx, "restore_checkpoint", { id, reason: args["reason"] ?? null, actor: "ai" }, 600000,
+  const outcome = await bridgeTool(ctx, "restore_checkpoint", {
+    id, reason: args["reason"] ?? null, actor: "ai", ...(saveWanted(ctx, args) ? { save: true } : {}),
+  }, 600000,
     (result) => [
+      ...(runBanner(result) ? [runBanner(result) as string] : []),
       `restored: ${String(result["restored"])}`,
       `the state before the restore is checkpoint ${String(result["safety_checkpoint"])}`,
-      `file: ${String(result["file"])} (path unchanged, not saved)`,
+      `file: ${String(result["file"])} (path unchanged${result["saved"] ? ", saved" : ", not saved"})`,
       "Ctrl+Z in Blender also undoes the restore.",
     ].join("\n"));
   if (outcome.ok && ensured.note) return { ...outcome, text: `${outcome.text}\n${ensured.note}` };
@@ -1440,7 +1577,11 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
     case "find":
       return bridgeTool(ctx, "find", { selector: args["selector"], limit: args["limit"] ?? 100 }, 60000, undefined, args["path"], extras);
     case "spatial":
-      return bridgeTool(ctx, "spatial", args, 120000, (result) => JSON.stringify(result, null, 1), args["path"], extras);
+      // sweep and through lead with a readable summary; the rest are small JSON answers.
+      return bridgeTool(ctx, "spatial", args, args["op"] === "sweep" || args["op"] === "through" ? 600000 : 120000,
+        (result) => typeof result["text"] === "string"
+          ? `${result["text"]}\n${JSON.stringify({ ...result, text: undefined }, null, 1)}`
+          : JSON.stringify(result, null, 1), args["path"], extras);
     case "timeline":
       return bridgeTool(ctx, "timeline", args, 120000, undefined, args["path"], extras);
     case "measure":

@@ -12,6 +12,8 @@ export interface ChangeReport {
   lost_animation?: string[];
   /** Built and removed again within the run (an import that was measured and deleted). Not a change. */
   temporary?: string[];
+  /** Changed meshes that several objects use (linked duplicates): mesh name -> objects. */
+  shared_meshes?: Record<string, string[]>;
 }
 
 export interface BridgeResponse {
@@ -158,5 +160,8 @@ export function formatChanges(report: ChangeReport | undefined, limit = 12): str
     lines.push(`modified ${category}: ${shown.join(", ")}${names.length > limit ? ` (+${names.length - limit} more)` : ""}`);
   }
   if (report.temporary?.length) lines.push(`temporary (added and removed again, not a change): ${list(report.temporary)}`);
+  for (const [mesh, users] of Object.entries(report.shared_meshes ?? {}).slice(0, limit)) {
+    lines.push(`linked: mesh ${mesh} is shared by ${list(users)}, so all of them show the change`);
+  }
   return lines;
 }

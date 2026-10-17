@@ -1,6 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
-import { AUTO_APPROVE, claudeRule, PIPELINE_TOOL, SAVE_TOOL, SCRIPT_TOOL, TOOL_NAMES, TRUSTED_PIPELINE_TOOL, TRUSTED_SCRIPT_TOOL } from "./toolDefs";
+import { AUTO_APPROVE, claudeRule, PIPELINE_TOOL, SAVE_TOOLS, SCRIPT_TOOL, TOOL_NAMES, TRUSTED_PIPELINE_TOOL, TRUSTED_SCRIPT_TOOL } from "./toolDefs";
 import { ServerLaunch, SERVER_NAME } from "./types";
 
 export interface LaunchInput {
@@ -104,12 +104,12 @@ export function claudeServerEntry(launch: ServerLaunch): JsonRecord {
   return { command: launch.command, args: launch.args, env: launch.env };
 }
 
-/** Cline reads alwaysAllow from the server entry: the shared allow list, plus save when that tick is on. */
-export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean, allowTrusted = false, allowSave = false): JsonRecord {
+/** Cline reads alwaysAllow from the server entry: the shared allow list, plus save and finish while the folder saves on its own. */
+export function clineServerEntry(launch: ServerLaunch, allowScripts: boolean, allowTrusted = false, allowSave = true): JsonRecord {
   const extra = [
     ...(allowScripts ? [SCRIPT_TOOL, PIPELINE_TOOL] : []),
     ...(allowScripts || allowTrusted ? [TRUSTED_SCRIPT_TOOL, TRUSTED_PIPELINE_TOOL] : []),
-    ...(allowSave ? [SAVE_TOOL] : []),
+    ...(allowSave ? SAVE_TOOLS : []),
   ];
   const alwaysAllow = [...new Set([...AUTO_APPROVE, ...extra])];
   return { ...claudeServerEntry(launch), alwaysAllow, disabled: false };
@@ -277,8 +277,10 @@ export function mergeClaudeLocal(existing: string | undefined, allowScripts: boo
     want.set(claudeRule(TRUSTED_SCRIPT_TOOL), trusted || allowScripts === true);
     want.set(claudeRule(TRUSTED_PIPELINE_TOOL), trusted || allowScripts === true);
   }
-  // Saving the user's file is its own decision.
-  if (allowSave !== undefined) want.set(claudeRule(SAVE_TOOL), allowSave);
+  // Saving the user's file is its own decision: save and finish go together.
+  if (allowSave !== undefined) {
+    for (const tool of SAVE_TOOLS) want.set(claudeRule(tool), allowSave);
+  }
   let changed = false;
   for (const [rule, on] of want) {
     const has = allow.includes(rule);

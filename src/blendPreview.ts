@@ -1,14 +1,15 @@
 import { spawn } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import { sidecarDir } from "./blendFiles";
+import { previewsStatus, sidecarDir } from "./blendFiles";
 
 /** Ingest stills, then the still this editor renders. The first fresh one is shown. */
 export const PREVIEW_NAMES = ["camera.png", "iso.png", "front.png", "click.png"];
 
 /**
- * A preview image that is at least as new as the .blend.
- * Opening the file shows this instead of rendering again.
+ * A preview image of this version of the .blend. Ingest stills count when previews.json says they
+ * were rendered from it (or, for older sidecars, when they are at least as new as the file); the
+ * click still counts when it is at least as new. Opening the file shows this instead of rendering again.
  */
 export function existingPreview(blendFile: string): string | undefined {
   let blendTime = 0;
@@ -20,11 +21,18 @@ export function existingPreview(blendFile: string): string | undefined {
     return undefined;
   }
   const dir = path.join(sidecarDir(blendFile), "previews");
+  const recorded = previewsStatus(blendFile).status;
   for (const name of PREVIEW_NAMES) {
     const file = path.join(dir, name);
     try {
       const stat = fs.statSync(file);
-      if (stat.isFile() && stat.size > 0 && stat.mtimeMs + 1000 >= blendTime) return file;
+      if (!stat.isFile() || stat.size <= 0) continue;
+      const fresh = stat.mtimeMs + 1000 >= blendTime;
+      if (name === "click.png" || recorded === "unrecorded" || recorded === "none") {
+        if (fresh) return file;
+      } else if (recorded === "current") {
+        return file;
+      }
     } catch {
       // The next name may exist.
     }

@@ -15,19 +15,19 @@ const obj = (properties: Record<string, unknown>, required: string[] = []): Reco
   ...(required.length ? { required } : {}),
 });
 
-const blendPath = { type: "string", description: "Workspace .blend to read when Blender is not running (then the saved file is used, in a background Blender). Optional when only one exists." };
-const targets = { description: "Objects: a name, a list of names, or a find selector (\"type:MESH and children_of:Lamp\"). Default: the visible mesh, curve and text objects, without references (vsblender_reference), staging (vsblender_stage: template floor, build plate) and boolean cutters." };
+const blendPath = { type: "string", description: "Workspace .blend this is about. When it is not the file open in Blender (or Blender is not running), the saved file is read in a background Blender and the open window is left alone. Optional: default the open file, or the only one. The reply starts with the source it read (open session or saved file)." };
+const targets = { description: "Objects: a name, a list of names, or a find selector (\"type:MESH and children_of:Lamp\"). Default: the visible mesh, curve and text objects, without references (vsblender_reference), staging (vsblender_stage: template floor, build plate), hardware stand-ins (vsblender_hardware: glass, bearings, motors) and boolean cutters. A hardware stand-in named here is included." };
 const overlay = {
   type: "array",
   items: { type: "object" },
   description: "Draw other geometry or a show plate with the image. Geometry: [{\"objects\": \"_REF *\" | \"file\": \"refs/part.stl\" (STL, OBJ, 3MF, SVG; part: an OBJ material/group; transform {location, rotation_deg, scale, units: mm}) | \"ref\": a references.json name (\"peg\", or \"peg/Chevron\" for one part), \"style\": \"wire\" | \"xray\" | \"silhouette\" (drawn over the image) | \"solid\" | \"cavity\" (shaded in the scene, hidden behind nearer geometry; temporary copies, never in the file), \"color\": \"#ff3010\", \"opacity\": 0.35}]. A plate: {\"image\": \"plates/chevron.png\"} or {\"video\": \"plates/dial.mp4\", \"time\": 52}, placed with box [x0, y0, x1, y1] (fractions, (0, 0) top left; default the whole frame), corners (four [x, y] fractions), or region (a 3D box projected through this camera). mode \"overlay\" (default) draws it in the frame; mode \"diff\" returns a triptych of the render, the plate and where they disagree.",
 };
-const saveArg = { type: "boolean", description: "Save the .blend after a successful run (journaled). Only when the user allowed it in setup (allowSave); otherwise refused." };
+const saveArg = { type: "boolean", description: "Default: the .blend is saved after a successful run that changed something (journaled), unless the folder asks first (\"allowSave\": false). false skips that save for this run. true in a folder that asks first is refused." };
 const allowReferences = { type: "boolean", description: "With save: save even though reference objects (vsblender_reference, _REF*) are in the scene." };
 
 const viewProps = {
   view: { type: "string", description: "camera, front, back, left, right, top, bottom, iso. Default iso." },
-  shading: { type: "string", description: "solid (Workbench, with cavity and outlines), material (EEVEE look-dev), rendered (the scene's engine and settings). Default solid." },
+  shading: { type: "string", description: "solid (Workbench, with cavity and outlines; shows the materials' viewport colours, best for a print_mm file), material (EEVEE look-dev, lit by the scene's lights, or a temporary studio light when it has none), rendered (the scene's engine and settings). Default solid." },
   target: { type: "string", description: "Object to frame. Its children are included." },
   isolate: { type: "boolean", description: "Show only target and its children (plus lights). Default false: neighbours stay visible." },
   frame: { type: "number", description: "Frame to show, e.g. 120 for the end of the dial sequence. The user's frame is restored afterwards." },
@@ -117,13 +117,13 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "run_script",
-    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`, `# vsblender: reads NAME`, `# vsblender: exports NAME` (an out-of-date warning then names the values that changed). `result` is a global, or the value main() returns. Or pass function and args. background: true runs on a throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, and the window is started first when this folder does not already have one. The reply starts with how many runs the file on disk does not have; the .blend is never saved unless save is passed (and allowed).",
+    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`, `# vsblender: reads NAME`, `# vsblender: exports NAME` (an out-of-date warning then names the values that changed). `result` is a global, or the value main() returns. Or pass function and args. background: true runs on a throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, and the window is started first when this folder does not already have one. A run that changed something saves the .blend when it is done (journaled), and the reply starts with \"saved <file>\". In a folder that asks first (\"allowSave\": false), or with save: false, the file is left unsaved and the reply starts with how many runs the file on disk does not have. Warnings name an object a run left without faces (a linked copy left on a placeholder) and the objects a changed mesh is shared with.",
     inputSchema: obj({
       path: { type: "string", description: "Workspace .py file. Keep model scripts next to their .blend: <blend folder>/scripts/, shared code in <blend folder>/scripts/lib/." },
       reason: { type: "string", description: "Why: goes into the journal and the NOTES change log. Give one for every change." },
       function: { type: "string" },
       args: { type: "object" },
-      timeout_ms: { type: "number", description: "Default 60000, max 600000. On timeout the script is asked to stop at its next vsblender.progress() call." },
+      timeout_ms: { type: "number", description: "In Blender: default 60000, max 600000; on timeout the script is asked to stop at its next vsblender.progress() call. background: default and max 600000; on timeout the job is stopped." },
       checkpoint: { type: "boolean", description: "Default true (from setup). false skips the automatic checkpoint (and with it the rollback on failure)." },
       atomic: { type: "boolean", description: "Default true: a failed or cancelled run is rolled back. false keeps the partial changes." },
       save: saveArg,
@@ -139,7 +139,7 @@ export const TOOLS: ToolDef[] = [
       reason: { type: "string" },
       function: { type: "string" },
       args: { type: "object" },
-      timeout_ms: { type: "number" },
+      timeout_ms: { type: "number", description: "As run_script: 60000 by default in Blender, 600000 for background." },
       checkpoint: { type: "boolean" },
       atomic: { type: "boolean" },
       save: saveArg,
@@ -157,10 +157,11 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "replay",
-    description: "The journaled script runs since the last save, in order: script, sha and reason. Lists them unless run is true, which executes them on the open file (each run is journaled again) and opens a Blender window first when this folder does not already have one. A script whose sha no longer matches the file on disk is named and skipped unless force is true.",
+    description: "The journaled script runs since the last save, in order: script, sha and reason. Lists them unless run is true, which executes them on the open file (each run is journaled again, with the same imports, printer and saving as run_script) and opens a Blender window first when this folder does not already have one. A script whose sha no longer matches the file on disk is named and skipped unless force is true.",
     inputSchema: obj({
       run: { type: "boolean", description: "Execute the runs. Default false: list them." },
       force: { type: "boolean", description: "Run a script even when its sha does not match the file on disk." },
+      save: saveArg,
     }),
   },
   {
@@ -197,7 +198,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "finish",
-    description: "End of this chat: save the open .blend and leave Blender open. Call it when the work is done, before stopping. A file that already matches the session is left as it is. Another folder's chat can then launch_blender with window \"close\" (quit this window and open theirs) or window \"new\" (a second window). It does not switch a window that has another folder's file. Refuses while reference objects are in the scene unless allow_references.",
+    description: "End of this chat: save the open .blend and leave Blender open. Call it when the work is done, before stopping. A file that already matches the session is reported as already saved (the usual case, as runs save themselves). The reply lists the runs it saved. Another folder's chat can then launch_blender with window \"close\" (quit this window and open theirs) or window \"new\" (a second window). It does not switch a window that has another folder's file. Refuses while reference objects are in the scene unless allow_references.",
     inputSchema: obj({
       reason: { type: "string", description: "What this save holds. Default: chat finished." },
       allow_references: allowReferences,
@@ -205,7 +206,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "save",
-    description: "Save the open .blend: the user's file, so call it when the user asked for a save (or allowed it in setup). Journaled with the reason; the watcher's re-ingest then logs the save as the AI's, pointing at its runs. Refuses while reference objects (vsblender_reference, _REF*) are in the scene unless allow_references. path saves as another workspace .blend (which becomes the open file; an existing file needs overwrite). compress defaults to true. At the end of a chat, call finish instead.",
+    description: "Save the open .blend now, with a reason. Runs already save themselves when they are done (\"allowSave\", on by default); in a folder that asks first (\"allowSave\": false), call this when the user asked for a save. Journaled with the reason; the reply lists the runs it put in the file, or says the editor or Blender saved them first. Refuses while reference objects (vsblender_reference, _REF*) are in the scene unless allow_references. path saves as another workspace .blend (which becomes the open file; an existing file needs overwrite). compress defaults to true. At the end of a chat, call finish instead.",
     inputSchema: obj({
       reason: { type: "string", description: "Why now: what this save holds." },
       path: { type: "string", description: "Save as this workspace .blend instead." },
@@ -253,11 +254,11 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "preview",
-    description: "Offscreen image. Never moves the user's viewport, camera or render settings. Axis views are orthographic, iso and camera are perspective. view camera uses the scene camera's aspect (camera picks another camera). Without a target, the frame is set on the main subject. Compositor, depth of field and motion blur are off unless asked for. region and crop frame a detail; overlay draws references (objects, STL/OBJ/3MF/SVG files, or references.json names) as wire, x-ray, silhouette, or shaded solid/cavity inside the scene; ref shows a registered reference on its own, shaded, without importing it; material shows one material on a sphere. Images that would be too large come back as a smaller JPEG. Works on the saved file when Blender is not running. Not kept unless save=true.",
+    description: "Offscreen image. Never moves the user's viewport, camera or render settings. Axis views are orthographic, iso and camera are perspective. view camera uses the scene camera's aspect (camera picks another camera). Without a target, the frame is set on the main subject. Compositor, depth of field and motion blur are off unless asked for. region and crop frame a detail; overlay draws references (objects, STL/OBJ/3MF/SVG files, or references.json names) as wire, x-ray, silhouette, or shaded solid/cavity inside the scene; ref shows a registered reference on its own, shaded, without importing it; material shows one material on a sphere. shading material or rendered on a scene with no lights (a print_mm file) is lit by a temporary studio light, and the reply says so. Images that would be too large come back as a smaller JPEG. path names another workspace .blend: its saved file is drawn in a background Blender. The reply names the file it drew. Not kept unless save=true.",
     inputSchema: obj({
       ...viewProps,
       ...solidProps,
-      material: { type: "string", description: "Preview one material on a sphere and floor (look-dev), e.g. MA:Brass. Material shading, 8 samples." },
+      material: { type: "string", description: "The NAME of one material to show on a sphere and floor (look-dev), e.g. MA:Brass. For the scene in lit material colours use shading: \"material\" instead (material: true is read as that)." },
       views: { type: "array", items: { type: "string" }, description: "Several views in one labelled contact sheet, e.g. [\"camera\", \"iso\", \"top\"]. Replaces view." },
       size: { type: "number", description: "Longest side in pixels, 64 to 4096. Default 512." },
       width: { type: "number" },
@@ -276,11 +277,12 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "check_model",
-    description: "Is the model fit for its purpose? Read-only. purpose general/render/game/print decides which checks run and how serious each is: open edges are fine for a render, a warning for a game asset, an error for a print. Checks the evaluated meshes (modifiers applied) at the current frame, or at frame: open edges and holes, non-manifold edges, flipped or inside-out normals, zero-area and coincident (z-fighting) faces, unapplied transforms, triangle budget, materials, UVs, flat shading, unit mix-ups. An object hidden by keyed visibility is reported as such (and from which frame it shows), and its own mesh is checked. For print, in mm against the printer profile: fits the build volume, self-intersections, bed contact, parts floating in mid-air, overhangs over the limit, thin walls (ray samples), and a rough filament estimate; suggest_orientation ranks orientations. Returns an image with problem faces coloured (temporary copies only). Works on the saved file when Blender is not running.",
+    description: "Is the model fit for its purpose? Read-only. purpose general/render/game/print decides which checks run and how serious each is: open edges are fine for a render, a warning for a game asset, an error for a print. Checks the evaluated meshes (modifiers applied) at the current frame, or at frame: open edges and holes, non-manifold edges, flipped or inside-out normals, zero-area and coincident (z-fighting) faces, unapplied transforms, triangle budget, materials, UVs, flat shading, unit mix-ups. An object hidden by keyed visibility is reported as such (and from which frame it shows), and its own mesh is checked. For print, in mm against the printer profile: fits the build volume (square-on, or only turned N degrees: vsblender.fit_on_bed gives the turn), self-intersections (faces that cut through or lie on each other, tested on the unwelded mesh so the result does not change with the pose), faces that only touch (T-junctions, or a skin across an opening), bed contact, parts floating in mid-air, overhangs over the limit, thin walls (ray samples; narrower than the nozzle is an error), and a rough filament estimate; suggest_orientation ranks orientations. A part that fails as posed (an assembled sector standing up) also gets how it does laid on its largest flat face; pose \"flat\" judges it that way. Hardware stand-ins (vsblender_hardware) are left out unless named. Returns an image with problem faces coloured (temporary copies only). Works on the saved file when Blender is not running.",
     inputSchema: obj({
       targets,
       purpose,
       printer,
+      pose: { type: "string", description: "print: as_is (default: as the part stands in the scene) or flat (laid on its largest flat face, as orient_flat does, on the bed)." },
       max_tris: { type: "number", description: "Triangle budget for purpose game. Default 50000." },
       deep: { type: "boolean", description: "Raise the limits of the slow checks (self-intersection, wall samples)." },
       suggest_orientation: { type: "boolean", description: "Print: rank orientations by overhang and bed contact." },
@@ -295,7 +297,7 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "export_model",
-    description: "Write models to files in the workspace (never overwrites unless overwrite=true). 3mf and stl are written from the evaluated meshes in millimetres; for purpose print, parts are placed on the bed and centred (3MF on the bed centre), each part named, ready for Bambu Studio, OrcaSlicer and PrusaSlicer. glb/gltf, fbx, usd/usdz, obj and ply use Blender's exporters in a background Blender on a copy of the session (your selection and settings are untouched); glTF and USD are written in metres. Default format: print 3mf, otherwise glb. Default folder: <blend folder>/exports/. Journaled.",
+    description: "Write models to files in the workspace (never overwrites unless overwrite=true). 3mf and stl are written from the evaluated meshes in millimetres; for purpose print, parts are placed on the bed and centred (3MF on the bed centre), each part named, ready for Bambu Studio, OrcaSlicer and PrusaSlicer. glb/gltf, fbx, usd/usdz, obj and ply use Blender's exporters in a background Blender on a copy of the session (your selection and settings are untouched); glTF and USD are written in metres. Multi-material printing (MMU, AMS): colours: true writes each object as one part with a volume per material, and parts {\"Ring A\": [\"Ring A Body\", \"Ring A Glyphs\"]} groups objects into one part, a volume each; every volume carries its extruder (extruders maps a material or object name to a number; the rest are numbered in order), for PrusaSlicer (Slic3r_PE_model.config) or Bambu Studio / OrcaSlicer (model_settings.config). Hardware stand-ins (vsblender_hardware) are left out unless named. Default format: print 3mf, otherwise glb. Default folder: <blend folder>/exports/. Journaled.",
     inputSchema: obj({
       targets,
       format: { type: "string", description: "3mf, stl, glb, gltf, fbx, obj, usd, usdz, ply." },
@@ -306,6 +308,10 @@ export const TOOLS: ToolDef[] = [
       place_on_bed: { type: "boolean", description: "Lowest point to z = 0 (default true for print)." },
       center: { type: "boolean", description: "Centre on the bed (3mf) or the origin (default true for print)." },
       assembly: { type: "boolean", description: "3mf: one object made of the parts, instead of separate objects." },
+      colours: { type: "boolean", description: "3mf: one part per object, one volume per material, each with its extruder." },
+      parts: { type: "object", description: "3mf: {part name: [object names]}: each part is one object, each object a volume (and each of its materials, when it has several). Implies colours." },
+      extruders: { type: "object", description: "With colours or parts: {material or object name (or \"object/material\"): extruder number}. Unnamed materials get the next numbers in order." },
+      slicer: { type: "string", description: "With colours or parts: prusa (PrusaSlicer), bambu or orca. Default from the printer profile (a Bambu preset: bambu; otherwise prusa)." },
       ascii: { type: "boolean", description: "stl: ASCII instead of binary." },
       apply_modifiers: { type: "boolean", description: "Default true." },
       mm_per_unit: { type: "number", description: "Override the scene's unit for stl/3mf." },
@@ -346,8 +352,8 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "restore_checkpoint",
-    description: "Replace the open session's data with a checkpoint's (\"last\" for the newest). Opens a Blender window first when this folder does not already have one. Checkpoints the current state first, keeps the file path, and is one undo step. The file on disk is not touched.",
-    inputSchema: obj({ id: { type: "string" }, reason: { type: "string" } }, ["id"]),
+    description: "Replace the open session's data with a checkpoint's (\"last\" for the newest). Opens a Blender window first when this folder does not already have one. Checkpoints the current state first, keeps the file path, and is one undo step. Then saved like a run (unless the folder asks first, or save: false).",
+    inputSchema: obj({ id: { type: "string" }, reason: { type: "string" }, save: saveArg }, ["id"]),
   },
   {
     name: "api",
@@ -370,14 +376,24 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "find",
-    description: "Objects matching a selector, with why each matched. Terms: name glob (\"SG Rock *\"), type:MESH, collection:X, material:X, parent:X, children_of:X, role~text, has:modifier[:TYPE], has:constraint, prop:key[=value], built_by:script, part:name (built by vsblender.part), from:file (appended), animated, emissive, visible, hidden, selected, active, derived, built, reference (measuring references), stage (template floor, build plate), within:[x0,y0,z0,x1,y1,z1], near:\"X\"<2 (scene units). Combine with and, or, not, ( ). Read-only. Works on the saved file when Blender is not running.",
+    description: "Objects matching a selector, with why each matched. Terms: name glob (\"SG Rock *\"), type:MESH, collection:X, material:X, parent:X, children_of:X, role~text, has:modifier[:TYPE], has:constraint, prop:key[=value], built_by:script, part:name (built by vsblender.part), from:file (appended), animated, emissive, visible, hidden, selected, active, derived, built, reference (measuring references), stage (template floor, build plate), hardware (stand-ins marked vsblender_hardware), within:[x0,y0,z0,x1,y1,z1], near:\"X\"<2 (scene units). Combine with and, or, not, ( ). Read-only. Works on the saved file when Blender is not running.",
     inputSchema: obj({ selector: { type: "string" }, limit: { type: "number" }, path: blendPath }, ["selector"]),
   },
   {
     name: "spatial",
-    description: "World-space geometry questions, after modifiers. op: bbox (targets), raycast (origin, direction, max_distance), drop (points [[x,y]...], optional targets, from_z: the surface below each point), distance (a, b: gap per axis, overlap), nearest / below / above / touching (target, k, tolerance), within (min, max). targets is a list of names or a find selector. Scene units (the reply's units field; 1 BU = 1 mm in print projects). Read-only. Works on the saved file when Blender is not running.",
+    description: "World-space geometry questions, after modifiers. op: bbox (targets), raycast (origin, direction, max_distance), drop (points [[x,y]...], optional targets, from_z: the surface below each point), distance (a, b: gap per axis, overlap), nearest / below / above / touching (target, k, tolerance), within (min, max), sweep (a moving part's clearance: object moves through motion, tested at each step against against (default: the rest of the scene, hardware stand-ins included): collisions (faces crossing, or one inside the other) and the smallest gap, per part), through (are openings open: rays from points inside each of loops, outlines in frame's XY plane, starting at local z start and running along direction for length, against targets; reports the rays blocked and by what). sweep and through move nothing in the scene. targets is a list of names or a find selector. Scene units (the reply's units field; 1 BU = 1 mm in print projects). Read-only. Works on the saved file when Blender is not running.",
     inputSchema: obj({
       op: { type: "string" },
+      object: { description: "sweep: the part that moves (a name or a list)." },
+      against: { description: "sweep: the parts that stand still (names or a selector). Default: every other visible part." },
+      motion: { type: "object", description: "sweep: {rotate: {axis: \"Z\" | [x, y, z], pivot: [x, y, z] | object name, angles: [..] | {from, to, step}}} or {translate: [dx, dy, dz], steps: 20}; frame: an object whose local axes the axis, pivot and translate are in (a gate root)." },
+      reach: { type: "number", description: "sweep: parts further than this from anywhere the mover goes are listed as out of reach, not measured. Default a quarter of the mover's size." },
+      samples: { type: "number", description: "sweep: vertices sampled for the gap (default 1500); through: rays per opening (default 30)." },
+      loops: { type: "array", description: "through: openings, each a 2D outline [[x, y], ...] (or a list of outlines with holes) in frame's XY plane." },
+      labels: { type: "array", items: { type: "string" }, description: "through: a name per opening." },
+      frame: { type: "string", description: "sweep, through: the object whose local frame the coordinates are in. Default world." },
+      start: { type: "number", description: "through: local z the rays start from." },
+      length: { type: "number", description: "through: how far the rays run." },
       targets: { description: "List of object names, or a find selector string." },
       target: { type: "string" },
       a: { type: "string" },
@@ -390,7 +406,7 @@ export const TOOLS: ToolDef[] = [
       min: { type: "array", items: { type: "number" } },
       max: { type: "array", items: { type: "number" } },
       k: { type: "number" },
-      tolerance: { type: "number", description: "touching: largest gap that counts. Default 0.5% of the target's size." },
+      tolerance: { type: "number", description: "touching: largest gap that counts. Default 0.5% of the target's size. sweep: a gap under this is marked TIGHT." },
       path: blendPath,
     }, ["op"]),
   },
@@ -492,8 +508,8 @@ export const TOOL_NAMES = TOOLS.map((tool) => tool.name);
  * Run without a permission prompt. Setup writes these as Claude Code allow rules.
  * Grok reads that file. Cline copies the names into alwaysAllow.
  * The build tools are included so a modelling loop does not stop on yes for every call.
- * save and finish write the user's .blend and stay on ask, with doctor_fix,
- * launch_blender_background, import_reference, and reference.
+ * save and finish are added when the folder saves on its own (allowSave, the default; SAVE_TOOLS).
+ * doctor_fix, launch_blender_background, import_reference, and reference stay on ask.
  */
 export const AUTO_APPROVE = [
   "doctor",
@@ -538,8 +554,10 @@ export const PIPELINE_TOOL = "run_pipeline";
 export const TRUSTED_SCRIPT_TOOL = "run_project_script";
 /** run_pipeline restricted to trusted folders. On the shared allow list with run_project_script. */
 export const TRUSTED_PIPELINE_TOOL = "run_project_pipeline";
-/** Saves the user's .blend. Asks each time unless the user ticks it in setup. */
+/** Saves the user's .blend. Runs without asking while the folder saves on its own (allowSave). */
 export const SAVE_TOOL = "save";
+/** The tools that write the user's .blend: allowed together with allowSave, asked about without it. */
+export const SAVE_TOOLS = ["save", "finish"];
 
 export function claudeRule(tool: string): string {
   return `mcp__vsblender__${tool}`;

@@ -50,6 +50,15 @@ export function listBlendFiles(root: string, maxDepth = 6): string[] {
   return found;
 }
 
+/**
+ * Whether opening a folder should show the setup panel: only a folder that has a .blend and is not
+ * set up yet, with the setting on, once per window. VS Code can activate the extension in folders
+ * without one (a workspaceContains search that times out on a big drive activates it anyway).
+ */
+export function shouldOfferSetup(state: { configured: boolean; hasBlend: boolean; setting: boolean; offered?: boolean }): boolean {
+  return !state.configured && state.hasBlend && state.setting && !state.offered;
+}
+
 export function fileSha256(file: string): string | undefined {
   try {
     const hash = crypto.createHash("sha256");
@@ -71,6 +80,37 @@ export function ingestStatus(blendFile: string): IngestStatus {
   } catch {
     return "stale";
   }
+}
+
+/**
+ * Whether the sidecar's preview images show this version of the file. current: rendered from it.
+ * older: rendered from an earlier version (an ingest that skipped previews kept them). unrecorded:
+ * images from before 0.8.0, with no record of what they show. none: no images.
+ */
+export type PreviewsStatus = "current" | "older" | "unrecorded" | "none";
+
+export function previewsStatus(blendFile: string, sha?: string): { status: PreviewsStatus; renderedAt?: string } {
+  const dir = path.join(sidecarDir(blendFile), "previews");
+  let index: { sha256?: string; rendered_at?: string; source?: string } | undefined;
+  try {
+    index = JSON.parse(fs.readFileSync(path.join(dir, "previews.json"), "utf8"));
+  } catch {
+    index = undefined;
+  }
+  if (!index) {
+    let images = false;
+    try {
+      images = fs.readdirSync(dir).some((name) => name.toLowerCase().endsWith(".png") && name !== "click.png");
+    } catch {
+      images = false;
+    }
+    return { status: images ? "unrecorded" : "none" };
+  }
+  const current = sha ?? fileSha256(blendFile);
+  const renderedAt = typeof index.rendered_at === "string" ? index.rendered_at : undefined;
+  // A live ingest renders the session, which can be ahead of the file: compare only disk renders.
+  const same = index.source === "live" ? true : Boolean(current) && index.sha256 === current;
+  return { status: same ? "current" : "older", ...(renderedAt ? { renderedAt } : {}) };
 }
 
 export interface CheckpointEntry {

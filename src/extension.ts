@@ -2,12 +2,12 @@ import * as fs from "fs";
 import * as path from "path";
 import * as vscode from "vscode";
 import { clickPreviewPath, clickPreviewScript, existingPreview, renderClickPreview } from "./blendPreview";
-import { ingestStatus, listBlendFiles, relativeTo } from "./blendFiles";
+import { ingestStatus, listBlendFiles, relativeTo, shouldOfferSetup } from "./blendFiles";
 import { callBridge, probeBridge } from "./bridge";
 import { serverLaunch } from "./configWrite";
 import { findNode } from "./findBlender";
 import { runIngest, ingestScript } from "./ingest";
-import { readConfig } from "./projectConfig";
+import { readConfig, writeConfig } from "./projectConfig";
 import { syncRuntime } from "./runtime";
 import { showSetup } from "./setup";
 import { installIfStale } from "./doctor";
@@ -26,6 +26,28 @@ const ingestQueue: { file: string; actor: string; manual: boolean }[] = [];
 /** Journal files already offered a save for this dirty streak. A save event clears the key. */
 const dirtyJournals = new Set<string>();
 let draining = false;
+/** Whether the folder has a .blend (undefined until searched), and whether setup was offered in this window. */
+let blendKnown: { folder: string; has: boolean } | undefined;
+let setupOffered = false;
+
+/** A file search that stops at the first .blend, skipping build and sidecar folders. */
+async function folderHasBlend(folder: string): Promise<boolean> {
+  if (blendKnown?.folder === folder) return blendKnown.has;
+  let has: boolean;
+  try {
+    const found = await vscode.workspace.findFiles(new vscode.RelativePattern(vscode.Uri.file(folder), "**/*.blend"),
+      "**/{node_modules,.git,.blender-ai,out,dist}/**", 1);
+    has = found.length > 0;
+  } catch {
+    has = listBlendFiles(folder, 3).length > 0;
+  }
+  blendKnown = { folder, has };
+  return has;
+}
+
+function setupSetting(): boolean {
+  return vscode.workspace.getConfiguration("vsblender").get<boolean>("showSetupOnStartup") !== false;
+}
 
 function workspaceRoot(): string | undefined {
   if (cachedRoot) return cachedRoot.folder;
@@ -197,10 +219,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
     const config = readConfig(folder);
     if (!config) {
+      // A folder with no .blend has nothing to set up: no status item there.
+      if (blendKnown?.folder === folder && !blendKnown.has) {
+        status.hide();
+        return;
+      }
+      status.show();
       status.text = "$(gear) Blender: setup";
       status.tooltip = "VSBlender: Setup";
       return;
     }
+    status.show();
     const probe = await probeBridge(config.port);
     if (probe.ok) {
       const share = typeof probe.progress?.fraction === "number" ? ` ${Math.round(probe.progress.fraction * 100)}%` : "";
@@ -335,9 +364,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cachedRoot = undefined;
     scheduleRefresh(context, folder, output);
   };
+  // The first .blend in a folder that is not set up yet: offer setup then (once per window).
+  const onFirstBlend = (uri: vscode.Uri): void => {
+    const folder = root();
+    if (!folder || readConfig(folder) || !ownBlend(folder, uri)) return;
+    blendKnown = { folder, has: true };
+    void refreshStatus();
+    if (shouldOfferSetup({ configured: false, hasBlend: true, setting: setupSetting(), offered: setupOffered })) {
+      setupOffered = true;
+      void showSetup(context, folder, output, runtimeRoot(context, output), onConfigured);
+    }
+  };
   blendWatcher.onDidCreate((uri) => {
     onBlend(uri);
     onBlendSet(uri);
+    onFirstBlend(uri);
   });
   blendWatcher.onDidChange(onBlend);
   blendWatcher.onDidDelete(onBlendSet);
@@ -352,13 +393,40 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   const folder = root();
   if (!folder) return;
   if (!readConfig(folder)) {
-    // Not awaited: activation should not wait on the Blender search behind the setup panel.
-    if (vscode.workspace.getConfiguration("vsblender").get<boolean>("showSetupOnStartup") !== false) {
-      void showSetup(context, folder, output, runtimeRoot(context, output), onConfigured);
-    }
+    // Only a folder with a .blend gets the setup panel. Not awaited: activation should not wait on
+    // the file search or the Blender search behind the panel.
+    void (async () => {
+      const hasBlend = await folderHasBlend(folder);
+      void refreshStatus();
+      if (shouldOfferSetup({ configured: false, hasBlend, setting: setupSetting(), offered: setupOffered })) {
+        setupOffered = true;
+        void showSetup(context, folder, output, runtimeRoot(context, output), onConfigured);
+      } else if (!hasBlend) {
+        output.appendLine("No .blend in this folder, so VSBlender setup was not opened. Run VSBlender: Setup to set it up anyway.");
+      }
+    })();
     return;
   }
   void startWorkspace(context, folder, output);
+}
+
+/**
+ * A folder that asks before saving ("allowSave": false): offer to save after every run instead, once
+ * per start. Keeping it as it is leaves the ask-first flow: the editor offers Save after a run.
+ */
+async function askAboutSaving(context: vscode.ExtensionContext, folder: string, output: vscode.OutputChannel): Promise<void> {
+  const choice = await vscode.window.showInformationMessage(
+    "VSBlender: this folder asks before saving .blend files (\"allowSave\": false), so the AI's runs stay unsaved until you save. "
+      + "Save after every run instead?",
+    "Save after every run",
+    "Keep asking"
+  );
+  if (choice !== "Save after every run") return;
+  const config = readConfig(folder);
+  if (!config) return;
+  writeConfig(folder, { ...config, allowSave: true });
+  output.appendLine("allowSave is on: each run saves the .blend when it is done; save and finish run without asking.");
+  await refreshClientFiles(context, folder, output);
 }
 
 async function ensureAddon(context: vscode.ExtensionContext, folder: string, output: vscode.OutputChannel): Promise<void> {
@@ -374,10 +442,15 @@ async function ensureAddon(context: vscode.ExtensionContext, folder: string, out
   }
 }
 
-/** One notification when a build leaves the file on disk behind. Save uses the same save_file path as the save tool. */
+/**
+ * One notification when a build leaves the file on disk behind, in a folder that asks before saving
+ * ("allowSave": false). Where runs save themselves there is nothing to offer. Save uses the same
+ * save_file path as the save tool.
+ */
 async function offerSave(uri: vscode.Uri): Promise<void> {
   const folder = workspaceRoot();
-  if (!folder || !readConfig(folder)) return;
+  const settings = folder ? readConfig(folder) : undefined;
+  if (!folder || !settings || settings.allowSave !== false) return;
   const key = uri.fsPath;
   let last = "";
   try {
@@ -427,6 +500,7 @@ async function offerSave(uri: vscode.Uri): Promise<void> {
 async function startWorkspace(context: vscode.ExtensionContext, folder: string, output: vscode.OutputChannel): Promise<void> {
   void ensureAddon(context, folder, output);
   await refreshClientFiles(context, folder, output);
+  if (readConfig(folder)?.allowSave === false) void askAboutSaving(context, folder, output);
   if (!autoIngestOn()) return;
   for (const file of listBlendFiles(folder)) {
     // A "live" sidecar was written on purpose from an unsaved session; re-reading the file would lose it.
@@ -459,7 +533,8 @@ async function refreshClientFiles(context: vscode.ExtensionContext, folder: stri
       launch,
       ...(config.allowScripts !== undefined ? { allowScripts: config.allowScripts } : {}),
       ...(config.allowTrustedScripts !== undefined ? { allowTrustedScripts: config.allowTrustedScripts } : {}),
-      ...(config.allowSave !== undefined ? { allowSave: config.allowSave } : {}),
+      // Unset means on: the permission rules for save and finish follow.
+      allowSave: config.allowSave !== false,
       ...(config.ignoreClientConfig !== undefined ? { ignoreClientConfig: config.ignoreClientConfig } : {}),
       ...(config.checkpoints ? { checkpoints: config.checkpoints } : {}),
       ...(config.libPaths ? { libPaths: config.libPaths } : {}),
