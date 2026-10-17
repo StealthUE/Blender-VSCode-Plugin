@@ -21,16 +21,17 @@ export function existingPreview(blendFile: string): string | undefined {
     return undefined;
   }
   const dir = path.join(sidecarDir(blendFile), "previews");
-  const recorded = previewsStatus(blendFile).status;
+  const recorded = previewsStatus(blendFile);
   for (const name of PREVIEW_NAMES) {
     const file = path.join(dir, name);
     try {
       const stat = fs.statSync(file);
       if (!stat.isFile() || stat.size <= 0) continue;
       const fresh = stat.mtimeMs + 1000 >= blendTime;
-      if (name === "click.png" || recorded === "unrecorded" || recorded === "none") {
+      // Without a previews.json each still is judged by its own time.
+      if (name === "click.png" || recorded.fromTimes || recorded.status === "none") {
         if (fresh) return file;
-      } else if (recorded === "current") {
+      } else if (recorded.status === "current") {
         return file;
       }
     } catch {

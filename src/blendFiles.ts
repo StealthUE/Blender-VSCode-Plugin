@@ -84,12 +84,22 @@ export function ingestStatus(blendFile: string): IngestStatus {
 
 /**
  * Whether the sidecar's preview images show this version of the file. current: rendered from it.
- * older: rendered from an earlier version (an ingest that skipped previews kept them). unrecorded:
- * images from before 0.8.0, with no record of what they show. none: no images.
+ * older: rendered from an earlier version (an ingest that skipped previews kept them). none: no images.
+ * previews.json records the version a set was rendered from. Stills from before 0.8.0 have no record:
+ * an ingest renders its stills just after the file is saved, so stills at least as new as the .blend
+ * show it, and older ones do not (fromTimes says the answer came from the file times).
  */
-export type PreviewsStatus = "current" | "older" | "unrecorded" | "none";
+export type PreviewsStatus = "current" | "older" | "none";
 
-export function previewsStatus(blendFile: string, sha?: string): { status: PreviewsStatus; renderedAt?: string } {
+/** A time as the add-on writes it: local, with its offset, to the second (2026-10-03T14:02:11+10:00). */
+export function localIso(ms: number): string {
+  const offset = -new Date(ms).getTimezoneOffset();
+  const pad = (n: number): string => String(Math.floor(Math.abs(n))).padStart(2, "0");
+  const local = new Date(ms + offset * 60000).toISOString().slice(0, 19);
+  return `${local}${offset >= 0 ? "+" : "-"}${pad(offset / 60)}:${pad(offset % 60)}`;
+}
+
+export function previewsStatus(blendFile: string, sha?: string): { status: PreviewsStatus; renderedAt?: string; fromTimes?: boolean } {
   const dir = path.join(sidecarDir(blendFile), "previews");
   let index: { sha256?: string; rendered_at?: string; source?: string } | undefined;
   try {
@@ -98,13 +108,25 @@ export function previewsStatus(blendFile: string, sha?: string): { status: Previ
     index = undefined;
   }
   if (!index) {
-    let images = false;
+    let newest = 0;
     try {
-      images = fs.readdirSync(dir).some((name) => name.toLowerCase().endsWith(".png") && name !== "click.png");
+      for (const name of fs.readdirSync(dir)) {
+        if (!name.toLowerCase().endsWith(".png") || name === "click.png") continue;
+        newest = Math.max(newest, fs.statSync(path.join(dir, name)).mtimeMs);
+      }
     } catch {
-      images = false;
+      newest = 0;
     }
-    return { status: images ? "unrecorded" : "none" };
+    if (!newest) return { status: "none" };
+    let blendTime = 0;
+    try {
+      blendTime = fs.statSync(blendFile).mtimeMs;
+    } catch {
+      blendTime = 0;
+    }
+    // A second of slack: some file systems store times in whole seconds.
+    const fresh = newest + 1000 >= blendTime;
+    return { status: fresh ? "current" : "older", renderedAt: localIso(newest), fromTimes: true };
   }
   const current = sha ?? fileSha256(blendFile);
   const renderedAt = typeof index.rendered_at === "string" ? index.rendered_at : undefined;

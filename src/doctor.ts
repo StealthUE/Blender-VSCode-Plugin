@@ -241,9 +241,10 @@ export async function runDoctor(
       const fold = (p: string): string => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p));
       const open = live.file && fold(live.file) === fold(file);
       const previews = previewsStatus(file);
+      // Stills from before 0.8.0 have no previews.json; their file times decide, so an upgrade adds no notes.
       const note = previews.status === "older"
-        ? `; previews from ${previews.renderedAt ?? "an earlier ingest"} are OLDER than the file (ingest with previews)`
-        : previews.status === "unrecorded" ? "; previews of unknown age (ingest with previews to record them)" : "";
+        ? `; previews from ${previews.renderedAt?.slice(0, 16).replace("T", " ") ?? "an earlier ingest"} are OLDER than the file (ingest with previews)`
+        : "";
       if (open && live.status) {
         return `${rel} (${live.status}, open in Blender${live.dirty ? " with unsaved changes" : ""}${live.status === "current" ? "" : `: ${live.detail ?? ""}`}${note})`;
       }
