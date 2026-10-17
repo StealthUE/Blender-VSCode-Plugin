@@ -229,6 +229,86 @@ def orient_flat(obj, method: str = "largest_face", max_overhang_deg: float = 45.
             "overhang_area": round(over, 6), "units": units_mod.label()}
 
 
+def _hull_2d(points: np.ndarray) -> np.ndarray:
+    """Convex hull of 2D points (monotone chain), counter-clockwise."""
+    pts = np.unique(np.round(np.asarray(points, dtype=np.float64)[:, :2], 9), axis=0)
+    if len(pts) < 3:
+        return pts
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and (out[-1][0] - out[-2][0]) * (p[1] - out[-2][1]) - \
+                    (out[-1][1] - out[-2][1]) * (p[0] - out[-2][0]) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+
+    lower = half(pts)
+    upper = half(pts[::-1])
+    return np.array(lower[:-1] + upper[:-1])
+
+
+def bed_fit(points_xy, bed_xy, margin: float = 0.0, step: float = 0.5) -> dict | None:
+    """The turn about Z (degrees, counter-clockwise seen from above, 0..180) that fits a flat outline on
+    a bed with the most room to spare, or None when no turn fits. Same units for points, bed and margin.
+
+    Returns {angle, w, h, spare, square}: the outline's size turned, the smaller room left on the two
+    axes, and whether it also fits square-on (0 or 90 degrees)."""
+    hull = _hull_2d(np.asarray(points_xy, dtype=np.float64))
+    if not len(hull):
+        return None
+    bx, by = float(bed_xy[0]) - 2 * margin, float(bed_xy[1]) - 2 * margin
+    angles = np.arange(0.0, 180.0, max(float(step), 0.01))
+    t = np.radians(angles)
+    c, s = np.cos(t)[:, None], np.sin(t)[:, None]
+    xs = hull[None, :, 0] * c - hull[None, :, 1] * s
+    ys = hull[None, :, 0] * s + hull[None, :, 1] * c
+    w = xs.max(axis=1) - xs.min(axis=1)
+    h = ys.max(axis=1) - ys.min(axis=1)
+    spare = np.minimum(bx - w, by - h)
+    square = bool((spare[angles == 0.0] >= 0).any() or (spare[np.isclose(angles, 90.0)] >= 0).any())
+    best = int(np.argmax(spare))
+    if spare[best] < 0:
+        return None
+    if square:
+        # Square-on is easier to place: prefer it when it fits, with the room it leaves.
+        options = [i for i in (0, int(np.argmin(np.abs(angles - 90.0)))) if spare[i] >= 0]
+        best = max(options, key=lambda i: spare[i])
+    return {"angle": round(float(angles[best]), 2), "w": round(float(w[best]), 3), "h": round(float(h[best]), 3),
+            "spare": round(float(spare[best]), 3), "square": square}
+
+
+def fit_on_bed(item, printer: dict | None = None, margin: float | None = None, step: float = 0.5) -> dict | None:
+    """How a part fits the printer's bed lying as it is: the turn about Z with the most room spare.
+
+    item: an object (its evaluated mesh, world space), a geo Solid, or points [(x, y), ...] in scene
+    units. printer: a profile (default the workspace's, vsblender.printer()). margin: millimetres kept
+    clear at the bed's edges (default 2). Returns {angle, w_mm, h_mm, spare_mm, square} or None when it
+    does not fit at any turn: then split it (geo.ring(...).split, plan_split) or lay it another way.
+    angle turns the part counter-clockwise seen from above."""
+    from . import helpers
+
+    profile = dict(helpers.DEFAULT_PRINTER)
+    profile.update(printer or helpers.printer() or {})
+    bed = profile.get("build_volume") or [220, 220, 250]
+    to_mm = units_mod.units()["bu_to_mm"]
+    if isinstance(item, (bpy.types.Object, str)):
+        bpy.context.view_layer.update()
+        pts = _points(_list(item), bpy.context.evaluated_depsgraph_get())
+    elif hasattr(item, "bm"):
+        pts = np.array([v.co[:] for v in item.bm.verts], dtype=np.float64)
+    else:
+        pts = np.asarray(item, dtype=np.float64)
+    if not len(pts):
+        raise ValueError("fit_on_bed: no points")
+    fit = bed_fit(pts[:, :2] * to_mm, bed[:2], 2.0 if margin is None else float(margin), step)
+    if fit is None:
+        return None
+    return {"angle": fit["angle"], "w_mm": fit["w"], "h_mm": fit["h"], "spare_mm": fit["spare"], "square": fit["square"],
+            "bed_mm": [float(bed[0]), float(bed[1])]}
+
+
 def stats(obj) -> dict:
     """Triangles, size, volume, area, shells and whether the evaluated mesh is closed."""
     ob = _list(obj)[0]

@@ -178,8 +178,8 @@ def subject_bounds(objects):
 def _look_at(cam, location, target, view: str) -> None:
     """A camera looks down its local -Z with local Y up. Top and bottom have no single up, so they are set.
 
-    Other views go through vsblender.aim, which picks an up axis that is not the view direction.
-    to_track_quat("-Z", "Y") is degenerate when the camera looks along world Y.
+    Other views go through vsblender.aim, which builds the rotation from a look-at basis with world Z
+    up: the front, back, left, right and iso views all come out with the model upright.
     """
     cam.location = location
     if view == "top":
@@ -570,6 +570,30 @@ def _material_ball(material_name: str, temps: _Temps):
     sun = temps.add(bpy.data.objects.new("_vsblender_ball_sun", sun_data))
     sun.rotation_euler = (math.radians(50.0), 0.0, math.radians(35.0))
     return [ball, floor, sun], (Vector((-1.2, -1.2, -0.05)), Vector((1.2, 1.2, 2.2)))
+
+
+def _needs_studio_light(scene) -> bool:
+    """No light renders in the preview scene and the world gives little light (a print_mm file)."""
+    for ob in scene.objects:
+        if ob.type == "LIGHT" and not ob.hide_render and getattr(ob.data, "energy", 0.0) > 0:
+            return False
+    strength = _world_strength(scene)
+    return scene.world is None or strength is None or strength < 0.5
+
+
+def _studio_light(collection, temps: _Temps) -> list:
+    """Key, fill and rim suns (directions only, so they light any size of model), removed with the preview."""
+    made = []
+    for name, energy, rot in (("key", 3.0, (50.0, 0.0, 35.0)), ("fill", 1.0, (60.0, 0.0, -110.0)),
+                              ("rim", 1.5, (-55.0, 0.0, 160.0))):
+        data = temps.add(bpy.data.lights.new(f"_vsblender_studio_{name}", "SUN"))
+        data.energy = energy
+        data.angle = math.radians(10.0)
+        ob = temps.add(bpy.data.objects.new(f"_vsblender_studio_{name}", data))
+        ob.rotation_euler = tuple(math.radians(a) for a in rot)
+        collection.objects.link(ob)
+        made.append(ob)
+    return made
 
 
 # ----------------------------------------------------------------------------- overlays
@@ -1198,6 +1222,12 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
         raise ValueError("camera must be the name of a camera object")
     view = "camera" if camera_name else str(params.get("view") or "iso")
     material_name = params.get("material")
+    if material_name is True or str(material_name).lower() in ("true", "yes"):
+        # material names one material to show on a ball; material: true means material shading.
+        material_name = None
+        params = dict(params, shading=params.get("shading") or "material")
+    elif material_name is False:
+        material_name = None
     shading = str(params.get("shading") or ("material" if material_name else "solid"))
     if view != "camera" and view not in VIEWS:
         raise ValueError("view must be camera, front, back, left, right, top, bottom, or iso")
@@ -1400,6 +1430,11 @@ def render_view(params: dict, out: str, objects=None, root: str | None = None):
                 scene.view_settings.look = src.view_settings.look
             except Exception:
                 pass
+            if not material_name and engine != "BLENDER_WORKBENCH" and _needs_studio_light(scene):
+                _studio_light(private, temps)
+                applied.append("studio light")
+                warnings.append(f"the scene has no lights and a dark world, so this {shading} preview is lit by a "
+                                "temporary studio light (three suns); the file is unchanged")
         if shading == "rendered":
             _copy_rna(getattr(src, "eevee", None), getattr(scene, "eevee", None))
             _copy_rna(getattr(src, "cycles", None), getattr(scene, "cycles", None), skip={"device"})

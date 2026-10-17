@@ -47,7 +47,7 @@ from collections import Counter, defaultdict
 
 import bmesh
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 
 def _load_snapshot():
@@ -1112,12 +1112,13 @@ def render_previews(out, man, args):
     r.resolution_percentage = 100
     r.image_settings.file_format = "PNG"
 
-    def shoot(fname, label):
+    def shoot(fname, label, objects=None):
         r.filepath = os.path.join(pdir, fname)
         t = time.time()
         try:
             bpy.ops.render.render(write_still=True)
-            results.append({"file": f"previews/{fname}", "view": label, "seconds": round(time.time() - t, 1)})
+            results.append({"file": f"previews/{fname}", "view": label, "seconds": round(time.time() - t, 1),
+                            **({"objects": int(objects)} if objects else {})})
         except Exception as e:
             results.append({"file": None, "view": label, "error": str(e)})
 
@@ -1169,7 +1170,8 @@ def render_previews(out, man, args):
             cd.lens, cd.sensor_width = 50.0, 36.0
             dist = (diag / 2) / math.sin(math.atan(18.0 / 50.0)) * 1.05
         cam.location = c - Vector(d).normalized() * dist
-        # to_track_quat(..., "Y") is degenerate when the view looks along world Y (the front of a gate).
+        # A look-at basis keeps world up at the top of the image (helpers.look_rotation); to_track_quat's
+        # second argument is the camera's own axis, which left back and side views rolled.
         try:
             from . import helpers
             helpers.aim(cam, c, track="-Z")
@@ -1179,9 +1181,10 @@ def render_previews(out, man, args):
                 cam.rotation_euler = (0.0, 0.0, 0.0)
             else:
                 dn = direction.normalized()
-                axes = (("Z", Vector((0.0, 0.0, 1.0))), ("Y", Vector((0.0, 1.0, 0.0))), ("X", Vector((1.0, 0.0, 0.0))))
-                up = min(axes, key=lambda item: abs(float(dn.dot(item[1]))))[0]
-                cam.rotation_euler = direction.to_track_quat("-Z", up).to_euler()
+                up = Vector((0.0, 1.0, 0.0)) if dn.z < -0.9998 else Vector((0.0, -1.0, 0.0)) if dn.z > 0.9998 \
+                    else Vector((0.0, 0.0, 1.0))
+                right = dn.cross(up).normalized()
+                cam.rotation_euler = Matrix((right, right.cross(dn).normalized(), -dn)).transposed().to_euler()
         cd.clip_start, cd.clip_end = max(0.001, dist * 0.001), dist * 4 + diag
 
     main = set(man["objects"]) - set(excluded)
@@ -1192,7 +1195,8 @@ def render_previews(out, man, args):
     for name, d, ortho in (("front", (0, 1, 0), True), ("right", (-1, 0, 0), True),
                            ("top", (0, 0, -1), True), ("iso", (-1, 1, -0.8), False)):
         aim(bounds[0], bounds[1], d, ortho)
-        shoot(f"{name}.png", f"{name} ({'orthographic' if ortho else 'perspective'}, Workbench random colours{note})")
+        shoot(f"{name}.png", f"{name} ({'orthographic' if ortho else 'perspective'}, Workbench random colours{note})",
+              sum(1 for n in main if man["objects"][n].get("bbox")))
     if scattered:
         whole, _excl, _ = framing(man)
         aim(whole[0], whole[1], (0, 0, -1), True)
@@ -1206,7 +1210,7 @@ def render_previews(out, man, args):
             continue
         show_only(members)
         aim(gb[0], gb[1], (-1, 1, -0.8), False)
-        shoot(f"{fname}.png", f"{label}: {len(members)} objects (perspective, Workbench)")
+        shoot(f"{fname}.png", f"{label}: {len(members)} objects (perspective, Workbench)", len(members))
     show_only(None)
     return results
 
@@ -1248,6 +1252,40 @@ def preview_groups(man, main, scene):
     return groups
 
 
+PREVIEW_INDEX = "previews.json"
+
+
+def _preview_index(out, previews, sha, signature, source, man) -> list:
+    """Record what the previews were rendered from (previews/previews.json), or, when this ingest drew
+    none, keep the old images listed as older than the file. Returns the previews NOTES lists."""
+    pdir = os.path.join(out, "previews")
+    path = os.path.join(pdir, PREVIEW_INDEX)
+    drawn = [p for p in previews if p.get("file")]
+    if drawn:
+        visible = sum(1 for o in man["objects"].values() if o.get("bbox") and not (o.get("hidden") or {}).get("render"))
+        write_json(path, {"sha256": sha, "signature": signature, "source": source, "rendered_at": now(),
+                          "objects_visible": visible, "views": previews})
+        return previews
+    old = load_json(path)
+    if isinstance(old, dict) and isinstance(old.get("views"), list):
+        kept = [v for v in old["views"] if v.get("file") and os.path.isfile(os.path.join(out, v["file"]))]
+        same = old.get("signature") == signature if source == "live" else old.get("sha256") == sha
+        if kept and not same:
+            man["previews_stale"] = {"rendered_at": old.get("rendered_at"), "sha256": old.get("sha256")}
+        return kept
+    # A sidecar from before 0.8.0: images without a record. Their age is all there is to go on.
+    try:
+        files = sorted(f for f in os.listdir(pdir) if f.endswith(".png"))
+    except OSError:
+        return []
+    if not files:
+        return []
+    newest = max(os.path.getmtime(os.path.join(pdir, f)) for f in files)
+    man["previews_stale"] = {"rendered_at": datetime.datetime.fromtimestamp(newest).astimezone().isoformat(timespec="seconds"),
+                             "sha256": None}
+    return [{"file": f"previews/{f}", "view": os.path.splitext(f)[0]} for f in files]
+
+
 def render_previews_offscreen(out, man, args, render_view):
     """Previews of the live session through the add-on's offscreen preview, which never touches the
     user's scene, camera or render settings. Same files as the headless previews."""
@@ -1259,11 +1297,12 @@ def render_previews_offscreen(out, man, args, render_view):
     results = []
     size = args.preview_size
 
-    def shoot(fname, label, params):
+    def shoot(fname, label, params, objects=None):
         t = time.time()
         try:
             render_view(dict(params, size=size), os.path.join(pdir, fname))
-            results.append({"file": f"previews/{fname}", "view": label, "seconds": round(time.time() - t, 1)})
+            results.append({"file": f"previews/{fname}", "view": label, "seconds": round(time.time() - t, 1),
+                            **({"objects": int(objects)} if objects else {})})
         except Exception as e:
             results.append({"file": None, "view": label, "error": str(e)})
 
@@ -1276,9 +1315,10 @@ def render_previews_offscreen(out, man, args, render_view):
         return results
     box = [list(bounds[0]), list(bounds[1])]
     note = f"; framed on the main subject, {len(scattered)} scattered objects reach outside it" if scattered else ""
+    shown = sum(1 for n in set(man["objects"]) - set(excluded) if man["objects"][n].get("bbox"))
     for name, ortho in (("front", True), ("right", True), ("top", True), ("iso", False)):
         shoot(f"{name}.png", f"{name} ({'orthographic' if ortho else 'perspective'}, Workbench{note})",
-              {"view": name, "shading": "solid", "bounds": box, "projection": "ortho" if ortho else "persp"})
+              {"view": name, "shading": "solid", "bounds": box, "projection": "ortho" if ortho else "persp"}, shown)
     if scattered:
         whole, _excl, _ = framing(man)
         shoot("scene_top.png", "whole scene from the top, including the scatter (orthographic, Workbench)",
@@ -1288,7 +1328,7 @@ def render_previews_offscreen(out, man, args, render_view):
         if root is None:
             continue
         shoot(f"{fname}.png", f"{label}: {len(members)} objects (perspective, Workbench, isolated)",
-              {"view": "iso", "shading": "solid", "target": root, "isolate": True})
+              {"view": "iso", "shading": "solid", "target": root, "isolate": True}, len(members))
     return results
 
 
@@ -1427,9 +1467,15 @@ def notes_generated(man, roles, state, previews):
     L += ["", f"**Roles** {len(roles) - n_inf} from annotations in the file, {n_inf} inferred (need review)."]
 
     if previews:
-        L += ["", "## Previews", ""]
+        stale = man.get("previews_stale")
+        if stale:
+            L += ["", f"## Previews (from {stale.get('rendered_at') or 'an earlier ingest'}, OLDER than the file: they may not "
+                      "show what is in it now; ingest with previews, or use the preview tool)", ""]
+        else:
+            L += ["", "## Previews", ""]
         for p in previews:
-            L.append(f"- ![{p['view']}]({p['file']}) {p['view']}" if p.get("file") else f"- {p['view']}: failed ({p.get('error')})")
+            drawn = f" - {p['objects']} objects" if p.get("objects") else ""
+            L.append(f"- ![{p['view']}]({p['file']}) {p['view']}{drawn}" if p.get("file") else f"- {p['view']}: failed ({p.get('error')})")
 
     L += ["", "## Object tree", "", "`[a]` = annotated in the file, `[?]` = inferred, needs review", ""]
     objs = man["objects"]
@@ -1891,6 +1937,7 @@ def ingest(args, out=None, render_view=None, source="disk"):
         else:
             print("previews skipped: they change render settings, so they only run in a background Blender (-b)")
     man["previews"] = previews
+    note_previews = _preview_index(out, previews, sha, signature, source, man)
 
     tdir = p("texts")
     os.makedirs(tdir, exist_ok=True)
@@ -1940,7 +1987,7 @@ def ingest(args, out=None, render_view=None, source="disk"):
         else:
             log_line = (f"- {stamp} [{who}]{why} {len(changes)} change(s) detected (sha {prev} -> {sha[:8]}): {summary}{more}"
                         if changes else f"- {stamp} [{who}]{why} file re-saved, no structural changes (sha {prev} -> {sha[:8]}).")
-    write_notes(p("NOTES.md"), man, roles, state, previews, log_line)
+    write_notes(p("NOTES.md"), man, roles, state, note_previews, log_line)
 
     record = {"time": state["ingested_at"], "event": event,
               "actor": (who if event == "saved" else args.actor) if changes is not None else "ingest", "source": source,

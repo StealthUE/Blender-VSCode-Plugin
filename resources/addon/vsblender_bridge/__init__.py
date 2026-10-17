@@ -35,14 +35,14 @@ from . import units as units_mod
 bl_info = {
     "name": "VSBlender Bridge",
     "author": "Massive Dynamic Engineering",
-    "version": (0, 7, 0),
+    "version": (0, 8, 0),
     "blender": (3, 2, 0),
     "location": "View3D > Sidebar > VSBlender",
     "description": "Local bridge for the VSBlender VS Code extension",
     "category": "Development",
 }
 
-ADDON_VERSION = "0.7.0"
+ADDON_VERSION = "0.8.0"
 # Answered on the socket thread. Everything else runs on Blender's main thread.
 _NO_MAIN_THREAD = {"ping", "cancel"}
 # How long a connection waits for the main thread. The caller's own timeout is usually shorter.
@@ -273,7 +273,8 @@ def finish(params: dict) -> dict:
     })
     _remember_window()
     saved["finished"] = True
-    saved["text"] = f"saved {saved.get('saved')}. Another chat can close this window or open another one."
+    runs = f" with {saved['runs']} run(s): {'; '.join(saved.get('saved_runs') or [])}" if saved.get("runs") else ""
+    saved["text"] = f"saved {saved.get('saved')}{runs}. Another chat can close this window or open another one."
     return saved
 
 
@@ -365,7 +366,11 @@ def open_blend(params: dict) -> dict:
         raise ValueError(f"path must be inside the workspace: {raw}")
     if not target.lower().endswith(".blend"):
         raise ValueError("path must end in .blend")
-    result = open_file({"path": target})
+    history._session["bridge_opening"] = True
+    try:
+        result = open_file({"path": target})
+    finally:
+        history._session["bridge_opening"] = False
     if result.get("opened") and not result.get("already"):
         try:
             history.journal(root, {
@@ -410,16 +415,23 @@ def _undo_push(message: str) -> None:
         pass
 
 
-def import_folders(root: str, lib_paths: list, script: str | None = None) -> list:
+def import_folders(root: str, lib_paths: list, script: str | None = None, missing: list | None = None) -> list:
     """Folders a script can import from, nearest first: the script's own folder, then each lib/
-    from there up to the workspace root, then the configured libPaths. So a model's scripts can
-    live next to its .blend (TestObject/scripts/ with TestObject/scripts/lib/)."""
+    from there up to the workspace root, then the configured libPaths and sharedLibs. So a model's
+    scripts can live next to its .blend (TestObject/scripts/ with TestObject/scripts/lib/).
+    Configured folders may be outside the workspace (another project's script folders); one that
+    does not exist is added to missing."""
     folders = []
 
-    def add(folder: str) -> None:
+    def add(folder: str, configured: bool = False) -> None:
         folder = os.path.abspath(folder)
-        if os.path.isdir(folder) and _under(folder, root) and \
-                os.path.normcase(folder) not in {os.path.normcase(f) for f in folders}:
+        if not os.path.isdir(folder):
+            if configured and missing is not None:
+                missing.append(folder)
+            return
+        if not configured and not _under(folder, root):
+            return
+        if os.path.normcase(folder) not in {os.path.normcase(f) for f in folders}:
             folders.append(folder)
 
     if script:
@@ -432,8 +444,8 @@ def import_folders(root: str, lib_paths: list, script: str | None = None) -> lis
             if parent == current or os.path.normcase(current) == os.path.normcase(os.path.abspath(root)):
                 break
             current = parent
-    for entry in lib_paths:
-        add(entry if os.path.isabs(entry) else os.path.join(root, entry))
+    for entry in lib_paths or []:
+        add(entry if os.path.isabs(entry) else os.path.join(root, entry), configured=True)
     return folders
 
 
@@ -441,14 +453,20 @@ def _prepare_imports(root: str, lib_paths: list, script: str | None = None) -> l
     """Put the workspace helper folders on sys.path and drop workspace modules imported by earlier
     calls, so an edited helper is read again. The add-on's own modules are never dropped."""
     own = os.path.dirname(os.path.abspath(__file__))
+    missing: list = []
+    folders = import_folders(root, lib_paths, script, missing)
     for name, module in list(sys.modules.items()):
         path = getattr(module, "__file__", None)
         if not path or name == "vsblender" or name.startswith("vsblender.") or name.startswith(__name__):
             continue
-        if _under(path, root) and not _under(path, own):
+        if (_under(path, root) or any(_under(path, f) for f in folders)) and not _under(path, own):
             del sys.modules[name]
+    for folder in missing:
+        # The default scripts/lib not existing is normal; a folder the config names is worth a line.
+        if os.path.normcase(folder) != os.path.normcase(os.path.join(os.path.abspath(root), "scripts", "lib")):
+            helpers.warn(f"libPaths/sharedLibs folder {folder} does not exist; nothing is imported from it")
     added = []
-    for folder in reversed(import_folders(root, lib_paths, script)):
+    for folder in reversed(folders):
         if folder not in sys.path:
             sys.path.insert(0, folder)
             added.append(folder)
@@ -609,6 +627,59 @@ def _lost_animation(report: dict, before: set, after: set) -> list:
     lost = (removed & before) | ((rebuilt & before) - after)
     lost |= {item for item in removed if item.startswith("AC:")}
     return sorted(lost)
+
+
+def _mesh_faces() -> dict:
+    """{object name: (face count, mesh name)} for every mesh object, to spot copies a run emptied."""
+    out = {}
+    for ob in bpy.data.objects:
+        if ob.type == "MESH" and ob.data is not None and not snapshot.skip_name(ob.name):
+            out[ob.name] = (len(ob.data.polygons), ob.data.name)
+    return out
+
+
+def _mesh_users(report: dict) -> dict:
+    """Changed meshes that several objects share (linked duplicates): {mesh: [objects]}."""
+    modified = report.get("modified", {})
+    names = set(modified.get("meshes", {})) | {item[3:] for item in report.get("added", []) + report.get("recreated", [])
+                                                if item.startswith("ME:")}
+    for ob_name, aspects in modified.get("objects", {}).items():
+        ob = bpy.data.objects.get(ob_name)
+        if ob is not None and ob.type == "MESH" and "data" in aspects and ob.data is not None:
+            names.add(ob.data.name)
+    out = {}
+    for name in sorted(names):
+        users = [o.name for o in bpy.data.objects if o.type == "MESH" and o.data is not None and o.data.name == name]
+        if len(users) > 1:
+            out[name] = users
+    return out
+
+
+def _emptied(before: dict, after: dict) -> list:
+    """Warnings for objects that had faces before the run and have none now."""
+    out = []
+    for name, (faces, mesh) in after.items():
+        old = before.get(name)
+        if old and old[0] > 0 and faces == 0:
+            shared = [o for o, (_f, m) in after.items() if m == mesh and o != name]
+            also = f"; its mesh {mesh} is shared with {', '.join(shared[:4])}" if shared else ""
+            out.append(f"{name}: its mesh has no faces now ({old[0]} before this run{also}). A part rebuilt elsewhere "
+                       "may have left its linked copies on a placeholder; to_object(..., shared='all') keeps linked "
+                       "duplicates on the new geometry")
+    return out
+
+
+def _auto_save(params: dict, reason: str, changed: list, out: dict) -> None:
+    """Save after a run when asked (save: true, which the extension sends while allowSave is on). A
+    refused save (references in the scene, a file outside the workspace, a session never saved) is
+    reported on the reply; the run itself already succeeded."""
+    if not params.get("save") or not (changed or history.has_unsaved_edits()):
+        return
+    try:
+        out["saved"] = save_file({"reason": reason, "actor": params.get("actor") or "ai",
+                                  "allow_references": bool(params.get("allow_references")), "auto": True})
+    except Exception as exc:
+        out["save_skipped"] = str(exc)
 
 
 def _stamp_provenance(report: dict, rel_script: str, sha: str, reason: str) -> list:
@@ -817,6 +888,7 @@ def run_script(params: dict):
 
     started = time.time()
     anim_before = animated_ids()
+    faces_before = _mesh_faces()
     saved_frame = bpy.context.scene.frame_current if bpy.context.scene else None
     before = snapshot.take()
     checkpoint_entry = None
@@ -846,6 +918,11 @@ def run_script(params: dict):
         report["lost_animation"] = lost
     changed = snapshot.flat(report)
     warnings = list(run.warnings)
+    if changed:
+        warnings += _emptied(faces_before, _mesh_faces())
+        shared = _mesh_users(report)
+        if shared:
+            report["shared_meshes"] = shared
     ms = int((time.time() - started) * 1000)
     cp_id = checkpoint_entry.get("id") if isinstance(checkpoint_entry, dict) else None
     if not changed and cp_id:
@@ -940,9 +1017,7 @@ def run_script(params: dict):
         detailed = [item for item in why if item.get("script") in shown]
         if detailed:
             out["out_of_date_why"] = detailed
-    if params.get("save") and (changed or history.has_unsaved_edits()):
-        out["saved"] = save_file({"reason": reason or f"after {rel_script}", "actor": params.get("actor") or "ai",
-                                  "allow_references": bool(params.get("allow_references"))})
+    _auto_save(params, reason or f"after {rel_script}", changed, out)
     out["unsaved"] = history.unsaved()
     return out, warnings, changed
 
@@ -1185,6 +1260,7 @@ def run_pipeline(params: dict):
     rel_pipe = history.rel(root, path)
     started = time.time()
     anim_before = animated_ids()
+    faces_before = _mesh_faces()
     before = snapshot.take()
     checkpoint_entry = None
     if cp_opts.get("auto", True):
@@ -1239,6 +1315,11 @@ def run_pipeline(params: dict):
     if lost:
         report["lost_animation"] = lost
     changed = snapshot.flat(report)
+    if changed:
+        warnings += _emptied(faces_before, _mesh_faces())
+        shared = _mesh_users(report)
+        if shared:
+            report["shared_meshes"] = shared
     if not changed and cp_id:
         history.discard_checkpoint(root, cp_id)
         cp_id = None
@@ -1277,9 +1358,7 @@ def run_pipeline(params: dict):
     out = {"pipeline": rel_pipe, "steps": ran, "changes": report, "checkpoint": cp_id,
            "ms": int((time.time() - started) * 1000)}
     out.update(_checkpoint_report(checkpoint_entry, cp_id, cp_opts, False, changed, warnings))
-    if params.get("save") and (changed or history.has_unsaved_edits()):
-        out["saved"] = save_file({"reason": reason or f"after pipeline {rel_pipe}", "actor": params.get("actor") or "ai",
-                                  "allow_references": bool(params.get("allow_references"))})
+    _auto_save(params, reason or f"after pipeline {rel_pipe}", changed, out)
     out["unsaved"] = history.unsaved()
     return out, warnings, changed
 
@@ -1307,6 +1386,8 @@ def restore_checkpoint(params: dict) -> dict:
                            "reason": params.get("reason") or None})
     history.notes_log(root, history.log_line(params.get("actor") or "ai", f"restored checkpoint `{result['restored']}`",
                                              params.get("reason"), None, result["safety_checkpoint"]))
+    _auto_save(params, str(params.get("reason") or "").strip() or f"restored checkpoint {result['restored']}", ["restore"], result)
+    result["unsaved"] = history.unsaved()
     return result
 
 
@@ -1358,6 +1439,7 @@ def _transaction(root: str, label: str, event: str, params: dict, fn) -> tuple:
     out = dict(result)
     out.update({"changes": report, "checkpoint": cp_id})
     out.update(_checkpoint_report(entry_cp, cp_id, cp_opts, False, changed, warnings))
+    _auto_save(params, reason or label, changed, out)
     out["unsaved"] = history.unsaved()
     return out, warnings, changed
 
@@ -1470,28 +1552,44 @@ def save_file(params: dict) -> dict:
                          f"{' ...' if len(refs) > 6 else ''}). Remove them first (a reference belongs in a preview overlay "
                          "or an import_reference file, not in the .blend), or pass allow_references: true to keep them in the file.")
     state = history.unsaved()
+    # The count is the session's (seeded from the journal after an add-on reload); the journal names
+    # those runs. With none, the last save says why: the editor or Blender saved first.
+    journaled, boundary = history.runs_since_boundary(root) if current else ([], None)
+    journaled = journaled[-int(state["runs"]):] if state["runs"] else []
     _purge_leftovers()
     compress = params.get("compress", True) is not False
-    saved = history.save_main(target, compress=compress)
+    history._session["bridge_saving"] = True
+    try:
+        saved = history.save_main(target, compress=compress)
+    finally:
+        history._session["bridge_saving"] = False
     history.reset_edited(saved=True)
     rel = history.rel(root, saved)
     reason = str(params.get("reason") or "").strip()
     actor = str(params.get("actor") or "ai")
     size = os.path.getsize(saved)
+    runs = int(state["runs"])
     entry = {"time": history.now_iso(), "event": "save", "actor": actor, "reason": reason or None, "file": rel,
-             "runs": state["runs"], "bytes": size, "compress": compress}
+             "runs": runs, "bytes": size, "compress": compress}
+    if params.get("auto"):
+        entry["auto"] = True
     if target and current and os.path.normcase(os.path.abspath(current)) != os.path.normcase(saved):
         entry["saved_as_from"] = history.rel(root, current)
     if refs:
         entry["references_kept"] = refs[:20]
     try:
         history.journal(root, entry)
-        runs = f" {state['runs']} run(s) since the last save are in the file now." if state["runs"] else ""
-        history.notes_log(root, history.log_line(actor, f"saved `{rel}`", reason or None, None, None).rstrip() + runs)
+        note = f" {runs} run(s) since the last save are in the file now." if runs else ""
+        history.notes_log(root, history.log_line(actor, f"saved `{rel}`", reason or None, None, None).rstrip() + note)
     except Exception:
         pass
-    return {"saved": rel, "file": saved, "bytes": size, "compress": compress, "runs": state["runs"],
-            "first": state["first"], **({"references_kept": refs} if refs else {})}
+    out = {"saved": rel, "file": saved, "bytes": size, "compress": compress, "runs": runs,
+           "first": state["first"], "saved_runs": [history.describe_run(e) for e in journaled[-10:]],
+           **({"references_kept": refs} if refs else {})}
+    if not runs and boundary and boundary.get("event") == "save":
+        out["previous_save"] = {"time": boundary.get("time"), "actor": boundary.get("actor"),
+                                "reason": boundary.get("reason"), "runs": boundary.get("runs")}
+    return out
 
 
 def save_copy(params: dict) -> dict:
@@ -1575,8 +1673,11 @@ def write_role_property(params: dict):
     ob["ai_role"] = str(params.get("role") or "")
     report = snapshot.diff(before, snapshot.take())
     _undo_push(f"VSBlender: role of {ob.name}")
-    history.mark_edited()
-    return {"object": ob.name, "property": "ai_role"}, [], snapshot.flat(report)
+    # A role is a label, not a run: the file is unsaved, but the run count stays as the journal has it.
+    history.mark_edited(run=False)
+    out = {"object": ob.name, "property": "ai_role"}
+    _auto_save(params, f"role of {ob.name}", snapshot.flat(report), out)
+    return out, [], snapshot.flat(report)
 
 
 def _replay_scripts(entry: dict) -> list:
@@ -1679,6 +1780,8 @@ def replay(params: dict) -> dict:
                 "path": row["path"],
                 "reason": row.get("reason") or "replay",
                 "actor": str(params.get("actor") or "ai"),
+                **{k: params[k] for k in ("lib_paths", "printer", "reference_roots", "checkpoint") if params.get(k)},
+                **({"save": True} if params.get("save") else {}),
             })
             executed.append({"script": row["script"], "ok": True, "result": result.get("result"),
                              "changed": changed, "warnings": warnings})
@@ -1855,7 +1958,11 @@ def _handle_conn(conn: socket.socket, direct: bool) -> None:
         _send(conn, holder.get("resp") or {"ok": False, "error": "empty response"})
         if _state.get("quit_after_reply"):
             _state["quit_after_reply"] = False
-            if not bpy.app.timers.is_registered(_quit_blender_soon):
+            if _state.get("blocking"):
+                # A headless bridge has no timer loop: ending its serve loop ends the script, and
+                # Blender (-b) exits with it. A timer registered here would never fire.
+                _state["queue"].put(stop_server)
+            elif not bpy.app.timers.is_registered(_quit_blender_soon):
                 bpy.app.timers.register(_quit_blender_soon, first_interval=0.3)
     except Exception as exc:
         try:
@@ -2011,16 +2118,56 @@ def _load_post(_dummy):
     # A preview interrupted by a crash can be saved into the file; clear it when the file loads.
     _purge_leftovers()
     history.reset_edited()
+    _journal_blender_open()
     _remember_window()
     ensure_server()
+
+
+def _journal_blender_save() -> None:
+    """A save made in Blender (Ctrl+S, File > Save), not through the bridge: journal it, so the runs it
+    put in the file are accounted for and the next save does not claim them."""
+    blend = bpy.data.filepath
+    root = workspace_root()
+    if not blend or not _under(os.path.abspath(blend), root):
+        return
+    try:
+        history.journal(root, {"time": history.now_iso(), "event": "save", "actor": "blender",
+                               "reason": "saved in Blender", "file": history.rel(root, blend),
+                               "runs": int(history.unsaved().get("runs") or 0)})
+    except Exception:
+        pass
+
+
+def _journal_blender_open() -> None:
+    """A file opened or reverted in Blender: runs before it are not in the session any more."""
+    blend = bpy.data.filepath
+    root = workspace_root()
+    if not blend or history._session.get("bridge_opening") or not _under(os.path.abspath(blend), root):
+        return
+    try:
+        history.journal(root, {"time": history.now_iso(), "event": "open", "actor": "blender",
+                               "file": history.rel(root, blend), "reason": "opened in Blender"})
+    except Exception:
+        pass
 
 
 @persistent
 def _save_post(*_args):
     # Saved: the edits made through the bridge are in the file now. A copy (checkpoint) does not count.
     if not history.writing_copy():
+        if not history._session.get("bridge_saving"):
+            _journal_blender_save()
         history.reset_edited(saved=True)
         _remember_window()
+
+
+def _seed_runs_once():
+    try:
+        history.seed_runs(workspace_root())
+        _remember_window()
+    except Exception:
+        pass
+    return None
 
 
 def _purge_once():
@@ -2094,6 +2241,9 @@ def register():
             bpy.app.timers.register(_purge_once, first_interval=0.1)
         if not bpy.app.timers.is_registered(_window_tick):
             bpy.app.timers.register(_window_tick, first_interval=0.2, persistent=True)
+        # An add-on reload keeps the session but not the run count: count the journal's unsaved runs again.
+        if not bpy.app.timers.is_registered(_seed_runs_once):
+            bpy.app.timers.register(_seed_runs_once, first_interval=0.3)
     helpers.install_modules()
     # The first ping has to name the file. During Preferences enable, bpy.data may refuse; the timer retries.
     _remember_window()

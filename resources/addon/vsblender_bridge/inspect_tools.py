@@ -626,6 +626,7 @@ def _term(term: str, ob, ctx: _Ctx):
         "built": lambda: "ai_built_by" in ob.keys(),
         "reference": lambda: marks.is_reference(ob),
         "stage": lambda: marks.is_stage(ob),
+        "hardware": lambda: marks.is_hardware(ob),
         "linked": lambda: ob.library is not None,
     }
     if low in flags:
@@ -851,7 +852,11 @@ def _spatial(params: dict, root: str) -> dict:
             if all(ob_high[i] >= low[i] and ob_low[i] <= high[i] for i in range(3)):
                 names.append(ob.name)
         return {"objects": names}
-    raise ValueError("op must be bbox, raycast, drop, nearest, distance, below, above, touching, or within")
+    if op in ("sweep", "through"):
+        from . import clearance
+
+        return clearance.sweep(params, root) if op == "sweep" else clearance.through(params, root)
+    raise ValueError("op must be bbox, raycast, drop, nearest, distance, below, above, touching, within, sweep or through")
 
 
 # ----------------------------------------------------------------------------- timeline

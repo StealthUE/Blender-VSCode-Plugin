@@ -235,7 +235,8 @@ def weld(arrays: MeshArrays, tol: float) -> tuple:
     if not len(v):
         return arrays.copy(), np.zeros(0, dtype=np.int64)
     tol = max(float(tol), 1e-12)
-    keys = np.round(v / tol).astype(np.int64)
+    # The grid starts at the corner of the bounds, so moving a part does not change what welds.
+    keys = np.round((v - v.min(axis=0)) / tol).astype(np.int64)
     _uniq, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
     inverse = inverse.reshape(-1)
     verts = v[first]
@@ -588,10 +589,18 @@ def _slic3r_volumes(text: str) -> dict:
                 last = int(vol.get("lastid") or -1)
             except ValueError:
                 continue
-            vols.append({"first": first, "last": last, "name": meta.get("name") or "", "type": meta.get("volume_type") or "ModelPart"})
+            vols.append({"first": first, "last": last, "name": meta.get("name") or "", "type": meta.get("volume_type") or "ModelPart",
+                         "extruder": _int_or_none(meta.get("extruder"))})
         if vols:
             by_object[str(oid)] = vols
     return by_object
+
+
+def _int_or_none(value):
+    try:
+        return int(str(value).strip()) if value not in (None, "") else None
+    except ValueError:
+        return None
 
 
 def _bambu_roles(text: str) -> dict:
@@ -605,7 +614,8 @@ def _bambu_roles(text: str) -> dict:
         parts = [child for child in obj if _local(child.tag) == "part"]
         for part in parts:
             meta = _meta_children(part)
-            role = {"name": meta.get("name") or "", "type": part.get("subtype") or "normal_part"}
+            role = {"name": meta.get("name") or "", "type": part.get("subtype") or "normal_part",
+                    "extruder": _int_or_none(meta.get("extruder"))}
             pid = part.get("id")
             if pid:
                 roles[str(pid)] = role
@@ -743,7 +753,7 @@ def _split_volumes(mesh: MeshArrays, vols: list, object_name: str, warnings: lis
             continue
         kind = vol.get("type") or "ModelPart"
         pieces.append({"name": vol.get("name") or object_name, "type": kind, "model": _is_model_volume(kind),
-                       "arrays": mesh.select(mask)})
+                       "arrays": mesh.select(mask), "extruder": vol.get("extruder")})
     if n and not assigned.all():
         mask = ~assigned
         pieces.append({"name": object_name, "type": "ModelPart", "model": True, "arrays": mesh.select(mask)})
@@ -760,7 +770,8 @@ def _object_pieces(entry: dict, oid, volume_table: dict, bambu_roles: dict, warn
         if last >= 0:
             vols = [{"first": 0, "last": last, "name": role.get("name") or entry["name"], "type": role["type"]}]
     if not vols:
-        return [{"name": entry["name"], "type": "ModelPart", "model": True, "arrays": mesh}]
+        return [{"name": (role or {}).get("name") or entry["name"], "type": "ModelPart", "model": True, "arrays": mesh,
+                 "extruder": (role or {}).get("extruder")}]
     return _split_volumes(mesh, vols, entry["name"], warnings)
 
 
@@ -869,8 +880,11 @@ def read_3mf(path: str, volumes: str = "model") -> list:
         matrix = _matrix_3mf(item.get("transform"))
         split = flatten(oid, matrix, whole=False)
         for piece in split:
-            records.append({"object": obj_name, "name": piece["name"], "type": piece["type"],
-                            "triangles": int(len(piece["arrays"])), "model": bool(piece["model"])})
+            record = {"object": obj_name, "name": piece["name"], "type": piece["type"],
+                      "triangles": int(len(piece["arrays"])), "model": bool(piece["model"])}
+            if piece.get("extruder") is not None:
+                record["extruder"] = piece["extruder"]
+            records.append(record)
         # raw keeps file order, negatives included. The other modes use the split pieces.
         pieces = flatten(oid, matrix, whole=True) if volumes == "raw" else split
         for piece in pieces:
@@ -1115,6 +1129,118 @@ def write_3mf(path: str, parts, title: str = "", application: str = "VSBlender",
     return os.path.getsize(path)
 
 
+def _mesh_xml(out, arrays: MeshArrays, indent: str = "   ") -> None:
+    out.write(f"{indent}<mesh>\n{indent} <vertices>\n")
+    buf = io.StringIO()
+    np.savetxt(buf, arrays.verts, fmt=f'{indent}  <vertex x="%.5f" y="%.5f" z="%.5f"/>')
+    out.write(buf.getvalue())
+    out.write(f"{indent} </vertices>\n{indent} <triangles>\n")
+    buf = io.StringIO()
+    np.savetxt(buf, arrays.tris, fmt=f'{indent}  <triangle v1="%d" v2="%d" v3="%d"/>')
+    out.write(buf.getvalue())
+    out.write(f"{indent} </triangles>\n{indent}</mesh>\n")
+
+
+def write_3mf_volumes(path: str, objects, layout: str = "prusa", title: str = "", application: str = "VSBlender",
+                      metadata: dict | None = None, thumbnail: str | None = None) -> int:
+    """A 3MF for a multi-material printer: each object is one part made of volumes, one per filament.
+
+    objects: [(part name, [(volume name, MeshArrays in mm, extruder number)])].
+    layout "prusa" (PrusaSlicer): one mesh per object, with Metadata/Slic3r_PE_model.config naming each
+      volume's triangle range and extruder.
+    layout "bambu" (Bambu Studio, OrcaSlicer): one mesh object per volume, a parent object made of them
+      as components, and Metadata/model_settings.config naming each part and its extruder.
+    """
+    if layout not in ("prusa", "bambu"):
+        raise ValueError("layout must be prusa or bambu")
+    model = io.StringIO()
+    model.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+    ns = ' xmlns:slic3rpe="http://schemas.slic3r.org/3mf/2017/06"' if layout == "prusa" else ""
+    model.write(f'<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"{ns}>\n')
+    meta = {"Title": title or (objects[0][0] if objects else "model"), "Application": application}
+    if layout == "prusa":
+        meta["slic3rpe:Version3mf"] = "1"
+    meta.update(metadata or {})
+    for key, value in meta.items():
+        model.write(f' <metadata name="{_xml(key)}">{_xml(value)}</metadata>\n')
+    model.write(" <resources>\n")
+    config = io.StringIO()
+    config.write('<?xml version="1.0" encoding="UTF-8"?>\n<config>\n')
+    build = []
+    next_id = 1
+    for part_name, volumes in objects:
+        volumes = [(n, a, e) for n, a, e in volumes if len(a.tris)]
+        if not volumes:
+            continue
+        if layout == "prusa":
+            oid = next_id
+            next_id += 1
+            mesh = concat([a for _n, a, _e in volumes])
+            model.write(f'  <object id="{oid}" type="model" name="{_xml(part_name)}">\n')
+            _mesh_xml(model, mesh)
+            model.write("  </object>\n")
+            config.write(f' <object id="{oid}" instances_count="1">\n'
+                         f'  <metadata type="object" key="name" value="{_xml(part_name)}"/>\n')
+            first = 0
+            for name, arrays, extruder in volumes:
+                last = first + len(arrays.tris) - 1
+                config.write(f'  <volume firstid="{first}" lastid="{last}">\n'
+                             f'   <metadata type="volume" key="name" value="{_xml(name)}"/>\n'
+                             '   <metadata type="volume" key="volume_type" value="ModelPart"/>\n'
+                             f'   <metadata type="volume" key="extruder" value="{int(extruder)}"/>\n'
+                             '   <mesh edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>\n'
+                             '  </volume>\n')
+                first = last + 1
+            config.write(" </object>\n")
+            build.append(oid)
+        else:
+            ids = []
+            for name, arrays, _extruder in volumes:
+                model.write(f'  <object id="{next_id}" type="model" name="{_xml(name)}">\n')
+                _mesh_xml(model, arrays)
+                model.write("  </object>\n")
+                ids.append(next_id)
+                next_id += 1
+            top = next_id
+            next_id += 1
+            model.write(f'  <object id="{top}" type="model" name="{_xml(part_name)}">\n   <components>\n')
+            for i in ids:
+                model.write(f'    <component objectid="{i}"/>\n')
+            model.write("   </components>\n  </object>\n")
+            first_extruder = int(volumes[0][2])
+            config.write(f'  <object id="{top}">\n   <metadata key="name" value="{_xml(part_name)}"/>\n'
+                         f'   <metadata key="extruder" value="{first_extruder}"/>\n')
+            for i, (name, _arrays, extruder) in zip(ids, volumes):
+                config.write(f'   <part id="{i}" subtype="normal_part">\n'
+                             f'    <metadata key="name" value="{_xml(name)}"/>\n'
+                             '    <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>\n'
+                             f'    <metadata key="extruder" value="{int(extruder)}"/>\n'
+                             '   </part>\n')
+            config.write("  </object>\n")
+            build.append(top)
+    config.write("</config>\n")
+    model.write(" </resources>\n <build>\n")
+    for i in build:
+        model.write(f'  <item objectid="{i}"/>\n')
+    model.write(" </build>\n</model>\n")
+    if not build:
+        raise ValueError("no volumes with triangles to write")
+    has_thumb = bool(thumbnail and os.path.isfile(thumbnail))
+    config_name = "Metadata/Slic3r_PE_model.config" if layout == "prusa" else "Metadata/model_settings.config"
+
+    def write(tmp):
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", _CT)
+            archive.writestr("_rels/.rels", _rels(has_thumb))
+            archive.writestr("3D/3dmodel.model", model.getvalue())
+            archive.writestr(config_name, config.getvalue())
+            if has_thumb:
+                archive.write(thumbnail, "Metadata/thumbnail.png")
+
+    _atomic_write(path, write)
+    return os.path.getsize(path)
+
+
 def mesh_stats(arrays: MeshArrays, weld_tol: float) -> dict:
     """Quick watertightness summary: counts only, for export warnings and Solid.check."""
     welded, _remap = weld(arrays, weld_tol)
@@ -1126,6 +1252,137 @@ def mesh_stats(arrays: MeshArrays, weld_tol: float) -> dict:
             "degenerate_tris": stats["degenerate_tris"], "shells": int(labels.max() + 1) if len(labels) else 0,
             "volume": va["volume"], "area": va["area"],
             "watertight": stats["open_edges"] == 0 and stats["non_manifold_edges"] == 0 and stats["flipped_edges"] == 0}
+
+
+# ----------------------------------------------------------------------------- one weld and sliver policy
+# Weld tolerances relative to the bounding-box diagonal. WELD_REL joins the near-coincident vertices
+# booleans leave (Solid.check, check_model and the exporter all use it); WELD_FINE joins float noise only.
+# A coarse weld can also collapse a sliver into a fold or a non-manifold edge, so the weld that leaves
+# fewer open and non-manifold edges is the one used: a real defect shows at both tolerances.
+WELD_REL = 1e-7
+WELD_FINE = 1e-9
+
+
+def diagonal(arrays: MeshArrays) -> float:
+    lo, hi = arrays.bounds()
+    return float(np.linalg.norm(hi - lo)) or 1.0
+
+
+def best_weld(arrays: MeshArrays, diag: float | None = None) -> tuple:
+    """(welded arrays, edge_stats, relative tolerance used): WELD_REL, unless WELD_FINE leaves fewer
+    open and non-manifold edges."""
+    diag = diag or diagonal(arrays)
+    coarse, _r = weld(arrays, max(diag * WELD_REL, 1e-12))
+    coarse_stats = edge_stats(coarse)
+    bad = coarse_stats["open_edges"] + coarse_stats["non_manifold_edges"]
+    if not bad:
+        return coarse, coarse_stats, WELD_REL
+    fine, _r = weld(arrays, max(diag * WELD_FINE, 1e-12))
+    fine_stats = edge_stats(fine)
+    if fine_stats["open_edges"] + fine_stats["non_manifold_edges"] < bad:
+        return fine, fine_stats, WELD_FINE
+    return coarse, coarse_stats, WELD_REL
+
+
+def stable_stats(arrays: MeshArrays, diag: float | None = None) -> dict:
+    """mesh_stats with the weld best_weld picks."""
+    welded, stats, rel = best_weld(arrays, diag)
+    labels = components(welded)
+    va = volume_area(welded)
+    return {"tris": int(len(arrays.tris)), "open_edges": stats["open_edges"],
+            "non_manifold_edges": stats["non_manifold_edges"], "flipped_edges": stats["flipped_edges"],
+            "degenerate_tris": stats["degenerate_tris"], "shells": int(labels.max() + 1) if len(labels) else 0,
+            "volume": va["volume"], "area": va["area"], "weld": rel,
+            "watertight": stats["open_edges"] == 0 and stats["non_manifold_edges"] == 0 and stats["flipped_edges"] == 0}
+
+
+def _sat_overlap_2d(a, b, eps: float) -> np.ndarray:
+    """Per pair: do triangles a and b (N, 3, 2) overlap with positive area? Separating-axis test on
+    the six edge normals; touching (within eps) counts as separate."""
+    overlap = np.ones(len(a), dtype=bool)
+    for tri in (a, b):
+        for k in range(3):
+            e = tri[:, (k + 1) % 3] - tri[:, k]
+            n = np.stack([-e[:, 1], e[:, 0]], axis=1)
+            length = np.linalg.norm(n, axis=1)
+            n = np.divide(n, length[:, None], out=np.zeros_like(n), where=length[:, None] > 0)
+            pa = np.einsum("nkj,nj->nk", a, n)
+            pb = np.einsum("nkj,nj->nk", b, n)
+            separated = (pa.max(axis=1) <= pb.min(axis=1) + eps) | (pb.max(axis=1) <= pa.min(axis=1) + eps)
+            overlap &= ~separated
+    return overlap
+
+
+def crossings(arrays: MeshArrays, diag: float | None = None, max_pairs: int = 2_000_000) -> dict:
+    """Triangle pairs that meet without being neighbours, on the UNWELDED mesh, so no vertex moves.
+
+    Pairs whose vertices come within diag x 1e-6 of each other are neighbours and left out, and so are
+    zero-area triangles (check_model reports those as degenerate). The rest are classified:
+      cut      each triangle runs through the other's plane: the surface passes through itself
+      overlap  coplanar with area in common: double or folded faces (a cap over an opening)
+      touch    one ends on the other (a T-junction, or a face laid across another face's edge)
+    Coordinates are taken relative to the centre of the bounds, so the result does not depend on where
+    the part stands. Returns counts, pair indices per kind, and sample points.
+    """
+    from mathutils.bvhtree import BVHTree
+
+    empty = {"cut": 0, "overlap": 0, "touch": 0, "pairs": np.zeros((0, 2), dtype=np.int64),
+             "kind": np.zeros(0, dtype=np.int8), "at": np.zeros((0, 3))}
+    tris = arrays.tris
+    if len(tris) < 2:
+        return empty
+    diag = diag or diagonal(arrays)
+    lo, hi = arrays.bounds()
+    verts = arrays.verts - (lo + hi) / 2.0
+    tol = diag * 1e-6
+    a, b, c = verts[tris[:, 0]], verts[tris[:, 1]], verts[tris[:, 2]]
+    cross = np.cross(b - a, c - a)
+    dbl = np.linalg.norm(cross, axis=1)
+    keep = np.nonzero(dbl * 0.5 > (diag * 1e-7) ** 2)[0]
+    if len(keep) < 2:
+        return empty
+    sub = tris[keep]
+    tree = BVHTree.FromPolygons(verts.tolist(), sub.tolist(), all_triangles=True, epsilon=0.0)
+    raw = tree.overlap(tree)
+    if not raw:
+        return empty
+    p = np.array(raw, dtype=np.int64)
+    p = p[p[:, 0] < p[:, 1]]
+    if len(p) > max_pairs:
+        p = p[:max_pairs]
+    p = keep[p]
+    # Neighbours: any vertex of one within tol of any vertex of the other (in chunks: 9 distances a pair).
+    far = np.zeros(len(p), dtype=bool)
+    for start in range(0, len(p), 200_000):
+        q = p[start:start + 200_000]
+        ca, cb = verts[tris[q[:, 0]]], verts[tris[q[:, 1]]]
+        gap = np.linalg.norm(ca[:, :, None, :] - cb[:, None, :, :], axis=3).min(axis=(1, 2))
+        far[start:start + len(q)] = gap > tol
+    p = p[far]
+    ta, tb = verts[tris[p[:, 0]]], verts[tris[p[:, 1]]]          # (N, 3, 3)
+    if not len(p):
+        return empty
+    na = np.cross(ta[:, 1] - ta[:, 0], ta[:, 2] - ta[:, 0])
+    nb = np.cross(tb[:, 1] - tb[:, 0], tb[:, 2] - tb[:, 0])
+    na /= np.linalg.norm(na, axis=1)[:, None]
+    nb /= np.linalg.norm(nb, axis=1)[:, None]
+    da = np.einsum("nkj,nj->nk", ta - tb[:, :1], nb)              # a's vertices against b's plane
+    db = np.einsum("nkj,nj->nk", tb - ta[:, :1], na)
+    straddle_a = (da.max(axis=1) > tol) & (da.min(axis=1) < -tol)
+    straddle_b = (db.max(axis=1) > tol) & (db.min(axis=1) < -tol)
+    coplanar = (np.abs(da).max(axis=1) <= tol) & (np.abs(db).max(axis=1) <= tol)
+    kind = np.full(len(p), 2, dtype=np.int8)                      # 2 touch
+    kind[straddle_a & straddle_b] = 0                             # 0 cut
+    if coplanar.any():
+        idx = np.nonzero(coplanar)[0]
+        axis = np.argmax(np.abs(nb[idx]), axis=1)
+        keep_axes = np.array([[1, 2], [0, 2], [0, 1]])[axis]
+        a2 = np.take_along_axis(ta[idx], keep_axes[:, None, :], axis=2)
+        b2 = np.take_along_axis(tb[idx], keep_axes[:, None, :], axis=2)
+        kind[idx[_sat_overlap_2d(a2, b2, tol)]] = 1               # 1 overlap
+    centres = ((ta.mean(axis=1) + tb.mean(axis=1)) / 2.0) + (lo + hi) / 2.0
+    return {"cut": int((kind == 0).sum()), "overlap": int((kind == 1).sum()), "touch": int((kind == 2).sum()),
+            "pairs": p, "kind": kind, "at": centres}
 
 
 def fmt_num(value: float, digits: int = 4) -> str:

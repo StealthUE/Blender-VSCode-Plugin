@@ -24,12 +24,18 @@ Two layers:
 3. Rings (gates, dials, wheels, clock faces): geo.ring(up="+Y", front="+Z") works in clock angles,
    clockwise from the top as seen from the front: ring.pt, ring.theta (for lathe), ring.on (a prism
    mapping onto a surface), ring.band (a sector following a surface), ring.pattern (one segment,
-   mirrored and repeated), ring.svgs (SVG outlines at a radius), ring.chevron (a point, two wings,
-   a shallow V).
+   mirrored and repeated), ring.svgs (SVG outlines at a radius; box= keeps a glyph set's sizes),
+   ring.chevron (a point, two wings, a shallow V), ring.radial_hole, and ring.plan_split /
+   ring.split (cut a ring into pieces that fit the bed, with half-laps, pins and screws).
+
+4. Mechanical: thread, hole and nut_trap (at=, axis= put them on any face), gear and rack
+   (involute; geom2d.gear_pair checks a mesh).
 
 Geometry for a child of a rotated root, or an object whose transform is keyed:
-to_object(name, parent=root, space="local"). After booleans: .clean() removes zero-area slivers; a
-cutter whose shells overlap: a.difference(b, union_cutters=True).
+to_object(name, parent=root, space="local"). Linked duplicates: to_object(..., shared="all").
+After booleans: .clean() removes zero-area slivers without merging faces into n-gons, and refuses a
+result that crosses itself; a cutter whose shells overlap: a.difference(b, union_cutters=True), and
+a.intersect(join, union_cutters=True). .named("Part") names a solid in warnings.
 
 Traps this module avoids: tessellate_polygon mis-fills concave outlines (CDT with even-odd is used);
 a ring of vertices on the axis leaves non-manifold edges (a single apex vertex is used).
@@ -38,6 +44,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 
 import bmesh
 import bpy
@@ -410,12 +417,18 @@ class Ring:
         out.desc = f"{one.desc}.ring_pattern({count}{', mirror=' + repr(mirror) if mirror else ''}{', symmetric' if symmetric else ''})"
         return out
 
-    def svgs(self, bm, paths, radius: float, height: float, z0: float, z1: float, angles=None, mat: int = 0) -> list:
-        """Each SVG as a prism on the ring: scaled so its y span is `height`, centred in x, placed at radius.
+    def svgs(self, bm, paths, radius: float, height: float, z0: float, z1: float, angles=None, mat: int = 0,
+             box=None, min_stroke: float | None = None, mode: str = "auto") -> list:
+        """Each SVG as a prism on the ring, centred at radius, between depths z0 and z1 along the ring's
+        front axis. angles: one clock angle per file (default: evenly spaced).
 
-        svg_loops is called without size=, so the file's own y extent is the scale (the same placement
-        a script does by hand). angles is one clock angle per file; the default spaces them evenly.
-        z0 and z1 are the prism heights along the ring's front axis (world Z when front is +Z).
+        box: how a glyph is scaled. None scales each file by its own drawing (its y span becomes
+        height), so glyphs of different sizes all come out the same height. box="viewbox" (or True)
+        scales every file by its viewBox and centres it on the viewBox, so a glyph set keeps the sizes
+        and positions it was drawn with; box=48 does the same for a 48-unit design box.
+        A page rectangle (a loop that is exactly the viewBox) is left out; nothing else is.
+        min_stroke (scene units): strokes thinner than this are widened (geom2d.svg_loops min_stroke).
+        mode: svg_loops mode ("auto", or "fill" for filled glyphs with hairline outlines).
         """
         paths = [str(p) for p in paths]
         if not paths:
@@ -427,22 +440,197 @@ class Ring:
             raise ValueError("angles must have one entry per SVG")
         faces = []
         for path, angle in zip(paths, angles):
-            loops = geom2d.svg_loops(str(path))
-            spans = [float(np.ptp(loop[:, 0])) for loop in loops]
-            if len(loops) > 1:
-                widest = max(spans)
-                kept = [loop for loop, span in zip(loops, spans) if span < widest * 0.8]
-                loops = kept or loops
-            pts = np.vstack(loops)
-            lo, hi = pts.min(axis=0), pts.max(axis=0)
-            scale = float(height) / max(float(hi[1] - lo[1]), 1e-12)
-            centre = (lo + hi) / 2.0
+            loops, scale, centre = self._svg_glyph(path, float(height), box, min_stroke, mode)
             placed = [np.column_stack([
                 (loop[:, 0] - centre[0]) * scale,
                 float(radius) + (loop[:, 1] - centre[1]) * scale,
             ]) for loop in loops]
             faces += prism(bm, placed, z0, z1, self.on(None, a=float(angle)), mat=mat)
         return faces
+
+    @staticmethod
+    def _svg_glyph(path: str, height: float, box, min_stroke, mode: str) -> tuple:
+        """(loops y up, scale to scene units, centre in SVG units) for one glyph file."""
+        view = geom2d.svg_view_box(path)
+        loops = geom2d.svg_loops(path, mode=mode)
+        if view is not None:
+            # The page rectangle: a 4-corner loop on the viewBox's edges (y flipped by svg_loops).
+            vx0, vx1 = view[0], view[0] + view[2]
+            vy0, vy1 = -(view[1] + view[3]), -view[1]
+            tol = 0.01 * max(view[2], view[3])
+
+            def page(loop):
+                lo, hi = loop.min(axis=0), loop.max(axis=0)
+                return (len(geom2d.simplify(loop, tol)) <= 5 and abs(lo[0] - vx0) < tol and abs(hi[0] - vx1) < tol
+                        and abs(lo[1] - vy0) < tol and abs(hi[1] - vy1) < tol)
+
+            kept = [l for l in loops if not page(l)]
+            loops = kept or loops
+        pts = np.vstack(loops)
+        lo, hi = pts.min(axis=0), pts.max(axis=0)
+        if box in (None, False):
+            scale = height / max(float(hi[1] - lo[1]), 1e-12)
+            centre = (lo + hi) / 2.0
+        else:
+            box_h = view[3] if (box is True or str(box).lower() == "viewbox") and view else float(box) \
+                if not isinstance(box, str) else None
+            if box_h is None:
+                raise ValueError(f"{os.path.basename(path)} has no viewBox; pass box=<design box height>")
+            scale = height / box_h
+            centre = np.array([view[0] + view[2] / 2.0, -(view[1] + view[3] / 2.0)]) if view else (lo + hi) / 2.0
+        if min_stroke:
+            loops = geom2d.svg_loops(path, mode=mode, min_stroke=float(min_stroke) / scale)
+            if view is not None:
+                loops = [l for l in loops if not page(l)] or loops
+        return loops, scale, centre
+
+    def radial_hole(self, angle: float, r: float, depth: float = 0.0, m=None, d: float | None = None,
+                    length: float = 10.0, inward: bool = True, **hole_kw) -> "Solid":
+        """A hole cutter on a round part: its opening at clock angle `angle`, radius r and depth `depth`
+        (toward the viewer), drilled toward the centre (inward=True, from the outside) or away from it
+        (inward=False, from inside a bore). length is how deep it goes. Other arguments as geo.hole
+        (fit, counterbore, countersink, teardrop)."""
+        direction = self.direction(float(angle)) * (-1.0 if inward else 1.0)
+        return hole(m=m, d=d, depth=length, at=tuple(self.pt(float(angle), float(r), float(depth))),
+                    axis=tuple(direction), **hole_kw)
+
+    # -- splitting a ring to fit a bed
+    def extent(self, solid) -> dict:
+        """Radius and depth range of a solid in this ring's frame."""
+        co = np.array([v.co[:] for v in solid.bm.verts], dtype=np.float64)
+        rel = co - np.array(self.center[:])
+        right, up, front = (np.array(v[:]) for v in (self.right, self.up, self.front))
+        r = np.hypot(rel @ right, rel @ up)
+        d = rel @ front
+        return {"r": (float(r.min()), float(r.max())), "depth": (float(d.min()), float(d.max()))}
+
+    def sector(self, a0: float, a1: float, r0: float, r1: float, d0: float, d1: float, seg_deg: float = 2.0) -> "Solid":
+        """A closed annular sector from clock angle a0 to a1 (clockwise), radii r0..r1, depths d0..d1."""
+        span = float(a1) - float(a0)
+        if span <= 0:
+            raise ValueError("a sector needs a1 > a0 (clock angles, clockwise)")
+        if span >= 360.0 - 1e-9:
+            return _solid_from(lambda bm: self.band(bm, 0.0, 360.0, r0, r1, None, d0, d1, seg_deg=seg_deg),
+                               _call("sector", a0, a1))
+        return _solid_from(lambda bm: self.band(bm, a0, a1, r0, r1, None, d0, d1, seg_deg=seg_deg), _call("sector", a0, a1))
+
+    def split(self, solid, seams, lap: float | None = None, lap_deg: float | None = None, z_split: float | None = None,
+              fixings=None, pin: dict | None = None, screw: int = 3, front_skin: float | None = None,
+              overshoot_deg: float = 1.0) -> list:
+        """Cut a ring into pieces at clock angles `seams`, so each fits the bed. Returns one Solid per
+        piece, clockwise from the first seam, each with meta["span"] = (from, to) and its name.
+
+        lap: a half-lap joint, as an arc length at the middle radius (scene units), or lap_deg in
+        degrees (a whole number of gear teeth keeps a cut off the teeth). Each piece then runs on past
+        its end seam by the lap: between the laps it is full depth, on the lap at its start it keeps
+        the front half, and on the lap at its end the back half, so the face shows only a hairline.
+        z_split: the depth of the lap's joint face (default: halfway through).
+        fixings: [("pin" | "screw", fraction across the lap, radius)]. Through the back half: pin slip
+        holes, or screw clearance holes counterbored from the back. Into the front half, blind from
+        the joint face: pin press holes, or heat-set insert holes, front_skin (default 1.2 mm) short of
+        the visible face. pin: {"tight": 2.95, "slip": 3.15} in mm; screw: the M size.
+        """
+        seams = sorted({round(float(s) % 360.0, 6) for s in seams})
+        if len(seams) < 2:
+            # One cut opens the ring but makes no pieces: nothing to split.
+            return [solid._derive(solid.desc)]
+        ext = self.extent(solid)
+        (r_min, r_max), (d_min, d_max) = ext["r"], ext["depth"]
+        reach = max(r_max * 0.05, _mm(2.0))
+        rlo, rhi = max(0.0, r_min - reach), r_max + reach
+        dlo, dhi = d_min - reach, d_max + reach
+        r_mid = (r_min + r_max) / 2.0
+        d = float(lap_deg) if lap_deg is not None else (math.degrees(float(lap) / r_mid) if lap else 0.0)
+        split_at = float(z_split) if z_split is not None else (d_min + d_max) / 2.0
+        pins = {"tight": 2.95, "slip": 3.15}
+        pins.update(pin or {})
+        skin = float(front_skin) if front_skin is not None else _mm(1.2)
+        spans = [(a, seams[(i + 1) % len(seams)] + (360.0 if i + 1 == len(seams) else 0.0)) for i, a in enumerate(seams)]
+        if d and any(b - a <= d for a, b in spans):
+            raise ValueError(f"a lap of {d:.3g} degrees is as long as the shortest piece: shorten the lap or use fewer seams")
+        # Fixing cutters per seam: (for the piece ending there, for the piece starting there).
+        at_seam = {}
+        if d and fixings:
+            blind = max(_mm(1.0), (d_max - split_at) - skin)
+            for seam in seams:
+                before, after = [], []
+                for kind, frac, radius in fixings:
+                    angle = seam + d * float(frac)
+                    back = tuple(self.pt(angle, float(radius), d_min))
+                    joint = tuple(self.pt(angle, float(radius), split_at))
+                    toward_front = tuple(self.front)
+                    through = (split_at - d_min) + _mm(0.5)
+                    if kind == "pin":
+                        before.append(hole(d=_mm(pins["slip"]), depth=through, at=back, axis=toward_front))
+                        after.append(hole(d=_mm(pins["tight"]), depth=blind, at=joint, axis=toward_front))
+                    elif kind == "screw":
+                        before.append(hole(m=screw, depth=through, counterbore=True, at=back, axis=toward_front))
+                        after.append(hole(m=screw, fit="insert", depth=min(blind, _mm(_table(INSERT, screw, "heat-set insert")[1] + 0.5)),
+                                          at=joint, axis=toward_front))
+                    else:
+                        raise ValueError("fixings are ('pin' | 'screw', fraction, radius)")
+                at_seam[round(seam, 6)] = (before, after)
+        pieces = []
+        letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for index, (a, b) in enumerate(spans):
+            if d:
+                cutters = [self.sector(b + d, a + 360.0, rlo, rhi, dlo, dhi),
+                           self.sector(a - overshoot_deg, a + d, rlo, rhi, dlo, split_at),
+                           self.sector(b, b + d + overshoot_deg, rlo, rhi, split_at, dhi)]
+                cutters += at_seam.get(round(b % 360.0, 6), ([], []))[0] + at_seam.get(round(a % 360.0, 6), ([], []))[1]
+            else:
+                cutters = [self.sector(b, a + 360.0, rlo, rhi, dlo, dhi)]
+            piece = solid.difference(join(*cutters), union_cutters=True)
+            label = f"{solid.label or 'ring'} {letters[index % 26]}"
+            piece.meta.update(label=label, span=(round(a % 360.0, 4), round((b + d) % 360.0, 4)))
+            pieces.append(piece)
+        return pieces
+
+    def plan_split(self, target, printer: dict | None = None, avoid=None, snap: float | None = None, phase: float = 0.0,
+                   counts=range(1, 13), lap: float | None = None, lap_deg: float | None = None,
+                   margin: float = 2.0) -> dict:
+        """The fewest equal pieces of a ring that fit the printer's bed (turned if need be), with no seam
+        inside an `avoid` span. target: a Solid in this ring's frame, or (r_in, r_out) in scene units.
+        avoid: [(a0, a1)] clock-angle spans a seam must not fall in (chevrons, glyphs). snap: seams only
+        at phase + k x snap (a gear's tooth pitch with phase on a tooth space). Returns {count, seams,
+        span_deg, fit} (fit as vsblender.fit_on_bed), or count None when nothing up to max(counts) fits.
+        """
+        from . import helpers, placement
+
+        if hasattr(target, "bm"):
+            r_in, r_out = self.extent(target)["r"]
+        else:
+            r_in, r_out = (float(v) for v in target)
+        profile = dict(helpers.DEFAULT_PRINTER)
+        profile.update(printer or helpers.printer() or {})
+        bed = profile.get("build_volume") or [220, 220, 250]
+        to_mm = units_mod.units()["bu_to_mm"]
+        r_mid = (r_in + r_out) / 2.0
+        extra = float(lap_deg) if lap_deg is not None else (math.degrees(float(lap) / r_mid) if lap else 0.0)
+        spans = [(float(a0) % 360.0, float(a1) % 360.0) for a0, a1 in (avoid or [])]
+
+        def blocked(angle: float) -> bool:
+            angle %= 360.0
+            for a0, a1 in spans:
+                inside = (a0 <= angle <= a1) if a0 <= a1 else (angle >= a0 or angle <= a1)
+                if inside:
+                    return True
+            return False
+
+        for count in counts:
+            span = 360.0 / int(count)
+            outline = _sector_outline(r_in * to_mm, r_out * to_mm, min(360.0, span + extra))
+            fit = placement.bed_fit(outline, bed[:2], margin)
+            if fit is None:
+                continue
+            step = float(snap) if snap else 0.5
+            offsets = np.arange(0.0, span, step) if int(count) > 1 else [0.0]
+            for off in offsets:
+                seams = [(float(phase) + off + k * span) % 360.0 for k in range(int(count))]
+                if int(count) == 1 or not any(blocked(s) for s in seams):
+                    return {"count": int(count), "seams": [round(s, 4) for s in seams] if int(count) > 1 else [],
+                            "span_deg": round(span, 4), "lap_deg": round(extra, 4), "fit": fit}
+        return {"count": None, "seams": [], "span_deg": None, "lap_deg": round(extra, 4), "fit": None}
 
     def chevron(self, bm, angle: float, outer: float, inner: float, spread: float = 28.0, wing: float = 0.45,
                 notch: float = 0.15, z0: float = 0.0, z1: float = 0.02, count: int = 1, mat: int = 0) -> list:
@@ -479,6 +667,18 @@ class Ring:
         for i in range(n):
             faces += prism(bm, [loop], z0, z1, self.on(None, a=float(angle) + step * i), mat=mat)
         return faces
+
+
+def _sector_outline(r_in: float, r_out: float, span: float, n: int = 96) -> np.ndarray:
+    """An annular sector's flat outline (bisector along +y); a 360 span is the outer circle."""
+    if span >= 360.0 - 1e-9:
+        t = np.linspace(0.0, 2 * math.pi, n, endpoint=False)
+        return np.column_stack([r_out * np.cos(t), r_out * np.sin(t)])
+    half = math.radians(span / 2.0)
+    t = np.linspace(-half, half, n + 1)
+    outer = np.column_stack([r_out * np.sin(t), r_out * np.cos(t)])
+    inner = np.column_stack([r_in * np.sin(t[::-1]), r_in * np.cos(t[::-1])])
+    return np.vstack([outer, inner])
 
 
 def ring(up="+Y", front="+Z", center=(0.0, 0.0, 0.0), clockwise: bool = True) -> Ring:
@@ -715,25 +915,36 @@ def replace_mesh(ob, bm, keep_slots: bool = True, smooth_deg: float | None = Non
 
     The mesh is rewritten in place, so modifiers, constraints, animation, custom properties and the
     material slots stay. Replacing ob.data with a new mesh instead drops the slots, and materials
-    keyed per slot then lose their last user. shared="copy" makes a shared mesh single-user first.
-    Shape keys cannot survive a topology change: the mesh is swapped and a warning is raised.
+    keyed per slot then lose their last user. A mesh other objects share (linked duplicates):
+    shared="all" writes it for every object that uses it, shared="copy" gives this object its own copy
+    first, and the default refuses. Shape keys cannot survive a topology change: the mesh is swapped
+    and a warning is raised.
     """
     me = ob.data
     if ob.type != "MESH" or me is None:
         raise ValueError(f"{ob.name} is not a mesh object")
-    if me.users > 1:
+    if shared not in ("error", "copy", "all"):
+        raise ValueError("shared must be 'error', 'copy' or 'all'")
+    users = [o for o in bpy.data.objects if o.type == "MESH" and o.data == me]
+    if len(users) > 1 or me.users > 1:
         if shared == "copy":
             me = me.copy()
             ob.data = me
-        else:
-            raise ValueError(f"{ob.name}'s mesh {me.name} is shared by {me.users} users; pass shared='copy'")
+            users = [ob]
+        elif shared != "all":
+            others = [o.name for o in users if o != ob]
+            named = f" ({', '.join(others[:4])}{' ...' if len(others) > 4 else ''})" if others else ""
+            raise ValueError(f"{ob.name}'s mesh {me.name} is shared by {max(me.users, len(users))} users{named}. "
+                             "to_object(..., shared='all') updates every object that uses it (linked duplicates); "
+                             "shared='copy' gives this object its own mesh")
     materials = list(me.materials) if keep_slots else []
     if me.shape_keys is not None:
         _warn(f"{ob.name}: its shape keys cannot follow new geometry; the mesh was replaced without them")
         new = bpy.data.meshes.new(me.name)
         bm.to_mesh(new)
         old_name = me.name
-        ob.data = new
+        for user in users or [ob]:
+            user.data = new
         if me.users == 0:
             bpy.data.meshes.remove(me)
         new.name = old_name
@@ -791,6 +1002,19 @@ class Solid:
         lo, hi = self.bounds
         size = hi - lo
         return f"<Solid {self.desc[:80]} {len(self.bm.faces)} faces size {size.x:.4g} x {size.y:.4g} x {size.z:.4g}>"
+
+    # -- naming
+    @property
+    def label(self) -> str | None:
+        """The name warnings use for this solid (named(), or the object to_object writes)."""
+        return self.meta.get("label")
+
+    def named(self, label: str) -> "Solid":
+        """The same solid with a name that warnings about it use. Transforms and clean() keep it, and a
+        boolean keeps the name of its first operand."""
+        out = self._derive(self.desc)
+        out.meta["label"] = str(label)
+        return out
 
     # -- transforms
     def transform(self, matrix, desc: str | None = None) -> "Solid":
@@ -891,29 +1115,51 @@ class Solid:
         are then subtracted as their union; the warning says when it is needed)."""
         return _boolean(self, list(others), "DIFFERENCE", solver, union_cutters)
 
-    def intersect(self, *others, solver: str = "auto") -> "Solid":
-        return _boolean(self, list(others), "INTERSECT", solver)
+    def intersect(self, *others, solver: str = "auto", union_cutters: bool = False) -> "Solid":
+        """self and others in common. union_cutters=True: the others (and the shells inside each, a
+        geo.join of parts that touch or overlap) are unioned first, so the result is self & (b | c | ...);
+        without it several operands give self & b & c, and a join whose shells overlap reports volume
+        that no single part has."""
+        return _boolean(self, list(others), "INTERSECT", solver, union_cutters)
 
     def clean(self, dist: float | None = None) -> "Solid":
-        """Remove the zero-area slivers booleans leave, by collapsing their degenerate edges, without
-        welding separate shells (finish() welds, which turns shells that touch into coincident faces
-        and non-manifold edges). The result is checked: when it has more open, non-manifold or flipped
-        edges than before, the solid is returned unchanged with a warning."""
+        """Remove the zero-area slivers booleans leave, without welding separate shells and without
+        merging faces into n-gons (an n-gon around a hole can be filled across it when tessellated).
+
+        A sliver whose shortest edge is under dist has that edge collapsed, only where the mesh stays
+        manifold (the edge's ends share exactly the two neighbours of its faces). A sliver with a vertex
+        lying on its long edge has that edge flipped with the neighbouring triangle. Faces next to a
+        sliver are triangulated first. What cannot be fixed safely is left and counted in the log.
+
+        The result is checked against the input: more open, non-manifold or flipped edges, more face
+        crossings (meshdata.crossings), more shells, or a changed volume return the input unchanged,
+        with a warning that names the solid (named()). dist: the length below which an edge or a
+        triangle's height is a sliver; default diagonal x 1e-8.
+        """
         tol = float(dist) if dist else _merge_dist(self.bm) * 1e-2
-        before = self.check()
+        if not _sliver_faces(self.bm, tol):
+            out = self._derive(self.desc)
+            out.log.append("clean: no slivers")
+            return out
+        before = self.check(crossings=True)
         out = self._derive(f"{self.desc}.clean()")
-        bmesh.ops.dissolve_degenerate(out.bm, dist=tol, edges=out.bm.edges)
+        fixed, left = _remove_slivers(out.bm, tol)
         loose = [v for v in out.bm.verts if not v.link_faces]
         if loose:
             bmesh.ops.delete(out.bm, geom=loose, context="VERTS")
         out.bm.normal_update()
-        after = out.check()
-        worse = [k for k in ("open_edges", "non_manifold_edges", "flipped_edges") if after[k] > before[k]]
+        after = out.check(crossings=True)
+        worse = [k for k in ("open_edges", "non_manifold_edges", "flipped_edges", "crossings", "shells") if after[k] > before[k]]
+        scale = max(abs(before["volume"]), float(np.prod([max(v, 1e-12) for v in before["size"]])) * 1e-6, 1e-30)
+        if abs(after["volume"] - before["volume"]) > scale * 1e-6:
+            worse.append("volume")
         if worse:
-            _warn(f"clean() would have added {', '.join(f'{k} {before[k]} -> {after[k]}' for k in worse)}; the solid was left as it was")
+            changes = ", ".join(f"{k} {_fmt(before[k])} -> {_fmt(after[k])}" for k in worse)
+            _warn(f"clean() on {_who(self)} would have changed {changes}; the solid was left as it was")
             out.bm.free()
             return self._derive(self.desc)
-        out.log.append(f"clean: {_zero_area(self)} -> {_zero_area(out)} zero-area triangles")
+        out.log.append(f"clean: {_zero_area(self)} -> {_zero_area(out)} zero-area triangles "
+                       f"({fixed} collapsed or flipped, {left} left)")
         return out
 
     def __add__(self, other):
@@ -957,11 +1203,21 @@ class Solid:
     def arrays(self) -> meshdata.MeshArrays:
         return meshdata.from_bmesh(self.bm)
 
-    def check(self) -> dict:
-        """Closed, consistently wound, shells and volume, in scene units."""
-        # Weld only float noise: a coarser weld merges close but distinct vertices and invents defects.
-        stats = meshdata.mesh_stats(self.arrays(), _merge_dist(self.bm) * 1e-3)
+    def check(self, crossings: bool = False) -> dict:
+        """Closed, consistently wound, shells and volume, in scene units.
+
+        Welded the way check_model and the exporter weld (meshdata.best_weld): the near-coincident
+        vertices booleans leave are joined, unless joining them makes more open or non-manifold edges
+        than float-noise welding does. crossings=True also counts triangle pairs that meet without being
+        neighbours, on the unwelded mesh (meshdata.crossings): cut, overlap, touch, and their sum.
+        """
+        arrays = self.arrays()
+        stats = meshdata.stable_stats(arrays)
         stats["size"] = [round(v, 6) for v in self.size]
+        if crossings:
+            found = meshdata.crossings(arrays)
+            stats["crossings"] = found["cut"] + found["overlap"] + found["touch"]
+            stats["crossing_kinds"] = {k: found[k] for k in ("cut", "overlap", "touch")}
         return stats
 
     # -- output
@@ -974,7 +1230,8 @@ class Solid:
         return me
 
     def to_object(self, name: str, materials=None, collection=None, smooth_deg: float | None = 30.0,
-                  uv: str | None = "box", modifiers=None, replace: bool = True, parent=None, space: str = "world"):
+                  uv: str | None = "box", modifiers=None, replace: bool = True, parent=None, space: str = "world",
+                  shared: str = "error", hardware: bool | None = None):
         """Create the object, or update an existing one of that name in place.
 
         space="world" (default): the solid is in world coordinates; an existing object keeps its
@@ -986,6 +1243,10 @@ class Solid:
         missing; vsblender.material sets their look). smooth_deg: smooth shading with sharp edges
         above this angle (None: flat). uv="box": box-projected UVs. modifiers: [("BEVEL", {"width":
         0.002}), ...], created or updated by name. Records how it was built in ob["ai_spec"].
+        shared: when the object's mesh is shared with other objects (linked duplicates, a print copy),
+        "all" writes the new geometry for all of them, "copy" splits this object off, "error" refuses.
+        hardware: True marks it a stand-in (vsblender_hardware: a bearing, a motor, glass), which
+        check_model and export_model leave out by default; False clears the mark.
         """
         if space not in ("world", "local"):
             raise ValueError("space must be world or local")
@@ -1019,7 +1280,7 @@ class Solid:
                     bmesh.ops.transform(bm, matrix=inverse, verts=bm.verts)
                     if inverse.to_3x3().determinant() < 0:
                         bmesh.ops.reverse_faces(bm, faces=bm.faces)
-                replace_mesh(ob, bm, keep_slots=True)
+                replace_mesh(ob, bm, keep_slots=True, shared=shared)
             else:
                 if ob is not None:
                     raise ValueError(f"{name} already exists (replace=False)")
@@ -1095,12 +1356,128 @@ class Solid:
         if self.meta.get("part"):
             spec["part"] = self.meta["part"]
             spec["part_params"] = self.meta.get("params") or {}
+        if hardware is not None:
+            from . import marks
+
+            marks.set_hardware(ob, bool(hardware))
         text = json.dumps(spec, default=str)
         if len(text) > 2000:  # the geo description goes first: the parameters are what matter
             spec["geo"] = spec["geo"][: max(0, 1500 - (len(text) - 2000))]
             text = json.dumps(spec, default=str)[:2000]
         ob["ai_spec"] = text
         return ob
+
+
+def _who(solid) -> str:
+    """How a warning names a solid: its label (named(), to_object), else the start of its description."""
+    label = solid.meta.get("label") if solid is not None else None
+    if label:
+        return str(label)
+    desc = solid.desc if solid is not None else "solid"
+    return desc if len(desc) <= 60 else desc[:57] + "..."
+
+
+def _sliver_faces(bm, tol: float) -> list:
+    """Faces whose tessellation has a triangle with an edge, or a height, under tol."""
+    if not len(bm.faces):
+        return []
+    bm.faces.index_update()
+    arrays = meshdata.from_bmesh(bm)
+    if not len(arrays.tris):
+        return []
+    v, t = arrays.verts, arrays.tris
+    a, b, c = v[t[:, 0]], v[t[:, 1]], v[t[:, 2]]
+    edges = np.stack([np.linalg.norm(b - a, axis=1), np.linalg.norm(c - b, axis=1), np.linalg.norm(a - c, axis=1)], axis=1)
+    longest = edges.max(axis=1)
+    twice_area = np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    height = np.divide(twice_area, longest, out=np.zeros_like(twice_area), where=longest > 0)
+    bad = (edges.min(axis=1) < tol) | (height < tol)
+    if not bad.any():
+        return []
+    bm.faces.ensure_lookup_table()
+    return [bm.faces[int(i)] for i in np.unique(arrays.face[bad])]
+
+
+def _can_collapse(edge) -> bool:
+    """The link condition: collapsing this edge keeps a manifold triangle mesh manifold."""
+    if not edge.is_manifold or len(edge.link_faces) != 2:
+        return False
+    a, b = edge.verts
+    if not all(e.is_manifold for e in list(a.link_edges) + list(b.link_edges)):
+        return False
+    opposite = set()
+    for f in edge.link_faces:
+        if len(f.verts) != 3:
+            return False
+        opposite.update(v for v in f.verts if v is not a and v is not b)
+    common = {e.other_vert(a) for e in a.link_edges} & {e.other_vert(b) for e in b.link_edges}
+    return len(opposite) == 2 and common == opposite
+
+
+def _flip_cap(edge, face) -> bool:
+    """Flip the long edge of a cap sliver (face) with the triangle across it, when the sliver's third
+    vertex lies inside that edge and the two new triangles face the way the neighbour does."""
+    if not edge.is_manifold or len(edge.link_faces) != 2:
+        return False
+    other = edge.link_faces[0] if edge.link_faces[1] == face else edge.link_faces[1]
+    if len(other.verts) != 3 or len(face.verts) != 3:
+        return False
+    a, b = edge.verts
+    v = next(x for x in face.verts if x is not a and x is not b)
+    w = next(x for x in other.verts if x is not a and x is not b)
+    ab = b.co - a.co
+    length2 = ab.length_squared
+    if length2 <= 0:
+        return False
+    t = (v.co - a.co).dot(ab) / length2
+    if not (0.0 < t < 1.0):
+        return False
+    if any(e.other_vert(v) is w for e in v.link_edges):
+        return False
+    other.normal_update()
+    reference = other.normal.copy()
+    new = bmesh.utils.edge_rotate(edge, False)
+    if new is None:
+        return False
+    for f in new.link_faces:
+        f.normal_update()
+        if f.normal.dot(reference) <= 0:
+            bmesh.utils.edge_rotate(new, True)
+            return False
+    return True
+
+
+def _remove_slivers(bm, tol: float, rounds: int = 8) -> tuple:
+    """(fixed, left): collapse short edges and flip cap slivers, in rounds until nothing changes."""
+    fixed = 0
+    for _ in range(rounds):
+        faces = _sliver_faces(bm, tol)
+        if not faces:
+            return fixed, 0
+        region = set(faces)
+        for f in faces:
+            for v in f.verts:
+                region.update(v.link_faces)
+        ngons = [f for f in region if len(f.verts) > 3]
+        if ngons:
+            bmesh.ops.triangulate(bm, faces=ngons, quad_method="BEAUTY", ngon_method="BEAUTY")
+        changed = 0
+        for f in _sliver_faces(bm, tol):
+            if not f.is_valid or len(f.verts) != 3:
+                continue
+            ordered = sorted(f.edges, key=lambda e: e.calc_length())
+            short, long_ = ordered[0], ordered[-1]
+            if short.calc_length() < tol:
+                if _can_collapse(short):
+                    bmesh.ops.collapse(bm, edges=[short], uvs=True)
+                    changed += 1
+                continue
+            if _flip_cap(long_, f):
+                changed += 1
+        fixed += changed
+        if not changed:
+            break
+    return fixed, len(_sliver_faces(bm, tol))
 
 
 def _zero_area(solid) -> int:
@@ -1302,14 +1679,37 @@ def _boolean(base: Solid, others: list, op: str, solver: str = "auto", union_cut
     desc = f"({base.desc}) {symbol} " + f" {symbol} ".join(f"({o.desc})" for o in others)
     if not others:
         return base._derive(base.desc)
-    if not union_cutters and op in ("DIFFERENCE", "UNION"):
+    shells, crossing = crossing_shells(base.bm)
+    if crossing:
+        _warn(f"{op.lower()}: {_who(base)} has {shells} shells that cut through each other ({crossing} crossing face pairs), "
+              "so it is not one closed solid and the result can count the overlap twice. Union its parts first "
+              "(geo.union(*parts, union_cutters=True)).")
+    if not union_cutters:
         for o in others:
             shells, crossing = crossing_shells(o.bm)
             if crossing:
-                _warn(f"{op.lower()}: a cutter has {shells} shells, and some cut through each other ({crossing} crossing face "
-                      f"pairs). Booleans need each operand to be one closed solid, so the overlaps can cut as crescents "
-                      f"instead of their union. Pass union_cutters=True (a.difference(b, union_cutters=True)).")
+                fix = "a.intersect(b, union_cutters=True)" if op == "INTERSECT" else "a.difference(b, union_cutters=True)"
+                _warn(f"{op.lower()}: {_who(o)} has {shells} shells, and some cut through each other ({crossing} crossing face "
+                      f"pairs). Booleans need each operand to be one closed solid, so the overlaps can "
+                      f"{'count twice' if op == 'INTERSECT' else 'cut as crescents instead of their union'}. "
+                      f"Pass union_cutters=True ({fix}).")
                 break
+    if union_cutters and op == "INTERSECT":
+        # self & (b | c | ...): Blender intersects every operand of a collection with every other.
+        pieces = [Solid(bm, f"shell of {_who(o)}") for o in others for bm in _split_shells(o.bm)]
+        if len(pieces) > 1:
+            whole = _boolean_run(pieces[0], pieces[1:], [p.bm for p in pieces[1:]], "UNION", solver,
+                                 "union of the operands", True)
+        else:
+            whole = pieces[0]
+        try:
+            out = _boolean_run(base, [whole], [whole.bm], op, solver, desc, False)
+        finally:
+            for p in pieces:
+                p.bm.free()
+            if whole not in pieces:
+                whole.bm.free()
+        return out
     other_bms = [o.bm for o in others]
     split = []
     if union_cutters:
@@ -1321,6 +1721,26 @@ def _boolean(base: Solid, others: list, op: str, solver: str = "auto", union_cut
     finally:
         for bm in split:
             bm.free()
+
+
+def _open_edges(bm) -> int:
+    return sum(1 for e in bm.edges if not e.is_manifold)
+
+
+def _volume_bound(op: str, base_bm, other_bms: list) -> tuple:
+    """(largest believable result volume, what it is) for a boolean, from the volumes of the operands
+    that are closed. (None, "") when no closed operand bounds it: an open mesh has no volume to trust."""
+    closed_b = _closed(base_bm)
+    if op == "INTERSECT":
+        trusted = ([abs(float(base_bm.calc_volume(signed=True)))] if closed_b else []) + \
+                  [abs(float(bm.calc_volume(signed=True))) for bm in other_bms if _closed(bm)]
+        return (min(trusted), "the smaller closed operand") if trusted else (None, "")
+    if op == "DIFFERENCE":
+        return (abs(float(base_bm.calc_volume(signed=True))), "the solid it was cut from") if closed_b else (None, "")
+    if closed_b and all(_closed(bm) for bm in other_bms):
+        total = abs(float(base_bm.calc_volume(signed=True))) + sum(abs(float(bm.calc_volume(signed=True))) for bm in other_bms)
+        return total, "the operands together"
+    return None, ""
 
 
 def _boolean_run(base: Solid, others: list, other_bms: list, op: str, solver: str, desc: str, union_cutters: bool) -> Solid:
@@ -1338,6 +1758,16 @@ def _boolean_run(base: Solid, others: list, other_bms: list, op: str, solver: st
     log = list(base.log)
     for o in others:
         log += o.log
+    operands = [base] + list(others)
+    not_closed = [o for o in operands if not _closed(o.bm)]
+    if wanted == "AUTO" and not_closed and "MANIFOLD" in available:
+        for o in not_closed:
+            _warn(f"{op.lower()} used the Exact solver because {_who(o)} is not closed ({_open_edges(o.bm)} open or "
+                  "non-manifold edges); the Manifold solver needs every operand closed (o.check(), o.clean())")
+    bound, bound_what = _volume_bound(op, base.bm, other_bms)
+    lo, hi = base.bounds
+    slack = float((hi - lo).length) ** 3 * 1e-9 + 1e-15
+    meta = {"label": base.label} if base.label else {}
     last_error = None
     for index, name in enumerate(order):
         import time
@@ -1350,10 +1780,25 @@ def _boolean_run(base: Solid, others: list, other_bms: list, op: str, solver: st
         ms = int((time.time() - started) * 1000)
         ok = len(bm.faces) > 0 or op == "INTERSECT"
         closed_in = _closed(base.bm) and all(_closed(o.bm) for o in others)
+        result = abs(float(bm.calc_volume(signed=True))) if len(bm.faces) else 0.0
+        if ok and bound is not None and result > bound * 1.001 + slack:
+            because = f" ({', '.join(_who(o) for o in not_closed)} not closed)" if not_closed else ""
+            message = (f"{op.lower()} with the {name} solver gave a volume of {_fmt(result)}, more than {bound_what} "
+                       f"({_fmt(bound)}){because}: the result is inside out or overlaps itself")
+            if wanted != "AUTO":
+                _warn(message + "; it was kept because solver= was given")
+            elif index < len(order) - 1:
+                bm.free()
+                last_error = RuntimeError(message)
+                continue
+            else:
+                bm.free()
+                raise RuntimeError(f"boolean {message}. Make every operand closed (check(), clean()), or pass "
+                                   "solver= to keep such a result")
         if ok and (not closed_in or _closed(bm) or index == len(order) - 1):
             extra = f", {len(other_bms)} cutter shells as separate operands" if union_cutters else ""
             log.append(f"{op.lower()}: {name} solver, {ms} ms{extra}" + ("" if index == 0 else " (after a retry)"))
-            return Solid(bm, desc, log)
+            return Solid(bm, desc, log, meta)
         bm.free()
         last_error = RuntimeError(f"{name} gave an {'empty' if not ok else 'open'} result")
     raise RuntimeError(f"boolean {op.lower()} failed: {last_error}")
@@ -1413,18 +1858,18 @@ def _run_boolean(base_bm, other_bms: list, op: str, solver: str):
                 pass
 
 
-def union(*solids, solver: str = "auto") -> Solid:
+def union(*solids, solver: str = "auto", union_cutters: bool = False) -> Solid:
     solids = [s for s in solids if s is not None]
-    return solids[0].union(*solids[1:], solver=solver)
+    return solids[0].union(*solids[1:], solver=solver, union_cutters=union_cutters)
 
 
-def difference(base: Solid, *cutters, solver: str = "auto") -> Solid:
-    return base.difference(*cutters, solver=solver)
+def difference(base: Solid, *cutters, solver: str = "auto", union_cutters: bool = False) -> Solid:
+    return base.difference(*cutters, solver=solver, union_cutters=union_cutters)
 
 
-def intersect(*solids, solver: str = "auto") -> Solid:
+def intersect(*solids, solver: str = "auto", union_cutters: bool = False) -> Solid:
     solids = [s for s in solids if s is not None]
-    return solids[0].intersect(*solids[1:], solver=solver)
+    return solids[0].intersect(*solids[1:], solver=solver, union_cutters=union_cutters)
 
 
 # ----------------------------------------------------------------------------- primitives
@@ -1672,13 +2117,14 @@ def _iso_d(m, d) -> float:
 
 def thread(m=None, d: float | None = None, pitch: float | None = None, length: float = 10.0, internal: bool = False,
            clearance: float | None = None, starts: int = 1, left: bool = False, chamfer: bool = True,
-           quality: int = 16, segments: int | None = None) -> Solid:
+           quality: int = 16, segments: int | None = None, at=None, axis=None) -> Solid:
     """An ISO metric (60 degree) threaded rod from z = 0 to length, or with internal=True the shape to
     subtract for a threaded hole (slightly larger, overshooting both ends).
 
     m: ISO size (M8 -> m=8, pitch from the coarse table). d and pitch: scene units. clearance: total
     diametral play (default 0.2 mm in print projects, else 0). The profile is built by displacing a
-    grid, so it is closed by construction.
+    grid, so it is closed by construction. at and axis ("+Z" default) put its start at a point and run
+    it along a direction.
     """
     major = _iso_d(m, d)
     if pitch is None:
@@ -1735,7 +2181,7 @@ def thread(m=None, d: float | None = None, pitch: float | None = None, length: f
         bm.faces.new((top, grid[-1][j], grid[-1][jn]))
     finish(bm, recalc_normals=False)
     size = f"M{_m_key(m)}" if m is not None else _fmt(major)
-    return Solid(bm, _call("thread", size, pitch=pitch, length=length, internal=internal, left=left))
+    return _placed(Solid(bm, _call("thread", size, pitch=pitch, length=length, internal=internal, left=left)), at, axis, "+Z")
 
 
 def _hole_d(m, d, fit: str) -> float:
@@ -1762,15 +2208,44 @@ def _hole_d(m, d, fit: str) -> float:
     return _mm(value) + comp
 
 
+def _axis_frame(axis, native: str) -> Matrix:
+    """Rotation taking a cutter built along native ("-Z": a hole going down, "+Z": a rod going up) to
+    axis, rolled so its local +Y points as near world +Z as it can (a teardrop's peak stays up)."""
+    a = axis_vector(axis).normalized()
+    z = -a if native == "-Z" else a
+    up = Vector((0.0, 0.0, 1.0))
+    y = up - z * up.dot(z)
+    if y.length < 1e-6:
+        y = Vector((0.0, 1.0, 0.0)) - z * z.y
+    y.normalize()
+    x = y.cross(z).normalized()
+    return Matrix((x, y, z)).transposed().to_4x4()
+
+
+def _placed(s: Solid, at, axis, native: str) -> Solid:
+    """s moved so its opening is at `at` and it runs along `axis` (into the material for a hole)."""
+    default = "-Z" if native == "-Z" else "+Z"
+    if at is None and (axis is None or (isinstance(axis, str) and axis.strip().upper() == default)):
+        return s
+    m = _axis_frame(axis if axis is not None else default, native)
+    if at is not None:
+        m = Matrix.Translation(Vector(tuple(at)[:3])) @ m
+    out = s.transform(m, s.desc)
+    out.desc = s.desc + (f".at({_fmt(tuple(at))})" if at is not None else "") + (f".axis({axis!r})" if axis is not None else "")
+    return out
+
+
 def hole(m=None, d: float | None = None, depth: float = 10.0, fit: str = "normal", counterbore=None, countersink=None,
-         teardrop: bool = False, segments: int | None = None) -> Solid:
+         teardrop: bool = False, segments: int | None = None, at=None, axis=None) -> Solid:
     """A cutter for a hole, to subtract: its open end at z = 0, going down depth (overshooting up a little).
 
+    at=(x, y, z) puts the opening there, and axis ("-Z" default, "+Y", "-X" or a vector) is the
+    direction the hole goes into the material: hole(m=3, depth=8, at=(0, 12, 5), axis="+Y") drills in
+    from a face looking toward -Y. Round parts: geo.ring(...).radial_hole.
     m with fit: close/normal/loose (ISO 273 clearance), tap (tap drill), insert (heat-set insert),
     press, exact. counterbore=True (cap screw head) or (diameter, depth); countersink=True (90 degree
-    flat head) or diameter. teardrop=True adds a 45 degree peak towards +Y: rotate(x=90) makes a
-    horizontal hole along Y that prints without support. In print projects the printer's hole
-    compensation is added.
+    flat head) or diameter. teardrop=True adds a 45 degree peak: on a horizontal axis it points up, so
+    the hole prints without support. In print projects the printer's hole compensation is added.
     """
     dia = _hole_d(m, d, fit)
     depth = float(depth)
@@ -1823,13 +2298,13 @@ def hole(m=None, d: float | None = None, depth: float = 10.0, fit: str = "normal
     size = f"M{_m_key(m)}" if m is not None else _fmt(dia)
     s.desc = _call("hole", size, depth=depth, fit=fit if m is not None else None, counterbore=bool(counterbore),
                    countersink=bool(countersink), teardrop=teardrop)
-    return s
+    return _placed(s, at, axis, "-Z")
 
 
-def nut_trap(m, depth: float | None = None, clearance: float | None = None) -> Solid:
+def nut_trap(m, depth: float | None = None, clearance: float | None = None, at=None, axis=None) -> Solid:
     """A hexagonal pocket for an ISO 4032 nut, to subtract: open at z = 0, going down depth
     (default the nut height plus 0.2 mm). clearance: added across the flats (default 0.3 mm in print
-    projects)."""
+    projects). at and axis place it as for hole()."""
     af, height = _table(NUT, m, "hex nut")
     if clearance is None:
         clearance = _mm(0.3) if _printer() is not None else 0.0
@@ -1840,4 +2315,48 @@ def nut_trap(m, depth: float | None = None, clearance: float | None = None) -> S
     loop = geom2d.regular(6, across_corners, rotation_deg=30.0)
     s = extrude([loop], depth + over, z0=-depth)
     s.desc = _call("nut_trap", f"M{_m_key(m)}", depth=depth)
+    return _placed(s, at, axis, "-Z")
+
+
+# ----------------------------------------------------------------------------- gears
+def gear(teeth: int, module: float, thickness: float, bore: float | None = None, hub_d: float | None = None,
+         hub_h: float = 0.0, shift: float = 0.0, backlash: float | None = None, phase: float = 0.0,
+         clearance: float = 0.25, tip_relief: float = 0.0) -> Solid:
+    """An involute spur gear standing on z = 0, centred on the Z axis.
+
+    module and backlash are millimetres, like m= on threads (module 1.5: pitch diameter = 1.5 mm x
+    teeth); thickness, bore, hub_d and hub_h are scene units. backlash defaults to 0.1 mm in print
+    projects (0 otherwise), taken off each tooth. shift: profile shift (geom2d.gear_pair says when a
+    small pinion needs it). phase: the clock angle of tooth 0 (degrees clockwise from +Y). hub_d/hub_h
+    add a boss on top; bore cuts a hole through both.
+    """
+    if backlash is None:
+        backlash = 0.1 if _printer() is not None else 0.0
+    m_bu = _mm(module)
+    loop = geom2d.spur(int(teeth), m_bu, shift=shift, backlash=_mm(backlash), clearance=clearance, phase=phase,
+                       tip_relief=_mm(tip_relief))
+    s = extrude([loop], float(thickness))
+    if hub_d and hub_h:
+        hub = cylinder(d=float(hub_d), h=float(hub_h) + float(thickness) * 0.5).move(0, 0, float(thickness) * 0.5)
+        s = s.union(hub)
+    if bore:
+        total = float(thickness) + float(hub_h or 0.0)
+        s = s.difference(cylinder(d=float(bore), h=total + 2 * _mm(1.0)).move(0, 0, -_mm(1.0)))
+    s.desc = _call("gear", int(teeth), module=module, thickness=thickness, bore=bore, hub_d=hub_d, hub_h=hub_h,
+                   shift=shift, phase=phase)
+    s.meta.update({"gear": {"teeth": int(teeth), "module_mm": float(module), "shift": float(shift)}})
+    return s
+
+
+def rack(module: float, teeth: int, height: float, thickness: float, backlash: float | None = None,
+         clearance: float = 0.25, extra: float = 0.0) -> Solid:
+    """A straight rack: teeth along +Y facing +X, the pitch line at x = 0, from z = 0 up by thickness.
+    module and backlash are millimetres; height (pitch line to the back, toward -X), thickness and
+    extra (plain bar at each end) are scene units."""
+    if backlash is None:
+        backlash = 0.1 if _printer() is not None else 0.0
+    loop = geom2d.rack(_mm(module), int(teeth), float(height), backlash=_mm(backlash), clearance=clearance,
+                       extra=float(extra))
+    s = extrude([loop], float(thickness))
+    s.desc = _call("rack", module=module, teeth=int(teeth), height=height, thickness=thickness)
     return s

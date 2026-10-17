@@ -6,6 +6,7 @@ even-odd rule (a loop inside another is a hole), which is what SVG fills and gly
     svg_loops(path, size=40)      SVG fills and strokes -> outline loops, y up, optionally scaled
     triangulate(loops)            -> (points, triangles) counter-clockwise, holes left open
     circle(d), rect(w, h, r), regular(n, d), arch(w, length), polygon(points), offset(loops, delta)
+    spur(teeth, module), rack(module, teeth, height), gear_dims(...), gear_pair(teeth, pinion, module)
 
 triangulate uses mathutils.geometry.delaunay_2d_cdt and keeps the triangles inside by even-odd:
 tessellate_polygon mis-fills concave outlines (a "Λ" comes out as a solid triangle).
@@ -57,6 +58,143 @@ def rect(w: float, h: float, r: float = 0.0, center: bool = True, segments: int 
 
 def polygon(points) -> np.ndarray:
     return np.asarray(points, float).reshape(-1, 2)
+
+
+# ----------------------------------------------------------------------------- gears (involute, 20 degrees)
+PRESSURE_DEG = 20.0
+
+
+def _inv(a: float) -> float:
+    return math.tan(a) - a
+
+
+def _clock_xy(angle_deg: float, r: float) -> tuple:
+    t = math.radians(angle_deg)
+    return (r * math.sin(t), r * math.cos(t))
+
+
+def gear_dims(teeth: int, module: float, shift: float = 0.0, clearance: float = 0.25,
+              pressure: float = PRESSURE_DEG) -> dict:
+    """Radii of an external involute spur gear, in the module's units: pitch, base, tip, root, and
+    the tooth pitch in degrees."""
+    m = float(module)
+    rp = int(teeth) * m / 2.0
+    return {"pitch_r": rp, "base_r": rp * math.cos(math.radians(pressure)), "tip_r": rp + m * (1.0 + shift),
+            "root_r": rp - m * (1.0 + clearance - shift), "pitch_deg": 360.0 / int(teeth)}
+
+
+def spur(teeth: int, module: float, shift: float = 0.0, backlash: float = 0.0, clearance: float = 0.25,
+         phase: float = 0.0, tip_relief: float = 0.0, flank: int = 7, tip: int = 3, root: int = 4,
+         pressure: float = PRESSURE_DEG) -> np.ndarray:
+    """An external involute spur gear's outline, counter-clockwise, centred on the origin.
+
+    module: the size (pitch diameter = teeth x module), in the units the outline comes back in.
+    shift: profile shift coefficient; positive thickens the tooth and avoids undercut on small pinions
+    (gear_pair says when it is needed). backlash: taken off the tooth thickness at the pitch circle.
+    phase: the clock angle (degrees clockwise from +Y, as geo.ring uses) of tooth 0's centre, so a ring
+    can be split in a tooth space: a space is centred at phase + pitch_deg / 2. tip_relief shortens
+    the tip. A tooth whose flanks meet before the tip is cut back to where they meet.
+    """
+    z = int(teeth)
+    if z < 4:
+        raise ValueError("a spur gear needs at least 4 teeth")
+    m = float(module)
+    d = gear_dims(z, m, shift, clearance, pressure)
+    rp, rb, ra, rf = d["pitch_r"], d["base_r"], d["tip_r"] - float(tip_relief), d["root_r"]
+    alpha = math.radians(pressure)
+    s_pitch = math.pi * m / 2.0 + 2.0 * shift * m * math.tan(alpha) - float(backlash)
+    psi_p = s_pitch / (2.0 * rp)
+
+    def half_angle(r: float) -> float:
+        r = max(r, rb)
+        return psi_p + _inv(alpha) - _inv(math.acos(min(1.0, rb / r)))
+
+    r_start = max(rf, rb)
+    lo, hi = r_start, ra
+    if half_angle(hi) <= 0:
+        for _ in range(60):
+            mid = (lo + hi) / 2
+            if half_angle(mid) > 0.02:
+                lo = mid
+            else:
+                hi = mid
+        ra = lo
+    radii = [r_start + (ra - r_start) * (i / flank) ** 0.8 for i in range(flank + 1)]
+    step = 360.0 / z
+    pts = []
+    for j in range(z):
+        c = float(phase) + j * step
+        left = [(c - math.degrees(half_angle(r)), r) for r in radii]
+        right = [(c + math.degrees(half_angle(r)), r) for r in reversed(radii)]
+        a0, a1 = left[-1][0], right[0][0]
+        tip_arc = [(a0 + (a1 - a0) * i / (tip + 1), ra) for i in range(1, tip + 1)]
+        tooth = left + tip_arc + right
+        if rf < rb - 1e-9:   # a radial flank below the base circle
+            tooth = [(left[0][0], rf)] + tooth + [(right[-1][0], rf)]
+        nxt = float(phase) + (j + 1) * step - math.degrees(half_angle(r_start))
+        b0 = tooth[-1][0]
+        root_arc = [(b0 + (nxt - b0) * i / (root + 1), rf) for i in range(1, root + 1)]
+        for angle, r in tooth + root_arc:
+            pts.append(_clock_xy(angle, r))
+    return orient([np.array(pts, float)])[0]
+
+
+def rack(module: float, teeth: int, height: float, backlash: float = 0.0, clearance: float = 0.25,
+         start: float = 0.0, extra: float = 0.0, pressure: float = PRESSURE_DEG) -> np.ndarray:
+    """A straight rack along +y with its teeth toward +x, as one counter-clockwise outline.
+
+    The pitch line is x = 0: teeth stand to x = +module, the roots at -(1 + clearance) module, the back
+    at x = -height. The first tooth's centre is at y = start + pitch / 2; extra adds plain bar at both
+    ends. A pinion meshes with its axis at x = pinion teeth x module / 2 (+ shift x module)."""
+    m = float(module)
+    p = math.pi * m
+    ta = math.tan(math.radians(pressure))
+    add, ded = m, (1.0 + clearance) * m
+    s = p / 2.0 - float(backlash)
+    pts = [(-float(height), start - extra), (-ded, start - extra)]
+    for k in range(int(teeth)):
+        cy = start + p / 2.0 + k * p
+        w_root = s / 2.0 + ded * ta
+        w_tip = max(0.05 * m, s / 2.0 - add * ta)
+        pts += [(-ded, cy - w_root), (add, cy - w_tip), (add, cy + w_tip), (-ded, cy + w_root)]
+    end = start + int(teeth) * p
+    pts += [(-ded, end + extra), (-float(height), end + extra)]
+    return orient([np.array(pts, float)])[0]
+
+
+def gear_pair(teeth: int, pinion: int, module: float, shift: float = 0.0, pinion_shift: float = 0.0,
+              pressure: float = PRESSURE_DEG) -> dict:
+    """Two external spur gears in mesh: centre distance, ratio, contact ratio and undercut.
+
+    warnings lists what to fix: a contact ratio under 1.2 (the teeth hand over roughly), or a gear with
+    fewer teeth than avoid undercut at its shift (raise its shift: x >= 1 - z sin^2(a) / 2)."""
+    m = float(module)
+    alpha = math.radians(pressure)
+    out = {"teeth": int(teeth), "pinion": int(pinion), "module": m, "ratio": int(teeth) / int(pinion)}
+    radii = []
+    warnings = []
+    for label, z, x in (("gear", int(teeth), float(shift)), ("pinion", int(pinion), float(pinion_shift))):
+        d = gear_dims(z, m, x, 0.25, pressure)
+        radii.append(d)
+        z_min = 2.0 * (1.0 - x) / math.sin(alpha) ** 2
+        out[f"{label}_pitch_r"] = d["pitch_r"]
+        out[f"{label}_tip_r"] = d["tip_r"]
+        out[f"{label}_root_r"] = d["root_r"]
+        out[f"{label}_undercut"] = z < z_min
+        if z < z_min:
+            need = 1.0 - z * math.sin(alpha) ** 2 / 2.0
+            warnings.append(f"the {label} ({z} teeth) is undercut at shift {x:g}: use shift >= {need:.2f}")
+    a = radii[0]["pitch_r"] + radii[1]["pitch_r"] + (float(shift) + float(pinion_shift)) * m
+    rb1, rb2 = radii[0]["base_r"], radii[1]["base_r"]
+    ra1, ra2 = radii[0]["tip_r"], radii[1]["tip_r"]
+    cos_w = min(1.0, (rb1 + rb2) / a)
+    alpha_w = math.acos(cos_w)
+    eps = (math.sqrt(max(ra1 ** 2 - rb1 ** 2, 0.0)) + math.sqrt(max(ra2 ** 2 - rb2 ** 2, 0.0)) - a * math.sin(alpha_w)) \
+        / (math.pi * m * math.cos(alpha))
+    out.update(centre_distance=a, contact_ratio=eps, working_pressure_deg=math.degrees(alpha_w), warnings=warnings)
+    if eps < 1.2:
+        warnings.append(f"contact ratio {eps:.2f} is under 1.2: the teeth hand over roughly (more teeth, or less shift)")
+    return out
 
 
 def arch(width: float, length: float, segments: int = 16) -> np.ndarray:
@@ -532,7 +670,8 @@ def load_shapes(path: str) -> list:
                 scale = math.sqrt(abs(np.linalg.det(m[:2, :2]))) or 1.0
                 shapes.append({"kind": "stroke", "subpaths": subs,
                                "width": _length(style.get("stroke-width"), 1.0) * scale,
-                               "cap": style.get("stroke-linecap", "butt")})
+                               "cap": style.get("stroke-linecap", "butt"),
+                               "filled": fill not in ("none", "")})
         for child in el:
             walk(child, m, style)
 
@@ -693,18 +832,51 @@ def simplify(loop, tol: float) -> np.ndarray:
     return out if len(out) >= 3 else loop
 
 
-def _view_box(path: str):
+def svg_view_box(path: str):
+    """The SVG's viewBox as [x, y, width, height] in user units (y down, as in the file), or None."""
     root = ET.parse(path).getroot()
     v = [float(x) for x in _NUM.findall(root.get("viewBox") or "")]
-    return v if len(v) == 4 else None
+    return v if len(v) == 4 and v[2] > 0 and v[3] > 0 else None
+
+
+_view_box = svg_view_box
+
+
+def stroke_width(loops, res: float | None = None) -> float:
+    """The typical stroke width of a filled drawing: twice the median distance to the outline along the
+    middle of its strokes (the ridge of the inside distance field). 0 for an empty drawing."""
+    loops = [np.asarray(l, float) for l in loops if len(l) >= 3]
+    if not loops:
+        return 0.0
+    lo, hi = bounds(loops)
+    size = float(max(hi - lo))
+    res = float(res or size / 300.0)
+    xs = np.arange(lo[0] - 2 * res, hi[0] + 3 * res, res)
+    ys = np.arange(lo[1] - 2 * res, hi[1] + 3 * res, res)
+    px, py = np.meshgrid(xs, ys)
+    F = _region_field(loops, px, py)
+    inner = F[1:-1, 1:-1]
+    ridge = inner > res
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx or dy:
+                ridge &= inner >= F[1 + dy:F.shape[0] - 1 + dy, 1 + dx:F.shape[1] - 1 + dx]
+    if not ridge.any():
+        return float(2 * max(F.max(), 0.0))
+    return float(2 * np.median(inner[ridge]))
 
 
 def svg_loops(path: str, size: float | None = None, res: float | None = None, tol: float | None = None,
-              flip_y: bool = True, center: bool = False, mode: str = "auto") -> list:
+              flip_y: bool = True, center: bool = False, mode: str = "auto", min_stroke: float | None = None) -> list:
     """Outline loops of an SVG: the union of its fills and strokes.
 
     mode auto: files with only fills give their exact polygons (sharp corners stay sharp); any
     stroke switches to a distance field traced with marching squares (overlapping strokes merge).
+    mode fill: fills only. Dropping a hairline outline drawn round a fill (CorelDRAW does this) loses
+    nothing and is not reported; dropping a stroke-only path, or a stroke wider than 1% of the drawing,
+    is (one warning line for all the files of a run).
+    min_stroke (SVG units): strokes are drawn at least this wide, and a filled drawing whose typical
+    stroke (stroke_width) is thinner is grown evenly until it is, for inlays a nozzle can print.
     flip_y: SVG y points down; the loops come back y up. size scales the longer side to size.
     center moves the bounding box centre to the origin. Units are the SVG's user units unless size.
     """
@@ -712,13 +884,27 @@ def svg_loops(path: str, size: float | None = None, res: float | None = None, to
     if not shapes:
         raise ValueError(f"no visible shapes in {path}")
     strokes = any(sh["kind"] == "stroke" for sh in shapes)
+    if min_stroke:
+        for sh in shapes:
+            # Line work is widened; an outline drawn round a fill is not (it would grow the whole shape).
+            if sh["kind"] == "stroke" and not sh.get("filled"):
+                sh["width"] = max(float(sh["width"]), float(min_stroke))
     if mode == "fill" and strokes:
-        from . import helpers
+        allpts = np.vstack([np.asarray(p, float) for sh in shapes for p, _c in sh["subpaths"]])
+        extent = float(max(allpts.max(axis=0) - allpts.min(axis=0))) or 1.0
+        lost = [sh for sh in shapes if sh["kind"] == "stroke" and (not sh.get("filled") or sh["width"] > 0.01 * extent)]
+        if lost:
+            from . import helpers
 
-        helpers.warn(f"svg_loops mode=fill drops strokes in {os.path.basename(path)}; use mode='auto' to include them")
+            helpers.warn("svg_loops mode=fill dropped strokes that carry shape in {n} file(s) ({items}); "
+                         "use mode='auto' to include them", group="svg_fill_strokes", item=os.path.basename(path))
     if mode == "fill" or (mode == "auto" and not strokes):
         loops = [np.asarray(p, float) for sh in shapes if sh["kind"] == "fill" for p, _c in sh["subpaths"] if len(p) >= 3]
         loops = [l[:-1] if len(l) > 3 and np.allclose(l[0], l[-1]) else l for l in loops]
+        if min_stroke and loops:
+            width = stroke_width(loops)
+            if 0 < width < float(min_stroke):
+                loops = offset(loops, (float(min_stroke) - width) / 2.0)
     else:
         allpts = np.vstack([np.asarray(p, float) for sh in shapes for p, _c in sh["subpaths"]])
         extent = float(max(allpts.max(axis=0) - allpts.min(axis=0)))

@@ -22,8 +22,11 @@ Modelling (see vsblender.geo for solids and mesh builders):
     part("dhd", keys_per_ring=18)        a reusable builder from parts/dhd.py, recorded on the objects
     intent("...")                        NOTES.md's Intent & constraints (kept across re-ingests)
     is_main()                            True in the script run_script runs, False when imported
-    aim(camera, target)                  point an object's track axis at a target (up axis follows the view)
+    aim(camera, target)                  point a camera or light at a target, world up kept up in the image
     dial(current, target, min_travel=0)  signed travel in degrees; add it to the running angle
+    fit_on_bed(obj)                      the turn about Z that fits a part on the printer's bed (or None)
+    hardware(obj)                        a stand-in for bought hardware: left out of checks and exports
+    source_blend()                       the .blend a script is about (a background run's original)
 """
 from __future__ import annotations
 
@@ -56,6 +59,9 @@ _root = {"path": ""}
 # What the current run_script call knows: the printer profile (purpose "print"), the script, and
 # warnings helpers raise along the way (reported with the run, not printed).
 _run = {"printer": None, "script": "", "warnings": [], "reference_roots": []}
+# Where each warning sits in _run["warnings"], so a repeat is counted on the same line instead of added.
+_seen = {"index": {}, "count": {}, "groups": {}}
+WARNING_CAP = 40
 
 # Submodules scripts import as vsblender.<name>. Loaded on first use, so a plain `import vsblender`
 # stays cheap.
@@ -69,20 +75,63 @@ def _begin(label: str, root: str, context: dict | None = None) -> None:
     context = context or {}
     _run.update(printer=context.get("printer"), script=context.get("script") or label, warnings=[],
                 reference_roots=list(context.get("reference_roots") or []))
+    _reset_warnings()
+
+
+def _reset_warnings() -> None:
+    _run["warnings"] = []
+    _seen.update(index={}, count={}, groups={}, list=_run["warnings"])
 
 
 def _end() -> list:
     """Stop the run; returns the warnings helpers collected during it."""
     _progress.update(active=False, cancel=False)
-    collected, _run["warnings"] = list(_run["warnings"]), []
-    return collected[:40]
+    collected = list(_run["warnings"])
+    _reset_warnings()
+    return capped(collected)
 
 
-def warn(message: str) -> None:
-    """A warning from a helper, shown in the run_script reply (not printed to stdout)."""
+def capped(warnings: list, cap: int = WARNING_CAP) -> list:
+    """At most cap lines; the last one says how many were left out."""
+    if len(warnings) <= cap:
+        return list(warnings)
+    return list(warnings[:cap - 1]) + [f"... and {len(warnings) - cap + 1} more warnings"]
+
+
+def warn(message: str, group: str | None = None, item=None) -> None:
+    """A warning from a helper, shown in the run_script reply (not printed to stdout).
+
+    The same text twice is one line with a count ("... (x12)"). group: warnings of one kind about
+    different things (one per file, one per solid) collapse into one line; message may use {n} (how
+    many) and {items} (the first few), and item names the thing this call is about.
+    """
     text = str(message)
-    if text not in _run["warnings"]:
+    if _seen.get("list") is not _run["warnings"]:      # the list was replaced (a new run, or a test)
+        _seen.update(index={}, count={}, groups={}, list=_run["warnings"])
+    if group is not None:
+        entry = _seen["groups"].get(group)
+        if entry is None:
+            entry = _seen["groups"][group] = {"template": text, "items": [], "index": len(_run["warnings"])}
+            _run["warnings"].append(text)
+        if item is not None and str(item) not in entry["items"]:
+            entry["items"].append(str(item))
+        items = entry["items"]
+        shown = ", ".join(items[:4]) + (f", ... ({len(items) - 4} more)" if len(items) > 4 else "")
+        try:
+            line = entry["template"].format(n=len(items) or 1, items=shown or "")
+        except (KeyError, IndexError, ValueError):
+            line = entry["template"]
+        _run["warnings"][entry["index"]] = line
+        return
+    index = _seen["index"].get(text)
+    if index is None:
+        _seen["index"][text] = len(_run["warnings"])
+        _seen["count"][text] = 1
         _run["warnings"].append(text)
+        return
+    _seen["count"][text] += 1
+    if index < len(_run["warnings"]):
+        _run["warnings"][index] = f"{text} (x{_seen['count'][text]})"
 
 
 def install_modules() -> None:
@@ -774,23 +823,65 @@ def is_main() -> bool:
     return sys._getframe(1).f_globals.get("__name__") == "__main__"
 
 
-# World axes tried as the "up" hint for to_track_quat, in the order a tie is broken.
-_UP_AXES = (("Z", Vector((0.0, 0.0, 1.0))), ("Y", Vector((0.0, 1.0, 0.0))), ("X", Vector((1.0, 0.0, 0.0))))
+def look_rotation(direction, up=None):
+    """The rotation matrix (3x3) of a camera or light looking along direction with world up kept up.
+
+    A camera looks down its local -Z with local +Y up. The basis is built directly: right = d x up,
+    up' = right x d, columns (right, up', -d). World up is +Z; a view within about a degree of straight
+    down uses +Y as up (the image's top is +Y, as in Blender's top view) and straight up uses -Y (as in
+    the bottom view). to_track_quat("-Z", "Z") is not used: its second argument is the object's own up
+    axis, and with track and up on the same axis the roll is undefined (back views came out upside
+    down, side views on their side).
+    """
+    from mathutils import Matrix
+
+    d = Vector(direction).normalized()
+    if up is None:
+        if d.z < -0.9998:
+            up = Vector((0.0, 1.0, 0.0))
+        elif d.z > 0.9998:
+            up = Vector((0.0, -1.0, 0.0))
+        else:
+            up = Vector((0.0, 0.0, 1.0))
+    right = d.cross(Vector(up))
+    if right.length < 1e-9:
+        right = d.orthogonal()
+    right.normalize()
+    true_up = right.cross(d).normalized()
+    return Matrix((right, true_up, -d)).transposed()
 
 
 def aim(ob, target, track: str = "-Z"):
-    """Point `track` (an object's local axis) at target and return the euler it landed on.
-
-    The up axis is the world axis least parallel to the view, so a camera that looks along
-    world Y still gets a finite rotation. to_track_quat(track, "Y") is degenerate in that case.
+    """Point an object's local -Z (a camera's or a light's view) at target, with world up kept up in the
+    image, and return the euler it landed on. Other track axes use to_track_quat with a world-Z hint.
     """
     direction = Vector(target) - Vector(ob.location)
     if direction.length < 1e-8:
         return ob.rotation_euler.copy()
-    d = direction.normalized()
-    up = min(_UP_AXES, key=lambda item: abs(float(d.dot(item[1]))))[0]
-    ob.rotation_euler = direction.to_track_quat(track, up).to_euler()
+    if track.upper() == "-Z":
+        ob.rotation_euler = look_rotation(direction).to_euler(ob.rotation_mode if ob.rotation_mode in
+                                                              ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX") else "XYZ")
+    else:
+        d = direction.normalized()
+        up = "Z" if abs(d.z) < 0.999 and track.upper().lstrip("-") != "Z" else "Y"
+        ob.rotation_euler = direction.to_track_quat(track.upper(), up).to_euler()
     return ob.rotation_euler.copy()
+
+
+def hardware(obj, on: bool = True):
+    """Mark an object as a hardware stand-in (glass, a bearing, a motor, a board): check_model and
+    export_model leave it out unless it is named; measure, spatial and preview still see it."""
+    from . import marks
+
+    for ob in (obj if isinstance(obj, (list, tuple)) else [obj]):
+        marks.set_hardware(ob, on)
+    return obj
+
+
+def source_blend() -> str:
+    """The .blend this script is about. In a background run (run_script background: true) that is the
+    saved file or the session the throwaway copy was made from, not the copy; otherwise the open file."""
+    return os.environ.get("VSBLENDER_SOURCE_BLEND") or bpy.data.filepath
 
 
 def dial(current: float, target: float, clockwise: bool = True, min_travel: float = 0.0) -> float:
@@ -856,13 +947,14 @@ def spec(obj, **params) -> dict:
 # Re-exported so scripts reach everything through `import vsblender`.
 from .units import units, mm, m, to_mm, label as units_label  # noqa: E402
 from .looks import material, ref_image  # noqa: E402
-from .placement import place_on_ground, place_on_bed, center_on_origin, center_on_bed, set_origin, orient_flat, stats  # noqa: E402
+from .placement import place_on_ground, place_on_bed, center_on_origin, center_on_bed, set_origin, orient_flat, stats, fit_on_bed  # noqa: E402
 from .meshdata import read_stl, read_obj, read_3mf, read_mesh_file  # noqa: E402
 from .geom2d import svg_loops  # noqa: E402
 
 __all__ += [
     "warn", "printer", "modifier", "apply_modifiers", "spec", "units", "mm", "m", "to_mm", "units_label",
-    "clear_keys", "intent", "is_main", "aim", "dial", "ref_section", "part", "part_folders", "reference_roots",
+    "clear_keys", "intent", "is_main", "aim", "look_rotation", "dial", "ref_section", "part", "part_folders",
+    "reference_roots", "hardware", "source_blend", "fit_on_bed",
     "material", "ref_image", "place_on_ground", "place_on_bed", "center_on_origin", "center_on_bed", "set_origin",
     "orient_flat", "stats", "read_stl", "read_obj", "read_3mf", "read_mesh_file", "svg_loops", "geo",
 ]

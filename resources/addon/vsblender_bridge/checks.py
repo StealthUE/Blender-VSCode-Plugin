@@ -29,7 +29,10 @@ LEVELS = {
     "loose": ("info", "info", "warn", "warn"),
     "coincident_faces": ("warn", "error", "warn", "warn"),
     "self_intersection": (None, None, None, "error"),
+    "faces_touch": (None, None, None, "warn"),
     "overlapping_shells": (None, None, None, "warn"),
+    "fits_turned": (None, None, None, "info"),
+    "flat_pose": (None, None, None, "info"),
     "transforms": ("info", "info", "warn", None),
     "negative_scale": ("warn", "warn", "warn", "info"),
     "tris": ("info", "info", "info", "info"),
@@ -72,7 +75,7 @@ def default_targets(root: str) -> list:
     for ob in bpy.context.scene.objects:
         if ob.type not in GEOMETRY_TYPES or ob.name.startswith("_vsblender"):
             continue
-        if marks.left_out(ob) or ob.hide_render or ob.hide_get():
+        if marks.not_for_output(ob) or ob.hide_render or ob.hide_get():
             continue
         if ob.display_type in {"WIRE", "BOUNDS"} and ob.hide_render is False and any(
                 m.type == "BOOLEAN" and m.object == ob for o in bpy.context.scene.objects for m in o.modifiers):
@@ -81,13 +84,21 @@ def default_targets(root: str) -> list:
     return out
 
 
-def resolve_targets(spec, root: str) -> list:
+def resolve_targets(spec, root: str, notes: list | None = None) -> list:
+    """The objects to check or export: the given ones, or the model (staging, references, hardware
+    stand-ins, hidden objects and boolean cutters left out). A named hardware stand-in is kept, with a
+    note in notes."""
     if spec in (None, "", []):
         return default_targets(root)
-    from . import inspect_tools
+    from . import inspect_tools, marks
 
     obs = inspect_tools.resolve_objects(spec, root)
-    return [o for o in obs if o.type in GEOMETRY_TYPES and not o.name.startswith("_vsblender")]
+    out = [o for o in obs if o.type in GEOMETRY_TYPES and not o.name.startswith("_vsblender")]
+    hardware = [o.name for o in out if marks.is_hardware(o)]
+    if hardware and notes is not None:
+        notes.append(f"{', '.join(hardware[:6])}{' ...' if len(hardware) > 6 else ''}: hardware stand-in(s) "
+                     "(vsblender_hardware), included because they were named")
+    return out
 
 
 class _Report:
@@ -190,9 +201,11 @@ def _check_model(params: dict, root: str) -> tuple:
     purpose = str(params.get("purpose") or default_purpose()).lower()
     if purpose not in PURPOSES:
         raise ValueError(f"purpose must be one of {', '.join(PURPOSES)}")
-    targets = resolve_targets(params.get("targets"), root)
+    warnings = []
+    targets = resolve_targets(params.get("targets"), root, warnings)
     if not targets:
-        raise ValueError("no mesh, curve or text objects to check (references, hidden objects and cutters are left out by default)")
+        raise ValueError("no mesh, curve or text objects to check (references, hardware stand-ins, hidden objects and "
+                         "cutters are left out by default)")
     deep = bool(params.get("deep"))
     from . import helpers
 
@@ -202,7 +215,6 @@ def _check_model(params: dict, root: str) -> tuple:
     to_mm = float(params.get("mm_per_unit") or u["bu_to_mm"])
     max_tris = int(params.get("max_tris") or 50000)
     deps = bpy.context.evaluated_depsgraph_get()
-    warnings = []
     reports = []
     highlights = []
     for ob in targets[:50]:
@@ -256,6 +268,18 @@ def _check_object(ob, deps, purpose: str, printer: dict, to_mm: float, max_tris:
     if not t:
         report.add("degenerate", "no faces after modifiers", level="warn" if purpose != "print" else "error")
         return report, None
+    pose = str(params.get("pose") or "as_is").lower()
+    if pose not in ("as_is", "flat"):
+        raise ValueError("pose must be as_is or flat")
+    if purpose == "print" and pose == "flat":
+        # Judge the part as it would print: largest flat face down, on the bed.
+        rot, euler = flat_rotation(arrays.verts)
+        verts = arrays.verts @ rot.T
+        verts[:, 2] -= verts[:, 2].min()
+        arrays = meshdata.MeshArrays(verts, arrays.tris, arrays.face, arrays.material, arrays.name)
+        report.facts["pose"] = {"flat": True, "rotation_deg": euler}
+        report.add("flat_pose", f"judged laid on its largest flat face (rotate {', '.join(_fmt(a, 1) for a in euler)}° XYZ, "
+                   "as orient_flat does), not as it stands in the scene")
     lo, hi = arrays.bounds()
     size = hi - lo
     diag = float(np.linalg.norm(size)) or 1.0
@@ -264,8 +288,7 @@ def _check_object(ob, deps, purpose: str, printer: dict, to_mm: float, max_tris:
     if purpose == "print":
         report.facts["size_mm"] = [round(float(v) * to_mm, 3) for v in size]
     started = time.time()
-    welded, _remap = meshdata.weld(arrays, diag * 1e-7)
-    stats = meshdata.edge_stats(welded)
+    welded, stats, _rel = meshdata.best_weld(arrays, diag)
     labels = meshdata.components(welded)
     shells = int(labels.max()) + 1 if len(labels) else 0
     va = meshdata.volume_area(welded, labels)
@@ -329,16 +352,27 @@ def _check_object(ob, deps, purpose: str, printer: dict, to_mm: float, max_tris:
         cap = 2_000_000 if deep else 300_000
         if t <= cap:
             started = time.time()
-            same, other, at = _self_intersections(welded, labels)
+            found = _self_intersections(arrays, labels, diag)
             _timed(report, "self_intersection", started)
-            if same:
-                report.add("self_intersection", f"{same} pairs of faces cut through each other within one shell", same, at)
-                category[_tris_in(at, welded)] = CAT["error"]
+            if found["same"]:
+                kinds = []
+                if found["cut"]:
+                    kinds.append(f"{found['cut']} cut through each other")
+                if found["overlap"]:
+                    kinds.append(f"{found['overlap']} lie on top of each other (folded or doubled faces)")
+                report.add("self_intersection", f"{found['same']} pairs of faces within one shell: {'; '.join(kinds)}",
+                           found["same"], found["at"])
+                category[found["tris"]] = CAT["error"]
             else:
                 report.ok("no self-intersections")
-            if other:
-                report.add("overlapping_shells", f"{other} face pairs where separate shells overlap; the slicer merges them "
-                           "(fine for printing, but booleans would make one clean solid)", other)
+            if found["touch"]:
+                report.add("faces_touch", f"{found['touch']} face pairs meet without sharing an edge: T-junctions, or a face "
+                           "laid across an opening (a hole, window or channel that is capped)", found["touch"],
+                           found["touch_at"])
+                category[found["touch_tris"] & (category == 0)] = CAT["warning"]
+            if found["other"]:
+                report.add("overlapping_shells", f"{found['other']} face pairs where separate shells overlap; the slicer merges them "
+                           "(fine for printing, but booleans would make one clean solid)", found["other"])
         else:
             report.add("self_intersection", f"skipped above {cap:,} triangles (deep=true raises the limit)", level="info")
 
@@ -388,26 +422,32 @@ def _tris_in(points, arrays) -> np.ndarray:
     return mask
 
 
-def _self_intersections(arrays, labels) -> tuple:
-    from mathutils.bvhtree import BVHTree
-
-    tree = BVHTree.FromPolygons(arrays.verts.tolist(), arrays.tris.tolist(), all_triangles=True, epsilon=0.0)
-    pairs = tree.overlap(tree)
-    if not pairs:
-        return 0, 0, np.zeros((0, 3))
-    p = np.array(pairs, dtype=np.int64)
-    p = p[p[:, 0] < p[:, 1]]
-    ta, tb = arrays.tris[p[:, 0]], arrays.tris[p[:, 1]]
-    shares = np.zeros(len(p), dtype=bool)
-    for i in range(3):
-        for j in range(3):
-            shares |= ta[:, i] == tb[:, j]
-    p = p[~shares]
+def _self_intersections(arrays, labels, diag: float) -> dict:
+    """Faces that meet without being neighbours (meshdata.crossings), on the unwelded mesh: welding
+    first would fold the slivers booleans leave and report crossings that are not there, and the count
+    would change with where the part stands. labels: shell per triangle (the welded mesh keeps the
+    triangle order). same: cut or overlapping pairs within one shell; other: pairs between shells;
+    touch: pairs within one shell that only meet (T-junctions, a face across an opening)."""
+    found = meshdata.crossings(arrays, diag)
+    t = len(arrays.tris)
+    empty = np.zeros(t, dtype=bool)
+    out = {"same": 0, "other": 0, "cut": 0, "overlap": 0, "touch": 0, "at": np.zeros((0, 3)), "touch_at": np.zeros((0, 3)),
+           "tris": empty, "touch_tris": empty.copy()}
+    p, kind = found["pairs"], found["kind"]
     if not len(p):
-        return 0, 0, np.zeros((0, 3))
+        return out
     same = labels[p[:, 0]] == labels[p[:, 1]]
-    at = arrays.verts[arrays.tris[p[same][:, 0]]].mean(axis=1)
-    return int(same.sum()), int((~same).sum()), at
+    crossing = same & (kind != 2)
+    touch = same & (kind == 2)
+    out.update(same=int(crossing.sum()), other=int((~same & (kind != 2)).sum()), cut=int((same & (kind == 0)).sum()),
+               overlap=int((same & (kind == 1)).sum()), touch=int(touch.sum()), at=found["at"][crossing],
+               touch_at=found["at"][touch])
+    tris = empty.copy()
+    tris[p[crossing].ravel()] = True
+    touch_tris = empty.copy()
+    touch_tris[p[touch].ravel()] = True
+    out["tris"], out["touch_tris"] = tris, touch_tris
+    return out
 
 
 def _mesh_checks(ob, report: _Report, purpose: str) -> None:
@@ -484,16 +524,23 @@ def _print_checks(report: _Report, welded, labels, va: dict, category, printer: 
     area = va["area"] * to_mm ** 2
     report.facts["volume_mm3"] = round(volume, 2)
     report.facts["area_mm2"] = round(area, 2)
-    # Fits the printer (as placed on the bed, optionally turned 90 degrees about Z).
+    # Fits the printer (as placed on the bed, square-on, turned 90 degrees, or turned to any angle about Z).
+    from . import placement
+
     bx, by, bz = (float(v) for v in (printer.get("build_volume") or [220, 220, 250]))
     fits = size[0] <= bx and size[1] <= by and size[2] <= bz
     turned = size[1] <= bx and size[0] <= by and size[2] <= bz
+    any_turn = placement.bed_fit(mm.verts[:, :2], (bx, by)) if not (fits or turned) and size[2] <= bz else None
+    pose_note = report.facts.get("pose")
     if fits or turned:
         report.ok(f"fits {printer.get('name', 'the printer')} ({_fmt(bx)} x {_fmt(by)} x {_fmt(bz)} mm)"
                   + ("" if fits else " when turned 90 degrees about Z"))
+    elif any_turn:
+        report.add("fits_turned", f"fits {printer.get('name', 'the printer')} only turned {_fmt(any_turn['angle'], 1)}° about Z "
+                   f"({_fmt(any_turn['spare'], 1)} mm to spare); vsblender.fit_on_bed gives the turn")
     elif unit_ok:
-        report.add("too_big", f"{_size_text(size, 'mm')} does not fit the {_fmt(bx)} x {_fmt(by)} x {_fmt(bz)} mm build volume; "
-                   "split it, scale it, or lay it flat")
+        report.add("too_big", f"{_size_text(size, 'mm')} does not fit the {_fmt(bx)} x {_fmt(by)} x {_fmt(bz)} mm build volume"
+                   + (" laid flat" if pose_note else "") + "; split it (geo.ring(...).plan_split / split), scale it, or lay it flat")
     if abs(zmin) > layer / 2 and params.get("place_on_bed", True) is False:
         report.add("off_bed", f"the lowest point is at z {_fmt(zmin)} mm, not on the bed (export_model places it on the bed)")
     # Bed contact: downward faces at the bottom.
@@ -503,7 +550,7 @@ def _print_checks(report: _Report, welded, labels, va: dict, category, printer: 
     category[bed & (category == 0)] = CAT["bed"]
     if contact <= 1e-6:
         report.add("no_bed_contact", "touches the bed only at a point or an edge: it will not stick. Lay a flat face down "
-                   "(vsblender.orient_flat), or add a flat base")
+                   "(vsblender.orient_flat, or check with pose: \"flat\"), or add a flat base")
     elif contact < 50.0:
         report.add("small_contact", f"only {_fmt(contact, 1)} mm² touches the bed: it may come loose (add a brim or a wider base)")
     else:
@@ -584,6 +631,52 @@ def _print_checks(report: _Report, welded, labels, va: dict, category, printer: 
                                 "note": "rough: 2 perimeters and 15% infill; the slicer's estimate is the one to trust"}
     if params.get("suggest_orientation"):
         report.facts["orientations"] = _suggest_orientations(mm, max_deg, layer)
+    # An assembled part (standing upright, under a turned root) fails as posed: say how it does flat.
+    codes = {f["code"] for f in report.findings}
+    if not pose_note and codes & {"too_big", "no_bed_contact"}:
+        flat = _flat_pose(mm, (bx, by, bz), layer)
+        if flat:
+            report.add("flat_pose", flat["text"])
+            report.facts["flat_pose"] = {k: v for k, v in flat.items() if k != "text"}
+
+
+def flat_rotation(verts: np.ndarray):
+    """(3x3 rotation, euler degrees) that puts the largest flat face of the hull down."""
+    from mathutils import Vector
+
+    from . import placement
+
+    normals = placement._hull_normals(verts, limit=6)
+    if not normals:
+        return np.identity(3), [0.0, 0.0, 0.0]
+    down = Vector((0, 0, -1))
+    # Of faces as large as the largest (top and bottom of a plate), keep the one already facing down.
+    largest = normals[0][1]
+    ties = [n for n, area in normals if area >= largest * 0.99]
+    best = max(ties, key=lambda n: n.dot(down))
+    q = best.rotation_difference(down)
+    return np.array(q.to_matrix()), [round(math.degrees(a), 2) for a in q.to_euler("XYZ")]
+
+
+def _flat_pose(mm, bed: tuple, layer: float) -> dict | None:
+    """Size, bed fit and bed contact of the part laid on its largest flat face (orient_flat)."""
+    from . import placement
+
+    rot, euler = flat_rotation(mm.verts)
+    v = mm.verts @ rot.T
+    size = v.max(axis=0) - v.min(axis=0)
+    _over, contact = placement._overhang_area(mm, rot, 45.0, layer)
+    fit = placement.bed_fit(v[:, :2], bed[:2]) if size[2] <= bed[2] else None
+    if fit is None:
+        where = "does not fit at any turn"
+    elif fit["square"]:
+        where = "fits"
+    else:
+        where = f"fits turned {_fmt(fit['angle'], 1)}° about Z"
+    text = (f"laid on its largest flat face (rotate {', '.join(_fmt(a, 1) for a in euler)}° XYZ, as orient_flat does) it is "
+            f"{_size_text(size, 'mm')}, {where}, with {_fmt(contact, 0)} mm² on the bed; check_model pose: \"flat\" judges it that way")
+    return {"text": text, "rotation_deg": euler, "size_mm": [round(float(s), 3) for s in size],
+            "fits": fit is not None, "turn_deg": fit["angle"] if fit else None, "bed_contact_mm2": round(contact, 1)}
 
 
 def _wall_thickness(mm, normals, areas, samples: int):

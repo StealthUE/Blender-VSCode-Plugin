@@ -730,7 +730,12 @@ def _jsonish(value):
 
 
 def run_background_script(spec):
-    """Exec a script in this headless copy. The caller's run_script path journals and checkpoints; this one does not."""
+    """Exec a script in this headless copy. The caller's run_script path journals and checkpoints; this one does not.
+
+    The script sees what a foreground run sees: every lib/ from its folder up to the workspace root, the
+    configured libPaths and sharedLibs, the workspace as the working folder, the printer profile, and
+    vsblender.source_blend() naming the file the copy was made from (bpy.data.filepath is the copy).
+    """
     import io
     from contextlib import redirect_stderr, redirect_stdout
 
@@ -749,12 +754,19 @@ def run_background_script(spec):
         namespace["mathutils"] = mathutils
     except Exception:
         pass
-    folder = os.path.dirname(os.path.abspath(script))
-    inserted = folder not in sys.path
-    if inserted:
-        sys.path.insert(0, folder)
+    root = addon.workspace_root()
+    source = spec.get("source_blend") or bpy.data.filepath
+    if source:
+        os.environ["VSBLENDER_SOURCE_BLEND"] = str(source)
+    rel_script = addon.history.rel(root, script)
+    addon.helpers._begin(rel_script, root, {"printer": spec.get("printer") if isinstance(spec.get("printer"), dict) else None,
+                                            "script": rel_script, "reference_roots": spec.get("reference_roots") or []})
+    previous = os.getcwd()
+    added = []
     warnings = []
     try:
+        os.chdir(root)
+        added = addon._prepare_imports(root, spec.get("lib_paths") or ["scripts/lib"], script)
         with redirect_stdout(stdout), redirect_stderr(stderr):
             exec(code, namespace)
             if function:
@@ -778,7 +790,9 @@ def run_background_script(spec):
             extra += "\n--- stderr ---\n" + err
         raise RuntimeError(f"{type(exc).__name__}: {exc}{extra}") from exc
     finally:
-        if inserted:
+        warnings += addon.helpers._end()
+        os.chdir(previous)
+        for folder in added:
             try:
                 sys.path.remove(folder)
             except ValueError:

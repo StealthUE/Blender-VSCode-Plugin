@@ -26,7 +26,7 @@ _sha_cache: dict = {}
 # A headless Blender never sets bpy.data.is_dirty (no undo pushes), so edits made through the
 # bridge are counted here too, with how many runs changed the scene since the last save and when the
 # first of them was. Reset when a file loads or is saved.
-_session = {"edited": False, "copying": False, "runs": 0, "first": None, "saved_at": None}
+_session = {"edited": False, "copying": False, "runs": 0, "first": None, "saved_at": None, "bridge_saving": False}
 
 
 def writing_copy() -> bool:
@@ -489,6 +489,81 @@ def journal(root: str, entry: dict) -> str:
     with open(path, "a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
     return path
+
+
+# Journal events that change the scene and count as a run until the next save; and the events after
+# which the session matches a file on disk.
+RUN_EVENTS = ("script", "pipeline", "append", "restore")
+BOUNDARY_EVENTS = ("save", "open")
+
+
+def read_journal(root: str, blend: str | None = None) -> list:
+    path = os.path.join(sidecar_dir(root, blend), "journal.jsonl")
+    out = []
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict):
+                    out.append(entry)
+    except OSError:
+        pass
+    return out
+
+
+def runs_since_boundary(root: str, blend: str | None = None) -> tuple:
+    """(runs, boundary): the journaled runs after the last save or open of this file, and that save or
+    open (None when there is none). A rolled-back run changed nothing and is left out."""
+    runs = []
+    boundary = None
+    for entry in reversed(read_journal(root, blend)):
+        event = entry.get("event")
+        if event in BOUNDARY_EVENTS:
+            boundary = entry
+            break
+        if event in RUN_EVENTS and not entry.get("rolled_back"):
+            runs.append(entry)
+    runs.reverse()
+    return runs, boundary
+
+
+def describe_run(entry: dict) -> str:
+    """One line for a journaled run: when, what and why."""
+    when = str(entry.get("time") or "")[11:16]
+    what = entry.get("script") or entry.get("pipeline") or entry.get("event") or "run"
+    why = f": {entry['reason']}" if entry.get("reason") else ""
+    return f"{when} {what}{why}".strip()
+
+
+def seed_runs(root: str) -> int:
+    """After an add-on reload the in-memory count starts at 0 while the session still has the runs:
+    count the journaled runs after the last save or open that are newer than the file on disk."""
+    blend = bpy.data.filepath
+    if not blend or not os.path.isfile(blend) or _session["runs"]:
+        return int(_session["runs"])
+    # Journal times are whole seconds: a run in the same second as the save before it still counts
+    # (only runs after the last save or open are looked at).
+    stamp = datetime.datetime.fromtimestamp(int(os.path.getmtime(blend))).astimezone()
+    runs, _boundary = runs_since_boundary(root)
+    newer = []
+    for entry in runs:
+        try:
+            when = datetime.datetime.fromisoformat(str(entry.get("time")))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.astimezone()
+        if when >= stamp:
+            newer.append(when)
+    if newer:
+        _session.update(edited=True, runs=len(newer), first=min(newer))
+    return int(_session["runs"])
 
 
 def notes_log(root: str, line: str) -> bool:

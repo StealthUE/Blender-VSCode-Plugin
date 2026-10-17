@@ -51,11 +51,34 @@ def plan(params: dict, root: str) -> dict:
     if fmt not in FORMATS:
         raise ValueError(f"format must be one of {', '.join(sorted(FORMATS))}")
     explicit = params.get("targets") not in (None, "", [])
-    targets = checks.resolve_targets(params.get("targets"), root)
+    notes: list = []
+    groups_param = params.get("parts")
+    colours = bool(params.get("colours") or params.get("colors") or groups_param)
+    if groups_param:
+        if not isinstance(groups_param, dict) or not groups_param:
+            raise ValueError("parts must be {part name: [object names]}")
+        groups = []
+        for part_name, members in groups_param.items():
+            members = [members] if isinstance(members, str) else [str(m) for m in members]
+            missing = [m for m in members if m not in bpy.data.objects]
+            if missing:
+                raise KeyError(f"parts[{part_name!r}]: no object named {', '.join(missing[:6])}")
+            groups.append((str(part_name), members))
+        seen = []
+        for _p, members in groups:
+            seen += [m for m in members if m not in seen]
+        targets = [bpy.data.objects[n] for n in seen]
+        explicit = True
+    else:
+        targets = checks.resolve_targets(params.get("targets"), root, notes)
+        groups = [(ob.name, [ob.name]) for ob in targets]
     if not targets:
-        raise ValueError("nothing to export: no visible mesh, curve or text objects (references are left out)")
+        raise ValueError("nothing to export: no visible mesh, curve or text objects (references and hardware stand-ins "
+                         "are left out)")
     if not explicit and len(targets) > 10:
         raise ValueError(f"{len(targets)} objects would be exported; pass targets (names or a find selector) to choose")
+    if colours and fmt != "3mf":
+        raise ValueError("colours and parts write one volume per filament, which only 3MF holds: use format 3mf")
     split = str(params.get("split") or ("objects" if fmt in ("stl", "ply") else "one")).lower()
     if split not in ("one", "objects"):
         raise ValueError("split must be one or objects")
@@ -81,7 +104,14 @@ def plan(params: dict, root: str) -> dict:
         folder, single = base_dir, None
     if not _under(folder, root):
         raise ValueError("exports must be written inside the workspace")
-    if split == "objects":
+    if colours:
+        if len(groups) == 1:
+            stem = safe_name(groups[0][0])
+        if split == "objects":
+            outputs = [(name, os.path.join(folder, f"{safe_name(name)}.{ext}"), members) for name, members in groups]
+        else:
+            outputs = [("all", single or os.path.join(folder, f"{stem}.{ext}"), [ob.name for ob in targets])]
+    elif split == "objects":
         outputs = [(ob.name, os.path.join(folder, f"{safe_name(ob.name)}.{ext}"), [ob.name]) for ob in targets]
     else:
         outputs = [("all", single or os.path.join(folder, f"{stem}.{ext}"), [ob.name for ob in targets])]
@@ -94,12 +124,33 @@ def plan(params: dict, root: str) -> dict:
     center = params.get("center")
     center = (purpose == "print") if center is None else bool(center)
     u = units_mod.units()
+    slicer = str(params.get("slicer") or "auto").lower()
+    if slicer not in ("auto", "prusa", "bambu", "orca"):
+        raise ValueError("slicer must be auto, prusa, bambu or orca")
+    if slicer == "auto":
+        preset = str((params.get("printer") or {}).get("preset") or (params.get("printer") or {}).get("name") or "").lower()
+        slicer = "bambu" if "bambu" in preset else "prusa"
     return {
         "purpose": purpose, "format": fmt, "split": split, "outputs": outputs, "place_on_bed": place, "center": center,
         "mm_per_unit": float(params.get("mm_per_unit") or u["bu_to_mm"]), "bu_to_m": u["bu_to_m"],
         "apply_modifiers": params.get("apply_modifiers", True) is not False, "assembly": bool(params.get("assembly")),
-        "ascii": bool(params.get("ascii")), "live": fmt in LIVE_FORMATS, "units": u["label"],
+        "ascii": bool(params.get("ascii")), "live": fmt in LIVE_FORMATS, "units": u["label"], "notes": notes,
+        "colours": colours, "groups": groups, "layout": "prusa" if slicer == "prusa" else "bambu", "slicer": slicer,
+        "extruders": dict(params.get("extruders") or {}),
     }
+
+
+def _weld_part(name: str, mm, warnings: list):
+    """Weld the way check_model does (meshdata.best_weld), then drop the triangles that collapsed.
+    Per-triangle material indices are kept."""
+    welded, _stats, rel = meshdata.best_weld(mm)
+    if rel == meshdata.WELD_FINE:
+        warnings.append(f"{name}: welded at float noise only, because joining its near-coincident vertices made more "
+                        "open or non-manifold edges (slivers from a boolean; Solid.clean() removes them)")
+    t = welded.tris
+    ok = (t[:, 0] != t[:, 1]) & (t[:, 1] != t[:, 2]) & (t[:, 0] != t[:, 2])
+    material = welded.material[ok] if welded.material is not None and len(welded.material) == len(t) else None
+    return meshdata.MeshArrays(welded.verts, t[ok], material=material, name=name)
 
 
 def _parts(names: list, deps, mm_per_unit: float, warnings: list) -> list:
@@ -110,14 +161,49 @@ def _parts(names: list, deps, mm_per_unit: float, warnings: list) -> list:
         if not len(arrays.tris):
             warnings.append(f"{name} has no faces; left out")
             continue
-        mm = arrays.scaled(mm_per_unit)
-        lo, hi = mm.bounds()
-        welded, _remap = meshdata.weld(mm, max(float(np.linalg.norm(hi - lo)) * 1e-7, 1e-9))
-        t = welded.tris
-        ok = (t[:, 0] != t[:, 1]) & (t[:, 1] != t[:, 2]) & (t[:, 0] != t[:, 2])
-        welded = meshdata.MeshArrays(welded.verts, t[ok], material=None, name=name)
-        parts.append((name, welded))
+        parts.append((name, _weld_part(name, arrays.scaled(mm_per_unit), warnings)))
     return parts
+
+
+def _slot_names(ob) -> list:
+    return [slot.material.name if slot.material else f"slot {i}" for i, slot in enumerate(ob.material_slots)] or ["(no material)"]
+
+
+def _colour_objects(spec: dict, names: list, deps, warnings: list) -> list:
+    """[(part, [(volume name, MeshArrays in mm, extruder)])]: each part's objects, split by material.
+
+    Extruders: spec["extruders"] maps a material or object name (or "object/material") to a number;
+    anything not named gets the next number in the order its material is first met."""
+    wanted = set(names)
+    chosen = {str(k): int(v) for k, v in spec["extruders"].items()}
+    auto: dict = {}
+    out = []
+    for part, members in spec["groups"]:
+        members = [m for m in members if m in wanted]
+        if not members:
+            continue
+        volumes = []
+        for name in members:
+            ob = bpy.data.objects[name]
+            arrays = meshdata.object_arrays(ob, deps, warnings=warnings)
+            if not len(arrays.tris):
+                warnings.append(f"{name} has no faces; left out")
+                continue
+            welded = _weld_part(name, arrays.scaled(spec["mm_per_unit"]), warnings)
+            slots = _slot_names(ob)
+            material = welded.material if welded.material is not None else np.zeros(len(welded.tris), dtype=np.int64)
+            used = [int(i) for i in np.unique(material)]
+            for index in used:
+                mat = slots[min(index, len(slots) - 1)]
+                piece = welded.select(material == index) if len(used) > 1 else welded
+                label = name if len(used) == 1 and len(members) > 1 else (mat if len(members) == 1 else f"{name} {mat}")
+                extruder = chosen.get(f"{name}/{mat}") or chosen.get(mat) or chosen.get(name)
+                if extruder is None:
+                    extruder = auto.setdefault(mat, len(auto) + 1 + max(chosen.values(), default=0))
+                volumes.append((label, piece, int(extruder)))
+        if volumes:
+            out.append((part, volumes))
+    return out
 
 
 def _place(parts: list, place: bool, center, bed=None) -> list:
@@ -140,12 +226,14 @@ def run_live(spec: dict, root: str, params: dict) -> tuple:
     """STL / 3MF from the evaluated meshes. Returns (result, warnings)."""
     from . import helpers
 
-    warnings = []
+    warnings = list(spec.get("notes") or [])
     printer = dict(helpers.DEFAULT_PRINTER)
     printer.update(params.get("printer") or {})
     bed = printer.get("build_volume") or [220, 220, 250]
     deps = bpy.context.evaluated_depsgraph_get()
     files = []
+    if spec.get("colours"):
+        return _run_colours(spec, root, params, deps, bed, warnings)
     for label, path, names in spec["outputs"]:
         parts = _parts(names, deps, spec["mm_per_unit"], warnings)
         if not parts:
@@ -176,6 +264,40 @@ def run_live(spec: dict, root: str, params: dict) -> tuple:
     return _finish(spec, files, root, params), warnings
 
 
+def _run_colours(spec: dict, root: str, params: dict, deps, bed, warnings: list) -> tuple:
+    """3MF with one object per part and one volume per filament, each with its extruder."""
+    files = []
+    for _label, path, names in spec["outputs"]:
+        objects = _colour_objects(spec, names, deps, warnings)
+        if not objects:
+            continue
+        flat = [(vol, arrays) for _part, vols in objects for vol, arrays, _e in vols]
+        placed = iter([a for _n, a in _place(flat, spec["place_on_bed"], spec["center"], bed if spec["center"] else None)])
+        objects = [(part, [(vol, next(placed), e) for vol, _a, e in vols]) for part, vols in objects]
+        for part, vols in objects:
+            # Each volume on its own: an inlay shares faces with the pocket it sits in.
+            for vol, arrays, _e in vols:
+                st = meshdata.mesh_stats(arrays, 1e-9)
+                if not st["watertight"]:
+                    warnings.append(f"{part} / {vol}: {st['open_edges']} open, {st['non_manifold_edges']} non-manifold, "
+                                    f"{st['flipped_edges']} flipped edges. Slicers may repair or misprint it; run check_model purpose=print.")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        title = os.path.splitext(os.path.basename(path))[0]
+        meshdata.write_3mf_volumes(path, objects, layout=spec["layout"], title=title,
+                                   application=f"VSBlender (Blender {bpy.app.version_string})",
+                                   metadata={"Designer": "", "Description": f"Exported from {os.path.basename(bpy.data.filepath) or 'an unsaved session'}"})
+        all_arrays = [a for _p, vols in objects for _v, a, _e in vols]
+        lows = np.min([a.bounds()[0] for a in all_arrays], axis=0)
+        highs = np.max([a.bounds()[1] for a in all_arrays], axis=0)
+        files.append({"file": history.rel(root, path), "objects": [p for p, _v in objects],
+                      "volumes": [{"part": p, "volume": v, "extruder": e, "tris": int(len(a.tris))} for p, vols in objects for v, a, e in vols],
+                      "tris": int(sum(len(a.tris) for a in all_arrays)), "bytes": os.path.getsize(path),
+                      "size_mm": [round(float(v), 3) for v in highs - lows], "sha256": _sha(path)})
+    if not files:
+        raise ValueError("nothing was written: the targets have no faces")
+    return _finish(spec, files, root, params), warnings
+
+
 def _sha(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -190,7 +312,16 @@ def _finish(spec: dict, files: list, root: str, params: dict) -> dict:
     for f in files:
         size = f" {' x '.join(meshdata.fmt_num(v, 2) for v in f['size_mm'])} mm," if f.get("size_mm") else ""
         lines.append(f"- {f['file']}:{size} {f.get('tris', '?')} tris, {f['bytes'] // 1024} KB ({', '.join(f['objects'][:6])})")
-    if spec["format"] == "3mf":
+        for vol in (f.get("volumes") or [])[:24]:
+            lines.append(f"    {vol['part']}: {vol['volume']} -> extruder {vol['extruder']} ({vol['tris']} tris)")
+    if spec.get("colours"):
+        if spec["layout"] == "prusa":
+            lines.append("PrusaSlicer opens each part as one object with its volumes on their extruders.")
+        else:
+            lines.append(f"Written for {spec['slicer'].title()}: each part is one object whose parts carry their extruder "
+                         "(Metadata/model_settings.config). If the slicer loads the geometry only, the parts are still "
+                         "grouped; set their filaments in the object list.")
+    elif spec["format"] == "3mf":
         lines.append("Bambu Studio, OrcaSlicer and PrusaSlicer open it with each part named; Bambu Studio says it is not "
                      "from Bambu Lab and loads the geometry only, which is expected.")
     try:
