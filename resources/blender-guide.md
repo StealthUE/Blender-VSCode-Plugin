@@ -38,7 +38,7 @@ Call `doctor` for each file's ingest status, and `session_info` for the file ope
 | `live` | The sidecar was built from a Blender session with unsaved changes, not from the file on disk. |
 | `diverged` | Blender has unsaved changes the sidecar does not describe. Call `ingest` with `live: true`. |
 
-Opening a `.blend` in the editor shows a preview of the file on disk. An ingest still is shown when `previews/previews.json` says it was rendered from this version of the file: the scene camera, then the iso view, then the front view. Otherwise a background Blender renders one still. That render keeps the window another chat is using on its own file. An ingest that skips previews keeps the old images, and `NOTES.md` and `doctor` then call them older than the file: they may not show what is in it now. Use `preview` for what is there.
+Opening a `.blend` in the editor shows a preview of the file on disk. An ingest still is shown when `previews/previews.json` says it was rendered from this version of the file: the scene camera, then the iso view, then the front view. Otherwise a background Blender renders one still. That render keeps the window another chat is using on its own file. An ingest that skips previews keeps the old images, and `NOTES.md` and `doctor` then call them older than the file: they may not show what is in it now. Stills from before 0.8.0 have no record, so their file times decide (newer than the `.blend` counts as current). Use `preview` for what is there.
 
 ## Before you change a model
 
