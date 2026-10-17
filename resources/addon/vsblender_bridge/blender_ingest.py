@@ -1255,9 +1255,13 @@ def preview_groups(man, main, scene):
 PREVIEW_INDEX = "previews.json"
 
 
-def _preview_index(out, previews, sha, signature, source, man) -> list:
+def _preview_index(out, previews, sha, signature, source, man, blend=None) -> list:
     """Record what the previews were rendered from (previews/previews.json), or, when this ingest drew
-    none, keep the old images listed as older than the file. Returns the previews NOTES lists."""
+    none, keep the old images listed as older than the file. Returns the previews NOTES lists.
+
+    Stills from before 0.8.0 have no record. An ingest renders its stills just after the file is
+    saved, so stills at least as new as the .blend are taken as showing it, and recorded that way;
+    older ones are recorded as older."""
     pdir = os.path.join(out, "previews")
     path = os.path.join(pdir, PREVIEW_INDEX)
     drawn = [p for p in previews if p.get("file")]
@@ -1273,17 +1277,31 @@ def _preview_index(out, previews, sha, signature, source, man) -> list:
         if kept and not same:
             man["previews_stale"] = {"rendered_at": old.get("rendered_at"), "sha256": old.get("sha256")}
         return kept
-    # A sidecar from before 0.8.0: images without a record. Their age is all there is to go on.
+    # A sidecar from before 0.8.0: images without a record. Their file times are all there is to go on.
     try:
-        files = sorted(f for f in os.listdir(pdir) if f.endswith(".png"))
+        files = sorted(f for f in os.listdir(pdir) if f.endswith(".png") and f != "click.png")
     except OSError:
         return []
     if not files:
         return []
     newest = max(os.path.getmtime(os.path.join(pdir, f)) for f in files)
-    man["previews_stale"] = {"rendered_at": datetime.datetime.fromtimestamp(newest).astimezone().isoformat(timespec="seconds"),
-                             "sha256": None}
-    return [{"file": f"previews/{f}", "view": os.path.splitext(f)[0]} for f in files]
+    rendered_at = datetime.datetime.fromtimestamp(newest).astimezone().isoformat(timespec="seconds")
+    kept = [{"file": f"previews/{f}", "view": os.path.splitext(f)[0]} for f in files]
+    try:
+        blend_time = os.path.getmtime(blend) if blend else None
+    except OSError:
+        blend_time = None
+    # A second of slack: some file systems store times in whole seconds.
+    fresh = source == "live" or (blend_time is not None and newest + 1.0 >= blend_time)
+    if not fresh:
+        man["previews_stale"] = {"rendered_at": rendered_at, "sha256": None}
+    try:
+        write_json(path, {"sha256": sha if fresh else None, "signature": signature if fresh else None, "source": source,
+                          "rendered_at": rendered_at, "recorded_from": "file times (stills from before 0.8.0)",
+                          "views": kept})
+    except OSError:
+        pass
+    return kept
 
 
 def render_previews_offscreen(out, man, args, render_view):
@@ -1937,7 +1955,7 @@ def ingest(args, out=None, render_view=None, source="disk"):
         else:
             print("previews skipped: they change render settings, so they only run in a background Blender (-b)")
     man["previews"] = previews
-    note_previews = _preview_index(out, previews, sha, signature, source, man)
+    note_previews = _preview_index(out, previews, sha, signature, source, man, blend)
 
     tdir = p("texts")
     os.makedirs(tdir, exist_ok=True)
