@@ -35,14 +35,14 @@ from . import units as units_mod
 bl_info = {
     "name": "VSBlender Bridge",
     "author": "Massive Dynamic Engineering",
-    "version": (0, 8, 0),
+    "version": (1, 0, 0),
     "blender": (3, 2, 0),
     "location": "View3D > Sidebar > VSBlender",
     "description": "Local bridge for the VSBlender VS Code extension",
     "category": "Development",
 }
 
-ADDON_VERSION = "0.8.0"
+ADDON_VERSION = "1.0.0"
 # Answered on the socket thread. Everything else runs on Blender's main thread.
 _NO_MAIN_THREAD = {"ping", "cancel"}
 # How long a connection waits for the main thread. The caller's own timeout is usually shorter.

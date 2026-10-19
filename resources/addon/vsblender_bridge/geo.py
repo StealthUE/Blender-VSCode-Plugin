@@ -12,7 +12,8 @@ Two layers:
        part.to_object("Bracket", materials=["Grey"])
    Primitives are centred in X and Y and stand on z = 0 (center=True centres them in Z too).
    + - & are union, difference, intersection (Blender's boolean; Manifold solver when the inputs are
-   closed). geo.join(a, b) combines without a boolean, which is faster and fine for render and game
+   closed). An intersection of closed solids whose surfaces never meet is decided by ray parity,
+   not a solver (the shells of each that lie inside the other). geo.join(a, b) combines without a boolean, which is faster and fine for render and game
    models. to_object updates an existing object in place: its material slots, modifiers and
    animation survive.
 
@@ -1670,6 +1671,91 @@ def _split_shells(bm) -> list:
     return out
 
 
+_PARITY_DIRS = (Vector((0.31, 0.27, 0.91)).normalized(), Vector((-0.6, 0.71, -0.36)).normalized())
+
+
+def _parity_inside(tree, point, step: float):
+    """Ray parity in two directions: True inside, False outside, None when they disagree (a ray grazed an edge)."""
+    votes = []
+    for direction in _PARITY_DIRS:
+        n, q = 0, Vector(point)
+        for _ in range(2000):
+            loc, _nrm, _i, _d = tree.ray_cast(q, direction, 1e12)
+            if loc is None:
+                break
+            n += 1
+            q = loc + direction * step
+        votes.append(n % 2 == 1)
+    return votes[0] if votes[0] == votes[1] else None
+
+
+def _shell_inside(piece, tree, tol: float):
+    """Whether one closed shell, whose surface does not cross the other solid's, lies inside it.
+    Vertices on the other surface (touching) are skipped; None when no vertex decides."""
+    piece.verts.ensure_lookup_table()
+    count = len(piece.verts)
+    votes = []
+    for i in sorted({int(k) for k in np.linspace(0, count - 1, min(count, 16))}):
+        co = piece.verts[i].co
+        hit = tree.find_nearest(co)
+        if hit[0] is None or hit[3] <= tol:
+            continue
+        vote = _parity_inside(tree, co, tol)
+        if vote is None:
+            continue
+        if votes and vote != votes[0]:
+            return None
+        votes.append(vote)
+        if len(votes) == 3:
+            break
+    return votes[0] if votes else None
+
+
+def _disjoint_intersect(base_bm, cut_bm):
+    """The intersection of two closed solids whose surfaces never cross: the shells of each that lie
+    inside the other, decided by ray parity, so no solver has to guess. The solvers decide this case
+    by a containment test that can be wrong: Exact once returned a whole board standing clear in a
+    box's hollow, after Manifold's correct empty result was retried. None when the surfaces meet, an
+    operand is not closed, or parity cannot decide a shell; the solvers run then."""
+    from mathutils.bvhtree import BVHTree
+
+    if not (len(base_bm.faces) and len(cut_bm.faces) and _closed(base_bm) and _closed(cut_bm)):
+        return None
+    tree_base = BVHTree.FromBMesh(base_bm, epsilon=0.0)
+    tree_cut = BVHTree.FromBMesh(cut_bm, epsilon=0.0)
+    if tree_base.overlap(tree_cut):
+        return None
+    # Shells that cut through each other (a join of overlapping parts) are not one solid: parity
+    # counts their overlap as outside. Those go to the solvers, which warn about them.
+    if crossing_shells(base_bm)[1] or crossing_shells(cut_bm)[1]:
+        return None
+    co = np.array([v.co[:] for v in base_bm.verts] + [v.co[:] for v in cut_bm.verts])
+    # Touching distance and ray step alike: well above float32 noise in the BVH, far below a wall.
+    tol = float(np.linalg.norm(co.max(axis=0) - co.min(axis=0))) * 1e-6 + 1e-12
+    kept, pieces = [], []
+    try:
+        for bm, other in ((base_bm, tree_cut), (cut_bm, tree_base)):
+            for piece in _split_shells(bm):
+                pieces.append(piece)
+                inside = _shell_inside(piece, other, tol)
+                if inside is None:
+                    return None
+                if inside:
+                    kept.append(piece)
+        result = bmesh.new()
+        for piece in kept:
+            me = bpy.data.meshes.new("_vsblender_geo_disjoint")
+            try:
+                piece.to_mesh(me)
+                result.from_mesh(me)
+            finally:
+                bpy.data.meshes.remove(me)
+        return result
+    finally:
+        for piece in pieces:
+            piece.free()
+
+
 def _boolean(base: Solid, others: list, op: str, solver: str = "auto", union_cutters: bool = False) -> Solid:
     """Blender's Boolean modifier on temporary objects. union_cutters: every shell of every operand
     becomes its own operand, so shells that overlap inside one cutter (studs drawn over groove lines)
@@ -1768,6 +1854,12 @@ def _boolean_run(base: Solid, others: list, other_bms: list, op: str, solver: st
     lo, hi = base.bounds
     slack = float((hi - lo).length) ** 3 * 1e-9 + 1e-15
     meta = {"label": base.label} if base.label else {}
+    if op == "INTERSECT" and len(other_bms) == 1:
+        decided = _disjoint_intersect(base.bm, other_bms[0])
+        if decided is not None:
+            what = "nothing in common" if not len(decided.faces) else f"volume {_fmt(abs(float(decided.calc_volume(signed=True))))}"
+            log.append(f"intersect: the surfaces do not meet; ray parity decided it ({what}), no solver")
+            return Solid(decided, desc, log, meta)
     last_error = None
     for index, name in enumerate(order):
         import time
