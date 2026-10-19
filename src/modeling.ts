@@ -17,6 +17,7 @@ import {
   fail,
   imageReply,
   importPaths,
+  isBuildScriptPath,
   liveBlend,
   ok,
   PREVIEW_BYTES,
@@ -341,6 +342,10 @@ export async function runPipeline(ctx: WorkspaceContext, args: Record<string, un
     file = resolved ?? pipelineFor(ctx, args);
   } catch (error) {
     return fail(errorText(error));
+  }
+  if (!isBuildScriptPath(ctx.workspace, file)) {
+    return fail(`${relativeTo(ctx.workspace, file)} is not in a scripts/ folder. A pipeline builds the model, so it and its steps `
+      + "belong in <blend folder>/scripts/, where they are saved with the project.");
   }
   const refused = saveRefusal(ctx, args);
   if (refused) return fail(refused);

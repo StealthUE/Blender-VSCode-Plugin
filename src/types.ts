@@ -64,6 +64,10 @@ export interface ProjectConfig {
   sharedLibs?: string[];
   /** ffmpeg for render videos and reference videos. Found on PATH or in the usual places when unset. */
   ffmpeg?: string;
+  /** Python for run_python. Found on PATH, or Blender's own Python, when unset. */
+  python?: string;
+  /** bash for run_shell. Git for Windows' bash on Windows when unset. */
+  bash?: string;
 }
 
 export interface WorkspaceContext {
@@ -81,6 +85,8 @@ export interface WorkspaceContext {
   referenceRoots?: string[];
   sharedLibs?: string[];
   ffmpeg?: string;
+  python?: string;
+  bash?: string;
 }
 
 export interface ServerLaunch {
@@ -105,7 +111,7 @@ export interface CallExtras {
 
 export const DEFAULT_PORT = 47876;
 export const SERVER_NAME = "vsblender";
-export const ADDON_VERSION = "0.8.0";
+export const ADDON_VERSION = "1.0.0";
 export const GUIDE_STAMP = "<!-- vsblender-guide";
 export const DEFAULT_LIB_PATHS = ["scripts/lib"];
 

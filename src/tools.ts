@@ -13,6 +13,9 @@ import { ingestScript, runIngest } from "./ingest";
 import * as jobs from "./jobs";
 import * as modeling from "./modeling";
 import { findFfmpeg } from "./ffmpeg";
+import {
+  checksDir, inlineModelFolder, isInsideDir, modelFolderOf, resolveScriptPath, runLocal, scriptLabel, startsBlender, writeCheck,
+} from "./localRun";
 import { loadCatalog, printerForCall } from "./printerLookup";
 import { describePrinter, printerParams, resolvePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
@@ -75,6 +78,8 @@ export function loadWorkspaceContext(env: NodeJS.ProcessEnv = process.env, cwd =
     ...(config?.referenceRoots ? { referenceRoots: config.referenceRoots } : {}),
     ...(config?.sharedLibs ? { sharedLibs: config.sharedLibs } : {}),
     ...(config?.ffmpeg ? { ffmpeg: config.ffmpeg } : {}),
+    ...(config?.python ? { python: config.python } : {}),
+    ...(config?.bash ? { bash: config.bash } : {}),
   };
 }
 
@@ -680,25 +685,44 @@ function scriptFileIsReadOnly(scriptPath: string): boolean {
 function requestIsReadOnly(ctx: WorkspaceContext, requested: unknown): boolean {
   if (typeof requested !== "string" || !requested.trim()) return false;
   try {
-    return scriptFileIsReadOnly(resolveInside(ctx.workspace, requested));
+    return scriptFileIsReadOnly(resolveScriptPath(ctx.workspace, requested));
   } catch {
     return false;
   }
 }
 
+/**
+ * Scripts that change the model are part of the project: they live in a scripts/ folder
+ * (<blend folder>/scripts/), so they are saved with it and replay can find them. Checks are inline.
+ */
+export function isBuildScriptPath(workspace: string, file: string): boolean {
+  const rel = path.relative(workspace, file);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  const parts = rel.split(/[\\/]/).slice(0, -1).map((part) => part.toLowerCase());
+  return parts.includes("scripts") && !parts.includes(".blender-ai");
+}
+
+function buildScriptRefusal(ctx: WorkspaceContext, script: string): string {
+  const model = modelFolderOf(ctx.workspace, script);
+  const where = model ? `${relativeTo(ctx.workspace, model) || "."}/scripts/` : "<blend folder>/scripts/";
+  return `${scriptLabel(ctx.workspace, script)} is not in a scripts/ folder. A script that changes the model belongs in ${where} `
+    + "so it is saved with the project. For a check, pass code instead of path (or mark the file # vsblender: read-only).";
+}
+
 /** A script on a throwaway copy. The open file, its journal and its checkpoints are not touched. */
-async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string, unknown>, extraLibs: string[] = [],
+  label?: string): Promise<ToolOutcome> {
   if (!ctx.blender || !fs.existsSync(ctx.blender)) return fail("No Blender executable is configured. Run VSBlender: Setup.");
   if (typeof args["path"] !== "string" || !args["path"].trim()) return fail("path is required");
   let script: string;
   try {
-    script = resolveInside(ctx.workspace, args["path"]);
+    script = resolveScriptPath(ctx.workspace, args["path"]);
   } catch (error) {
     return fail(errorText(error));
   }
   if (!script.toLowerCase().endsWith(".py")) return fail("path must be a .py file");
   if (!fs.existsSync(script)) return fail(`file not found: ${args["path"]}`);
-  const rel = relativeTo(ctx.workspace, script);
+  const rel = label ?? scriptLabel(ctx.workspace, script);
   const probe = await probeBridge(ctx.port);
   const foreign = probe.ok && !decideWindow(ctx.workspace, probe.window ?? { unknown: true }).use;
   const id = jobs.newJobId("script");
@@ -735,7 +759,7 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
       : `the saved file ${relativeTo(ctx.workspace, blend)} (Blender is not running; the file is not written)`;
   }
   const spec: Record<string, unknown> = {
-    kind: "script", script, lib_paths: importPaths(ctx), source_blend: sourceBlend ?? blend,
+    kind: "script", script, lib_paths: [...importPaths(ctx), ...extraLibs], source_blend: sourceBlend ?? blend,
     printer: (await printerForCall(ctx)).params, reference_roots: referenceRoots(ctx),
   };
   if (typeof args["function"] === "string" && args["function"]) spec["function"] = args["function"];
@@ -760,18 +784,49 @@ async function runScriptInBackground(ctx: WorkspaceContext, args: Record<string,
   }
 }
 
+/**
+ * run_script code: an inline check in Blender. Kept in the temp checks folder, outside the project,
+ * marked read-only, and always run on a throwaway copy: a check never reaches the model.
+ */
+async function runInlineCheck(ctx: WorkspaceContext, args: Record<string, unknown>): Promise<ToolOutcome> {
+  const code = String(args["code"]);
+  if (startsBlender(code)) return fail("A check runs inside Blender already; it does not start another one.");
+  const header = scriptMarkedReadOnly(code) ? "" : "# vsblender: read-only\n";
+  const file = writeCheck(ctx.workspace, header + code, "py");
+  let libs: string[] = [];
+  try {
+    const model = await inlineModelFolder(ctx, args["blend"]);
+    libs = [path.join(model, "scripts"), path.join(model, "scripts", "lib")].filter((dir) => fs.existsSync(dir));
+  } catch {
+    libs = [];
+  }
+  const rest: Record<string, unknown> = { ...args, path: file, background: true };
+  delete rest["code"];
+  const outcome = await runScriptInBackground(ctx, rest, libs, "inline check");
+  return { ...outcome, text: `${outcome.text}\nkept: ${file} (run_script path runs it again)` };
+}
+
 export async function runScript(ctx: WorkspaceContext, args: Record<string, unknown>, extras: CallExtras = {}): Promise<ToolOutcome> {
-  if (typeof args["path"] !== "string" || !args["path"].trim()) return fail("path is required");
+  const hasCode = typeof args["code"] === "string" && args["code"].trim() !== "";
+  const hasPath = typeof args["path"] === "string" && args["path"].trim() !== "";
+  if (hasCode && hasPath) return fail("run_script takes path (a script in scripts/) or code (an inline check), not both");
+  if (hasCode) return runInlineCheck(ctx, args);
+  if (!hasPath) return fail("path is required (or code, for an inline check)");
   let script: string;
   try {
-    script = resolveInside(ctx.workspace, args["path"]);
+    script = resolveScriptPath(ctx.workspace, String(args["path"]));
   } catch (error) {
     return fail(errorText(error));
   }
   if (!script.toLowerCase().endsWith(".py")) return fail("path must be a .py file");
   if (!fs.existsSync(script)) return fail(`file not found: ${args["path"]}`);
-  // A throwaway copy is only for a script that says it does not change the scene.
-  if (args["background"] === true && scriptFileIsReadOnly(script)) return runScriptInBackground(ctx, args);
+  const readOnly = scriptFileIsReadOnly(script);
+  if (!readOnly && !isBuildScriptPath(ctx.workspace, script)) return fail(buildScriptRefusal(ctx, script));
+  // A throwaway copy is only for a script that says it does not change the scene. A kept check lives
+  // outside the workspace, where only the background runner reads it.
+  if (readOnly && (args["background"] === true || isInsideDir(checksDir(ctx.workspace), script))) {
+    return runScriptInBackground(ctx, { ...args, background: true });
+  }
   const refused = saveRefusal(ctx, args);
   if (refused) return fail(refused);
   const ensured = await ensureSceneWindow(ctx);
@@ -1598,6 +1653,10 @@ export async function callTool(ctx: WorkspaceContext, name: string, args: Record
       return modeling.runProjectScript(ctx, args, extras);
     case "run_project_pipeline":
       return modeling.runProjectPipeline(ctx, args, extras);
+    case "run_python":
+      return runLocal(ctx, "python", args, importPaths(ctx), extras);
+    case "run_shell":
+      return runLocal(ctx, "shell", args, importPaths(ctx), extras);
     case "set_role":
       return setRole(ctx, args);
     case "diff":

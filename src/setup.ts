@@ -108,7 +108,7 @@ function html(state: PanelState): string {
   </fieldset>
   <fieldset>
     <legend>Approvals and git</legend>
-    <p class="muted">Claude Code and Grok run a build without a prompt on each tool: scripts, pipelines, new files, append, open, replay, restore, roles, export, and render, plus the read-only tools, and save and finish while the tick below is on. These ask each time: doctor_fix, a hidden Blender, import_reference, and reference. VS Code and Cursor keep approvals in their own settings.</p>
+    <p class="muted">Claude Code and Grok run a build without a prompt on each tool: scripts, pipelines, Python and shell checks (run_python, run_shell), new files, append, open, replay, restore, roles, export, and render, plus the read-only tools and writing build scripts under scripts/, and save and finish while the tick below is on. These ask each time: doctor_fix, a hidden Blender, import_reference, and reference. VS Code and Cursor keep approvals in their own settings.</p>
     <label><input type="checkbox" id="allowSave" ${state.allowSave ? "checked" : ""}> Save the .blend after every run (recommended). Each run that changes the model saves the file, journaled with its reason; a checkpoint from before every run still lets you go back. Off: the AI asks before saving and the editor offers Save.</label>
     <label>Trusted script folders (comma separated, workspace relative) <input type="text" id="trustedScripts" value="${escapeAttr(state.trustedScripts)}" placeholder="Models/scripts"></label>
     <label><input type="checkbox" id="ignoreClientConfig" ${state.ignoreClientConfig ? "checked" : ""}> Keep the MCP config files out of git. .mcp.json and the others hold paths for this machine; each person runs setup.</label>
@@ -285,7 +285,7 @@ export async function showSetup(
       next.push("Claude Code asks you to approve the vsblender server in .mcp.json the first time it starts in this folder.");
     }
     if (clients.claude || clients.grok) {
-      next.push("Scripts, pipelines, new files, append, open, replay, restore, roles, export, and render run without asking. doctor_fix, a hidden Blender, import_reference, and reference ask each time.");
+      next.push("Scripts, pipelines, Python and shell checks, new files, append, open, replay, restore, roles, export, and render run without asking, and build scripts under scripts/ are written without asking. doctor_fix, a hidden Blender, import_reference, and reference ask each time.");
       next.push(allowSave
         ? "Each run saves the .blend when it is done; save and finish run without asking."
         : "Runs leave the .blend unsaved: save and finish ask you, and the editor offers Save after a run.");

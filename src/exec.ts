@@ -9,7 +9,7 @@ export interface ExecResult {
 export function execFileText(
   command: string,
   args: string[],
-  options: { timeout: number; cwd?: string; env?: NodeJS.ProcessEnv; maxBuffer?: number }
+  options: { timeout: number; cwd?: string; env?: NodeJS.ProcessEnv; maxBuffer?: number; signal?: AbortSignal }
 ): Promise<ExecResult> {
   return new Promise((resolve) => {
     execFile(
@@ -19,6 +19,7 @@ export function execFileText(
         timeout: options.timeout,
         cwd: options.cwd,
         env: options.env,
+        ...(options.signal ? { signal: options.signal } : {}),
         encoding: "utf8",
         windowsHide: true,
         maxBuffer: options.maxBuffer ?? 20 * 1024 * 1024,

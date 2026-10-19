@@ -8,7 +8,8 @@ import { printerForCall } from "./printerLookup";
 import { describePrinter } from "./printers";
 import { readConfig } from "./projectConfig";
 import { applyWorkspace } from "./workspaceSetup";
-import { hasScriptRule, readText, serverLaunch } from "./configWrite";
+import { hasScriptRule, readText, SCRIPT_EDIT_ALLOW, serverLaunch } from "./configWrite";
+import { findBash, findPython } from "./localRun";
 import { AUTO_APPROVE, claudeRule } from "./toolDefs";
 import { ADDON_VERSION, ClientFlags, WorkspaceContext } from "./types";
 import { decideWindow } from "./windows";
@@ -154,6 +155,14 @@ export async function runDoctor(
     }
   }
 
+  // run_python and run_shell: checks and helpers outside Blender, without a permission prompt.
+  const python = findPython(ctx);
+  checks.push(check("python", Boolean(python), python ? `${python.path} (${python.source}): run_python`
+    : "not found: set \"python\" in .blender-ai/config.json, or configure Blender (its own Python is used)", true));
+  const bash = findBash(ctx);
+  checks.push(check("bash", Boolean(bash), bash ? `${bash.path} (${bash.source}): run_shell`
+    : `not found: set "bash" in .blender-ai/config.json${process.platform === "win32" ? " (Git for Windows: Git\\bin\\bash.exe)" : ""}`, true));
+
   const config = readConfig(ctx.workspace);
   checks.push(check("workspace config", Boolean(config), config ? `port ${config.port}` : "missing .blender-ai/config.json"));
   if (isExtensionSource(ctx.workspace)) {
@@ -175,10 +184,10 @@ export async function runDoctor(
 
   if (ctx.clients.claude || ctx.clients.grok) {
     const settings = readText(path.join(ctx.workspace, ".claude", "settings.json")) ?? "";
-    const missing = AUTO_APPROVE.map(claudeRule).filter((rule) => !settings.includes(`"${rule}"`));
+    const missing = [...AUTO_APPROVE.map(claudeRule), ...SCRIPT_EDIT_ALLOW].filter((rule) => !settings.includes(`"${rule}"`));
     const scripts = settings.includes(`"${claudeRule("run_script")}"`)
       || hasScriptRule(readText(path.join(ctx.workspace, ".claude", "settings.local.json")))
-      ? "scene tools, including run_script, run without asking"
+      ? "scene tools, including run_script, run_python and run_shell, run without asking, and scripts/ is written without asking"
       : "run_script asks each time";
     checks.push(check("claude permissions", !missing.length,
       missing.length ? `${missing.length} tool(s) still ask for approval (${missing.slice(0, 3).join(", ")}...). Reload the window, or run doctor_fix.`

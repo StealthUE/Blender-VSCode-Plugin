@@ -210,6 +210,16 @@ const BLEND_DENY = [
   "Edit(**/*.blend1)",
 ];
 
+/**
+ * The scripts that build a model live in <blend folder>/scripts/: writing them does not ask.
+ * Claude Code matches Edit(path) for every file-writing tool and ignores Write(path); Grok has its
+ * own Write rules, so both are written.
+ */
+export const SCRIPT_EDIT_ALLOW = [
+  "Edit(**/scripts/**)",
+  "Write(**/scripts/**)",
+];
+
 function parseSettings(existing: string | undefined): JsonRecord | undefined {
   if (existing === undefined) return {};
   try {
@@ -226,8 +236,8 @@ function ruleList(permissions: JsonRecord, key: string): string[] {
 
 /**
  * .claude/settings.json: deny reading or editing .blend files, and allow the shared VSBlender list
- * (read-only tools and the build loop) without asking. Rules for tools that no longer exist are
- * dropped. Other rules are left alone.
+ * (read-only tools, the build loop, run_python and run_shell) and writing build scripts under
+ * scripts/ without asking. Rules for tools that no longer exist are dropped. Other rules are left alone.
  */
 export function mergeClaudeSettings(existing: string | undefined): string | undefined {
   const settings = parseSettings(existing);
@@ -238,7 +248,7 @@ export function mergeClaudeSettings(existing: string | undefined): string | unde
   const ours = new Set(TOOL_NAMES.map(claudeRule));
   // Old builds allowed tool names that were renamed or split; keep only rules for tools that exist.
   const keptAllow = allow.filter((rule) => !rule.startsWith("mcp__vsblender__") || ours.has(rule));
-  const wantAllow = AUTO_APPROVE.map(claudeRule);
+  const wantAllow = [...AUTO_APPROVE.map(claudeRule), ...SCRIPT_EDIT_ALLOW];
   const nextAllow = [...keptAllow, ...wantAllow.filter((rule) => !keptAllow.includes(rule))];
   const nextDeny = [...deny, ...BLEND_DENY.filter((rule) => !deny.includes(rule))];
   if (existing !== undefined && JSON.stringify(nextAllow) === JSON.stringify(allow) && JSON.stringify(nextDeny) === JSON.stringify(deny)) {

@@ -117,9 +117,11 @@ export const TOOLS: ToolDef[] = [
   },
   {
     name: "run_script",
-    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`, `# vsblender: reads NAME`, `# vsblender: exports NAME` (an out-of-date warning then names the values that changed). `result` is a global, or the value main() returns. Or pass function and args. background: true runs on a throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, and the window is started first when this folder does not already have one. A run that changed something saves the .blend when it is done (journaled), and the reply starts with \"saved <file>\". In a folder that asks first (\"allowSave\": false), or with save: false, the file is left unsaved and the reply starts with how many runs the file on disk does not have. Warnings name an object a run left without faces (a linked copy left on a placeholder) and the objects a changed mesh is shared with.",
+    description: "Run a workspace .py inside the open Blender, on its main thread: Blender's UI is blocked until it returns. Takes an automatic checkpoint first (dropped when nothing changed; the reply gives its size and what all checkpoints take), makes the run one undo step, appends a journal entry and a NOTES change-log line, and reports what changed by category (added, removed, recreated, renamed, modified materials/worlds/scene settings/keys, lost animation, temporary). Atomic: if the script raises or is cancelled, the session is rolled back to that checkpoint. Objects it builds are stamped with the script (ai_built_by). The namespace is fresh each call; `import vsblender` for helpers, `from vsblender import geo` for modelling. Importable: the script's folder, every lib/ from there up to the workspace root, libPaths and sharedLibs. Header lines: `# vsblender: read-only`, `# vsblender: atomic off`, `# vsblender: rerun-after <script>`, `# vsblender: reads NAME`, `# vsblender: exports NAME` (an out-of-date warning then names the values that changed). `result` is a global, or the value main() returns. Or pass function and args. A script that changes the model must be in a scripts/ folder (<blend folder>/scripts/), so it is saved with the project; anything else is refused. code instead of path is an inline check: kept in a temp folder outside the project, run on a throwaway copy, never journaled. background: true runs on a throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, and the window is started first when this folder does not already have one. A run that changed something saves the .blend when it is done (journaled), and the reply starts with \"saved <file>\". In a folder that asks first (\"allowSave\": false), or with save: false, the file is left unsaved and the reply starts with how many runs the file on disk does not have. Warnings name an object a run left without faces (a linked copy left on a placeholder) and the objects a changed mesh is shared with.",
     inputSchema: obj({
-      path: { type: "string", description: "Workspace .py file. Keep model scripts next to their .blend: <blend folder>/scripts/, shared code in <blend folder>/scripts/lib/." },
+      path: { type: "string", description: "Workspace .py file. A script that changes the model must be inside a scripts/ folder, next to its .blend: <blend folder>/scripts/ (shared code in <blend folder>/scripts/lib/), so it is saved with the project. A script marked # vsblender: read-only may be anywhere in the workspace." },
+      code: { type: "string", description: "Instead of path: an inline check in Blender (measure, list, inspect). It is kept in a temp folder outside the project and always runs on a throwaway copy of the session (or the saved file when Blender is closed), so it never changes the model. Build steps go in a file under scripts/." },
+      blend: { type: "string", description: "With code: the workspace .blend to check when Blender is not running and the workspace has several." },
       reason: { type: "string", description: "Why: goes into the journal and the NOTES change log. Give one for every change." },
       function: { type: "string" },
       args: { type: "object" },
@@ -129,7 +131,32 @@ export const TOOLS: ToolDef[] = [
       save: saveArg,
       allow_references: allowReferences,
       background: { type: "boolean", description: "Throwaway copy only when the script is marked # vsblender: read-only. Any other script runs in the open Blender, which is started first when this folder does not already have one." },
-    }, ["path"]),
+    }),
+  },
+  {
+    name: "run_python",
+    description: "Run Python outside Blender (no bpy), without a permission prompt: checks, sizing tables, reading SVG or JSON, file conversions. For a check, pass code: it is kept in a temp folder outside the project, so it never mixes with the scripts that build the model. path runs a workspace .py instead. Python is \"python\" in .blender-ai/config.json, a Python on PATH, or the one that ships with Blender (has numpy). Runs in the model folder (the folder of the .blend; cwd changes it), with the script's folder, each lib/ above it, the model's scripts/ and scripts/lib/, libPaths and sharedLibs on PYTHONPATH, and VSBLENDER_WORKSPACE and VSBLENDER_MODEL_DIR set. Returns the exit code, stdout and stderr. Does not start Blender: use run_script for that, and run_script code for a check that needs bpy. Use this instead of Bash or PowerShell for Python.",
+    inputSchema: obj({
+      code: { type: "string", description: "Python source for an inline check." },
+      path: { type: "string", description: "Instead of code: a workspace .py, or a kept check's path from an earlier reply." },
+      argv: { type: "array", items: { type: "string" }, description: "Command-line arguments (sys.argv[1:])." },
+      blend: { type: "string", description: "The .blend (or folder) whose folder an inline check runs in. Default: the file open in this folder's Blender, else the only .blend, else the workspace." },
+      cwd: { type: "string", description: "Workspace folder to run in instead of the model folder." },
+      timeout_ms: { type: "number", description: "Default 120000, max 600000." },
+    }),
+  },
+  {
+    name: "run_shell",
+    description: "Run a bash or PowerShell script, without a permission prompt: file listings, ffmpeg, copying exports, slicer command lines. For a check, pass code (bash by default; shell: \"powershell\"): it is kept in a temp folder outside the project. path runs a workspace .sh or .ps1 instead. bash is \"bash\" in .blender-ai/config.json, or Git for Windows' bash on Windows (never the WSL launcher). Runs in the model folder (the folder of the .blend; cwd changes it) with VSBLENDER_WORKSPACE and VSBLENDER_MODEL_DIR set. Returns the exit code, stdout and stderr. Does not start Blender, and must not read or write .blend files: those go through the vsblender tools. Use this instead of the Bash or PowerShell tool for work in the model folder.",
+    inputSchema: obj({
+      code: { type: "string", description: "Script source for an inline check." },
+      shell: { type: "string", description: "With code: bash (default) or powershell." },
+      path: { type: "string", description: "Instead of code: a workspace .sh or .ps1, or a kept check's path from an earlier reply." },
+      argv: { type: "array", items: { type: "string" }, description: "Arguments ($1... in bash, $args in PowerShell)." },
+      blend: { type: "string", description: "The .blend (or folder) whose folder an inline check runs in. Default: the file open in this folder's Blender, else the only .blend, else the workspace." },
+      cwd: { type: "string", description: "Workspace folder to run in instead of the model folder." },
+      timeout_ms: { type: "number", description: "Default 120000, max 600000." },
+    }),
   },
   {
     name: "run_project_script",
@@ -507,7 +534,8 @@ export const TOOL_NAMES = TOOLS.map((tool) => tool.name);
 /**
  * Run without a permission prompt. Setup writes these as Claude Code allow rules.
  * Grok reads that file. Cline copies the names into alwaysAllow.
- * The build tools are included so a modelling loop does not stop on yes for every call.
+ * The build tools are included so a modelling loop does not stop on yes for every call. run_python
+ * and run_shell are too: run_script already runs any Python with the same access.
  * save and finish are added when the folder saves on its own (allowSave, the default; SAVE_TOOLS).
  * doctor_fix, launch_blender_background, import_reference, and reference stay on ask.
  */
@@ -536,6 +564,8 @@ export const AUTO_APPROVE = [
   "run_pipeline",
   "run_project_script",
   "run_project_pipeline",
+  "run_python",
+  "run_shell",
   "new_blend",
   "append",
   "open_blend",

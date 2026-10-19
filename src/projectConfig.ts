@@ -23,6 +23,8 @@ export function readConfig(workspace: string): ProjectConfig | undefined {
     const referenceRoots = stringList(raw.referenceRoots);
     const sharedLibs = stringList(raw.sharedLibs);
     const ffmpeg = typeof raw.ffmpeg === "string" && raw.ffmpeg.trim() ? raw.ffmpeg.trim() : undefined;
+    const python = typeof raw.python === "string" && raw.python.trim() ? raw.python.trim() : undefined;
+    const bash = typeof raw.bash === "string" && raw.bash.trim() ? raw.bash.trim() : undefined;
     const printer = normalizePrinterSetting(raw.printer);
     return {
       version: 1,
@@ -41,6 +43,8 @@ export function readConfig(workspace: string): ProjectConfig | undefined {
       ...(referenceRoots ? { referenceRoots } : {}),
       ...(sharedLibs ? { sharedLibs } : {}),
       ...(ffmpeg ? { ffmpeg } : {}),
+      ...(python ? { python } : {}),
+      ...(bash ? { bash } : {}),
     };
   } catch {
     return undefined;
