@@ -26,23 +26,28 @@ const ingestQueue: { file: string; actor: string; manual: boolean }[] = [];
 /** Journal files already offered a save for this dirty streak. A save event clears the key. */
 const dirtyJournals = new Set<string>();
 let draining = false;
-/** Whether the folder has a .blend (undefined until searched), and whether setup was offered in this window. */
-let blendKnown: { folder: string; has: boolean } | undefined;
+/**
+ * Whether the folder has a .blend (undefined until searched; the .blend watcher sets or clears it),
+ * and whether setup was offered in this window. The search is kept as a promise so the status poll
+ * and activation share one search.
+ */
+let blendKnown: { folder: string; has: Promise<boolean> } | undefined;
 let setupOffered = false;
 
 /** A file search that stops at the first .blend, skipping build and sidecar folders. */
-async function folderHasBlend(folder: string): Promise<boolean> {
-  if (blendKnown?.folder === folder) return blendKnown.has;
-  let has: boolean;
+async function searchBlend(folder: string): Promise<boolean> {
   try {
     const found = await vscode.workspace.findFiles(new vscode.RelativePattern(vscode.Uri.file(folder), "**/*.blend"),
       "**/{node_modules,.git,.blender-ai,out,dist}/**", 1);
-    has = found.length > 0;
+    return found.length > 0;
   } catch {
-    has = listBlendFiles(folder, 3).length > 0;
+    return listBlendFiles(folder, 3).length > 0;
   }
-  blendKnown = { folder, has };
-  return has;
+}
+
+function folderHasBlend(folder: string): Promise<boolean> {
+  if (blendKnown?.folder !== folder) blendKnown = { folder, has: searchBlend(folder) };
+  return blendKnown.has;
 }
 
 function setupSetting(): boolean {
@@ -205,31 +210,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   context.subscriptions.push(output);
   status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   status.command = "vsblender.status";
-  status.show();
   context.subscriptions.push(status);
 
   const root = (): string | undefined => workspaceRoot();
   const refreshStatus = async (): Promise<void> => {
     const folder = root();
     if (!status) return;
-    if (!folder) {
-      status.text = "$(gear) Blender";
-      status.tooltip = "Open a folder to set up VSBlender";
+    // The status item is only for a folder with a .blend, set up or not. It stays hidden until the search finds one.
+    if (!folder || !(await folderHasBlend(folder))) {
+      status.hide();
       return;
     }
+    status.show();
     const config = readConfig(folder);
     if (!config) {
-      // A folder with no .blend has nothing to set up: no status item there.
-      if (blendKnown?.folder === folder && !blendKnown.has) {
-        status.hide();
-        return;
-      }
-      status.show();
       status.text = "$(gear) Blender: setup";
       status.tooltip = "VSBlender: Setup";
       return;
     }
-    status.show();
     const probe = await probeBridge(config.port);
     if (probe.ok) {
       const share = typeof probe.progress?.fraction === "number" ? ` ${Math.round(probe.progress.fraction * 100)}%` : "";
@@ -364,12 +362,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     cachedRoot = undefined;
     scheduleRefresh(context, folder, output);
   };
+  // A new .blend shows the status item; a deleted one searches again, so the last one gone hides it.
+  const onBlendPresence = (uri: vscode.Uri, created: boolean): void => {
+    const folder = root();
+    if (!folder || !ownBlend(folder, uri)) return;
+    blendKnown = created ? { folder, has: Promise.resolve(true) } : undefined;
+    void refreshStatus();
+  };
   // The first .blend in a folder that is not set up yet: offer setup then (once per window).
   const onFirstBlend = (uri: vscode.Uri): void => {
     const folder = root();
     if (!folder || readConfig(folder) || !ownBlend(folder, uri)) return;
-    blendKnown = { folder, has: true };
-    void refreshStatus();
     if (shouldOfferSetup({ configured: false, hasBlend: true, setting: setupSetting(), offered: setupOffered })) {
       setupOffered = true;
       void showSetup(context, folder, output, runtimeRoot(context, output), onConfigured);
@@ -378,10 +381,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   blendWatcher.onDidCreate((uri) => {
     onBlend(uri);
     onBlendSet(uri);
+    onBlendPresence(uri, true);
     onFirstBlend(uri);
   });
   blendWatcher.onDidChange(onBlend);
-  blendWatcher.onDidDelete(onBlendSet);
+  blendWatcher.onDidDelete((uri) => {
+    onBlendSet(uri);
+    onBlendPresence(uri, false);
+  });
   context.subscriptions.push(blendWatcher);
 
   const journalWatcher = vscode.workspace.createFileSystemWatcher("**/.blender-ai/**/journal.jsonl");
@@ -397,7 +404,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // the file search or the Blender search behind the panel.
     void (async () => {
       const hasBlend = await folderHasBlend(folder);
-      void refreshStatus();
       if (shouldOfferSetup({ configured: false, hasBlend, setting: setupSetting(), offered: setupOffered })) {
         setupOffered = true;
         void showSetup(context, folder, output, runtimeRoot(context, output), onConfigured);
